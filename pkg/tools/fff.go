@@ -232,7 +232,28 @@ func GrepFiles(baseDir, subDir, pattern, filePattern string, maxResults int) (Gr
 		return GrepFilesResult{}, err
 	}
 
-	// 1. Try ripgrep if installed
+	// 1. Try native fff (ffgrep / fff grep) if installed
+	if fffPath, err := exec.LookPath("fff"); err == nil && fffPath != "" {
+		res, err := runFFFGrep(fffPath, searchRoot, pattern, filePattern, maxResults)
+		if err == nil && len(res) > 0 {
+			return GrepFilesResult{
+				Matches: res,
+				Count:   len(res),
+				Backend: "fff-native",
+			}, nil
+		}
+	} else if ffgrepPath, err := exec.LookPath("ffgrep"); err == nil && ffgrepPath != "" {
+		res, err := runFFFGrep(ffgrepPath, searchRoot, pattern, filePattern, maxResults)
+		if err == nil && len(res) > 0 {
+			return GrepFilesResult{
+				Matches: res,
+				Count:   len(res),
+				Backend: "fff-native",
+			}, nil
+		}
+	}
+
+	// 2. Try ripgrep if installed
 	if rgPath, err := exec.LookPath("rg"); err == nil && rgPath != "" {
 		res, err := runRipgrep(rgPath, searchRoot, pattern, filePattern, maxResults)
 		if err == nil {
@@ -244,7 +265,7 @@ func GrepFiles(baseDir, subDir, pattern, filePattern string, maxResults int) (Gr
 		}
 	}
 
-	// 2. Fallback to builtin scanner
+	// 3. Fallback to builtin scanner
 	res, err := runBuiltinGrep(searchRoot, pattern, filePattern, maxResults)
 	if err != nil {
 		return GrepFilesResult{}, errors.Wrap(err, "running builtin grep")
@@ -255,6 +276,47 @@ func GrepFiles(baseDir, subDir, pattern, filePattern string, maxResults int) (Gr
 		Count:   len(res),
 		Backend: "builtin",
 	}, nil
+}
+
+func runFFFGrep(binPath, searchRoot, pattern, filePattern string, maxResults int) ([]GrepMatch, error) {
+	var args []string
+	if filepath.Base(binPath) == "fff" {
+		args = []string{"grep", pattern, "--limit", fmt.Sprintf("%d", maxResults)}
+	} else {
+		// ffgrep standalone binary
+		args = []string{pattern, "--limit", fmt.Sprintf("%d", maxResults)}
+	}
+	if filePattern != "" {
+		args = append(args, "--filter", filePattern)
+	}
+
+	cmd := exec.Command(binPath, args...)
+	cmd.Dir = searchRoot
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+
+	var matches []GrepMatch
+	scanner := bufio.NewScanner(&out)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) == 3 {
+			var lineNum int
+			fmt.Sscanf(parts[1], "%d", &lineNum)
+			matches = append(matches, GrepMatch{
+				File:    parts[0],
+				LineNum: lineNum,
+				Content: strings.TrimSpace(parts[2]),
+			})
+			if len(matches) >= maxResults {
+				break
+			}
+		}
+	}
+	return matches, nil
 }
 
 func runRipgrep(rgPath, searchRoot, pattern, filePattern string, maxResults int) ([]GrepMatch, error) {
