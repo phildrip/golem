@@ -1026,8 +1026,10 @@ func (m Model) renderSlashCommandHelp(input string) string {
 		desc string
 	}
 	commands := []cmdHelp{
+		{"/profile", "Inspect configured profiles or switch active profile"},
+		{"/remember", "Record preference or decision into profile memory"},
 		{"/tree", "Inspect fractal memory hierarchy"},
-		{"/zoom", "Inspect memory node (/zoom <id> <n>)"},
+		{"/zoom", "Inspect memory node (/zoom [target] <id> <n>)"},
 		{"/compact", "Trigger memory compaction fold"},
 		{"/clear", "Clear chat viewport (disk memory preserved)"},
 		{"/mcp", "Inspect active MCP servers, tools & configs"},
@@ -1156,11 +1158,12 @@ func (m Model) generateShortcutsVisual() string {
 			items: []shortcutItem{
 				{"Ctrl+K", "Shortcuts popup", "Open / close this shortcuts and controls guide"},
 				{"Ctrl+T", "Fractal memory tree", "Open / close the OptChat hierarchical tree modal"},
+				{"/profile", "Profile manager", "Inspect active & configured provider profiles"},
 				{"/mcp", "MCP server status", "Open active MCP servers and configuration inspector"},
 			},
 		},
 		{
-			title: "Modal Navigation (Tree, MCP & Shortcuts)",
+			title: "Modal Navigation (Tree, MCP, Profile & Shortcuts)",
 			items: []shortcutItem{
 				{"↑ / k", "Scroll up 1 line", "Navigate modal contents"},
 				{"↓ / j", "Scroll down 1 line", "Navigate modal contents"},
@@ -1172,8 +1175,10 @@ func (m Model) generateShortcutsVisual() string {
 		{
 			title: "Slash Commands (type in prompt)",
 			items: []shortcutItem{
+				{"/profile [name]", "Switch/view profile", "Hot-switch active provider profile or view modal"},
+				{"/remember <text>", "Record memory", "Persist key ruling/decision into profile memory"},
 				{"/tree, /memory", "View memory tree", "Inspect binary hierarchy and live head"},
-				{"/zoom <id> <n>", "Inspect node", "Full text inspect (n=1 for verbatim event)"},
+				{"/zoom [t] id n", "Inspect node", "Full text inspect (target optional, n=1 for verbatim)"},
 				{"/compact", "Compact memory", "Manually trigger a background compaction pass"},
 				{"/clear", "Clear chat view", "Clear viewport without deleting stored history"},
 				{"/mcp", "MCP status popup", "Inspect connected MCP servers, tools, and configs"},
