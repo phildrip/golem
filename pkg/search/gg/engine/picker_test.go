@@ -13,7 +13,7 @@ func TestFilePickerOperations(t *testing.T) {
 
 	// Create test files
 	file1 := filepath.Join(tempDir, "main.go")
-	file2 := filepath.Join(tempDir, "pkg", "tools", "fff.go")
+	file2 := filepath.Join(tempDir, "pkg", "tools", "gg.go")
 	file3 := filepath.Join(tempDir, "README.md")
 
 	if err := os.MkdirAll(filepath.Dir(file2), 0755); err != nil {
@@ -46,8 +46,8 @@ func TestFilePickerOperations(t *testing.T) {
 	if !picker.HasFile("main.go") {
 		t.Errorf("expected picker to have main.go")
 	}
-	if !picker.HasFile("pkg/tools/fff.go") {
-		t.Errorf("expected picker to have pkg/tools/fff.go")
+	if !picker.HasFile("pkg/tools/gg.go") {
+		t.Errorf("expected picker to have pkg/tools/gg.go")
 	}
 
 	// Test QueryCandidates
@@ -57,8 +57,8 @@ func TestFilePickerOperations(t *testing.T) {
 	}
 
 	candTools := picker.QueryCandidates("tools/ *.go")
-	if len(candTools) != 1 || candTools[0] != "pkg/tools/fff.go" {
-		t.Errorf("expected pkg/tools/fff.go, got: %v", candTools)
+	if len(candTools) != 1 || candTools[0] != "pkg/tools/gg.go" {
+		t.Errorf("expected pkg/tools/gg.go, got: %v", candTools)
 	}
 
 	// Test RemoveFile
@@ -151,5 +151,62 @@ func TestFilePickerWatcher(t *testing.T) {
 	}
 	if !removed {
 		t.Errorf("expected watcher to detect removal of dynamic.txt within timeout")
+	}
+}
+
+// TestFilePickerWatcherDirectoryLifecycle ports FFF's new_directory_watcher_test and fs_delete_handler_test.
+func TestFilePickerWatcherDirectoryLifecycle(t *testing.T) {
+	tempDir := t.TempDir()
+
+	picker, err := NewFilePicker(context.Background(), FilePickerOptions{
+		RootDir:       tempDir,
+		EnableWatcher: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create FilePicker with watcher: %v", err)
+	}
+	defer picker.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 1. Create a new subdirectory and file inside it
+	subDir := filepath.Join(tempDir, "new_sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	subFile := filepath.Join(subDir, "inner.go")
+	if err := os.WriteFile(subFile, []byte("package sub"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	detected := false
+	for i := 0; i < 40; i++ {
+		if picker.HasFile("new_sub/inner.go") {
+			detected = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !detected {
+		t.Errorf("expected watcher to detect file inside new subdirectory")
+	}
+
+	// 2. Remove the entire subdirectory
+	if err := os.RemoveAll(subDir); err != nil {
+		t.Fatal(err)
+	}
+
+	removed := false
+	for i := 0; i < 40; i++ {
+		if !picker.HasFile("new_sub/inner.go") {
+			removed = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !removed {
+		t.Errorf("expected watcher to remove file when parent subdirectory is deleted")
 	}
 }

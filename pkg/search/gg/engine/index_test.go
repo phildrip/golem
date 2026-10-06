@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -11,7 +12,7 @@ func TestInvertedIndex(t *testing.T) {
 		"pkg/search/gg/engine/index.go",
 		"pkg/search/gg/parser/parser.go",
 		"cmd/golem-cli/main.go",
-		"pkg/tools/fff.go",
+		"pkg/tools/gg.go",
 		"pkg/config/config.go",
 	}
 
@@ -43,10 +44,63 @@ func TestInvertedIndex(t *testing.T) {
 		t.Errorf("expected 0 matches for 'zz', got: %v", matchesNone)
 	}
 
-	// 5. Test RemoveDocument
+	// 5. Short query (< 2 chars) returns all documents
+	matchesShort := idx.FilterCandidates("a")
+	if len(matchesShort) != 5 {
+		t.Errorf("expected all 5 docs for 1-char query, got: %d", len(matchesShort))
+	}
+
+	// 6. Test RemoveDocument
 	idx.RemoveDocument(1, files[1])
 	matchesAfterRemove := idx.FilterCandidates("parser")
 	if len(matchesAfterRemove) != 0 {
 		t.Errorf("expected 0 matches for 'parser' after removing doc 1, got: %v", matchesAfterRemove)
+	}
+
+	// 7. Test Reset
+	idx.Reset()
+	if len(idx.FilterCandidates("config")) != 0 {
+		t.Errorf("expected 0 matches after Reset")
+	}
+}
+
+// TestRareBigramsRejectAbsentQueries ports FFF's rare_bigrams_reject_absent_queries_without_losing_matches test.
+func TestRareBigramsRejectAbsentQueries(t *testing.T) {
+	idx := NewInvertedIndex()
+	const totalDocs = 4096
+
+	for docID := 0; docID < totalDocs; docID++ {
+		var path string
+		switch docID {
+		case 31:
+			path = "marker_qq_blah.txt"
+		case 500:
+			path = "marker_qz_blah.txt"
+		case 1000:
+			path = "marker_zy_blah.txt"
+		case 3000:
+			path = "marker_yx_blah.txt"
+		default:
+			path = fmt.Sprintf("ordinary_content_%d.txt", docID)
+		}
+		idx.AddDocument(docID, path)
+	}
+
+	// Query containing absent combination of bigrams
+	absentMatches := idx.FilterCandidates("qqzyx")
+	if len(absentMatches) != 0 {
+		t.Errorf("expected 0 matches for absent combined query, got: %v", absentMatches)
+	}
+
+	// Query containing present rare bigram "qq"
+	presentMatches := idx.FilterCandidates("qq")
+	if len(presentMatches) != 1 || presentMatches[0] != 31 {
+		t.Errorf("expected exactly doc 31 for rare bigram 'qq', got: %v", presentMatches)
+	}
+
+	// Query for doc 3000 rare bigram "yx"
+	yxMatches := idx.FilterCandidates("yx")
+	if len(yxMatches) != 1 || yxMatches[0] != 3000 {
+		t.Errorf("expected exactly doc 3000 for 'yx', got: %v", yxMatches)
 	}
 }

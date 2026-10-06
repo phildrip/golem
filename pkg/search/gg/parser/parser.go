@@ -74,16 +74,19 @@ func Parse(raw string) Query {
 			continue
 		}
 
-		// Check for directory constraint: ends with /
-		if strings.HasSuffix(token, "/") {
-			constraints = append(constraints, Constraint{
-				Type:  ConstraintPathSegment,
-				Value: strings.ToLower(token),
-			})
-			continue
+		// Check for directory constraint: ends with / or starts with /
+		if strings.HasSuffix(token, "/") || strings.HasPrefix(token, "/") {
+			cleanSeg := strings.Trim(token, "/")
+			if cleanSeg != "" {
+				constraints = append(constraints, Constraint{
+					Type:  ConstraintPathSegment,
+					Value: strings.ToLower(cleanSeg),
+				})
+				continue
+			}
 		}
 
-		// Check for file path constraint with slash: e.g. "pkg/tools/fff.go"
+		// Check for file path constraint with slash: e.g. "pkg/tools/gg.go"
 		if strings.Contains(token, "/") && strings.Contains(token, ".") {
 			constraints = append(constraints, Constraint{
 				Type:  ConstraintFilePath,
@@ -114,7 +117,10 @@ func (q Query) Matches(path string) bool {
 				return false
 			}
 		case ConstraintPathSegment:
-			if !strings.Contains(pathLower, c.Value) {
+			hasPrefix := strings.HasPrefix(pathLower, c.Value+"/")
+			hasMiddle := strings.Contains(pathLower, "/"+c.Value+"/")
+			hasExact := pathLower == c.Value
+			if !hasPrefix && !hasMiddle && !hasExact {
 				return false
 			}
 		case ConstraintFilePath:

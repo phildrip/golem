@@ -132,3 +132,41 @@ func TestScannerMaxFiles(t *testing.T) {
 		t.Fatalf("expected exactly 5 results, got %d", len(results))
 	}
 }
+
+func TestScannerEdgeCases(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. Empty directory
+	emptyDir := filepath.Join(tempDir, "empty")
+	_ = os.MkdirAll(emptyDir, 0755)
+	scannerEmpty := NewScanner(ScanOptions{RootDir: emptyDir})
+	resEmpty, err := scannerEmpty.Scan(context.Background())
+	if err != nil {
+		t.Fatalf("scan empty dir failed: %v", err)
+	}
+	if len(resEmpty) != 0 {
+		t.Errorf("expected 0 files in empty dir, got %d", len(resEmpty))
+	}
+
+	// 2. Deeply nested directories
+	deepDir := filepath.Join(tempDir, "a", "b", "c", "d", "e")
+	_ = os.MkdirAll(deepDir, 0755)
+	deepFile := filepath.Join(deepDir, "deep.txt")
+	_ = os.WriteFile(deepFile, []byte("deep"), 0644)
+
+	scannerDeep := NewScanner(ScanOptions{RootDir: filepath.Join(tempDir, "a")})
+	resDeep, err := scannerDeep.Scan(context.Background())
+	if err != nil {
+		t.Fatalf("scan deep dir failed: %v", err)
+	}
+	if len(resDeep) != 1 || resDeep[0] != "b/c/d/e/deep.txt" {
+		t.Errorf("expected b/c/d/e/deep.txt, got: %v", resDeep)
+	}
+
+	// 3. Invalid non-directory root
+	scannerInvalid := NewScanner(ScanOptions{RootDir: deepFile})
+	_, err = scannerInvalid.Scan(context.Background())
+	if err == nil {
+		t.Errorf("expected error when scanning a file instead of directory")
+	}
+}

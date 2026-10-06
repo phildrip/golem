@@ -1,6 +1,7 @@
 package scoring
 
 import (
+	"fmt"
 	"sort"
 	"testing"
 )
@@ -18,6 +19,7 @@ func TestFastSubsequenceCheck(t *testing.T) {
 		{"main", "cmd/golem/main.go", true},
 		{"pkg", "README.md", false},
 		{"GO", "main.go", true}, // case-insensitive
+		{"コント", "日本語/コントローラー.tsx", true}, // UTF-8 multibyte
 	}
 
 	for _, c := range cases {
@@ -50,10 +52,57 @@ func TestFuzzyScore(t *testing.T) {
 		t.Fatalf("expected boundary match")
 	}
 
+	// CamelCase bonus: "FB" should match "FooBar.go" with high score
+	sCamel, _, mCamel := FuzzyScore("FB", "pkg/core/FooBar.go")
+	if !mCamel || sCamel <= 0 {
+		t.Fatalf("expected CamelCase match")
+	}
+
 	// Non-matching
 	_, _, mNone := FuzzyScore("xyz", "main.go")
 	if mNone {
 		t.Errorf("expected no match for xyz in main.go")
+	}
+}
+
+// TestFuzzyParallelAndSequentialMatch ports FFF's fuzzy_parallel_and_sequential_scores_match test.
+func TestFuzzyParallelAndSequentialMatch(t *testing.T) {
+	var paths []string
+	for i := 0; i < 2000; i++ {
+		paths = append(paths, fmt.Sprintf("src/components/group_%d/controller_é_%d.tsx", i/100, i))
+	}
+
+	query := "controller"
+
+	// Sequential scores
+	seqResults := make([]MatchResult, len(paths))
+	for i, p := range paths {
+		score, pos, matched := FuzzyScore(query, p)
+		seqResults[i] = MatchResult{
+			Path:      p,
+			Score:     score,
+			Positions: pos,
+			Matched:   matched,
+		}
+	}
+
+	// Parallel scores (4 workers)
+	parResults := ParallelMatchScores(query, paths, 4)
+
+	if len(seqResults) != len(parResults) {
+		t.Fatalf("length mismatch: seq %d, par %d", len(seqResults), len(parResults))
+	}
+
+	for i := range seqResults {
+		if seqResults[i].Matched != parResults[i].Matched {
+			t.Errorf("at index %d: matched mismatch (seq %v, par %v)", i, seqResults[i].Matched, parResults[i].Matched)
+		}
+		if seqResults[i].Score != parResults[i].Score {
+			t.Errorf("at index %d: score mismatch (seq %d, par %d)", i, seqResults[i].Score, parResults[i].Score)
+		}
+		if len(seqResults[i].Positions) != len(parResults[i].Positions) {
+			t.Errorf("at index %d: positions len mismatch", i)
+		}
 	}
 }
 

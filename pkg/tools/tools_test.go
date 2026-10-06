@@ -210,7 +210,7 @@ func TestADKToolInstantiation(t *testing.T) {
 	}
 }
 
-func TestFFF_FindAndGrep(t *testing.T) {
+func TestGG_FindAndGrep(t *testing.T) {
 	tempDir := t.TempDir()
 
 	// Create test directory tree

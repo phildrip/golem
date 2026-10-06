@@ -18,7 +18,7 @@ import (
 	"google.golang.org/adk/v2/tool/functiontool"
 )
 
-// FindFilesArgs defines input for fast file finding (fff).
+// FindFilesArgs defines input for fast file finding (gg).
 type FindFilesArgs struct {
 	Query       string `json:"query" jsonschema:"Fuzzy search term or pattern to match against file paths (e.g. 'agent.go', 'config', '*.json')"`
 	Directory   string `json:"directory,omitempty" jsonschema:"Subdirectory to search within (relative to workspace). Defaults to root if omitted."`
@@ -32,7 +32,7 @@ type FindFilesResult struct {
 	Backend string   `json:"backend" jsonschema:"Search backend used: 'gg-native', 'fff-native', 'git-ls', or 'walk'"`
 }
 
-// GrepFilesArgs defines input for fast content searching (ffgrep).
+// GrepFilesArgs defines input for fast content searching (gg grep).
 type GrepFilesArgs struct {
 	Pattern     string `json:"pattern" jsonschema:"Text or regex pattern to search for inside files"`
 	Directory   string `json:"directory,omitempty" jsonschema:"Subdirectory to search within (relative to workspace). Defaults to root if omitted."`
@@ -467,21 +467,21 @@ func runBuiltinGrep(searchRoot, pattern, filePattern string, maxResults int) ([]
 	return matches, err
 }
 
-// NewFindFilesTool returns an ADK tool exposing fff fast file finding.
+// NewFindFilesTool returns an ADK tool exposing gg fast file finding.
 func NewFindFilesTool(baseDir string) (tool.Tool, error) {
 	return functiontool.New(functiontool.Config{
 		Name:        "find_files",
-		Description: "Fast file finder (fff) for rapidly locating files by name or path across the workspace. Uses indexed fff/git if available, falling back to directory traversal.",
+		Description: "Fast file finder (gg) for rapidly locating files by name, extension, glob, or path across the workspace. Uses pure Go inverted index and fuzzy matching with fallback to git/walk.",
 	}, func(ctx agent.Context, args FindFilesArgs) (FindFilesResult, error) {
 		return FindFiles(baseDir, args.Directory, args.Query, args.MaxResults)
 	})
 }
 
-// NewGrepFilesTool returns an ADK tool exposing ffgrep content searching.
+// NewGrepFilesTool returns an ADK tool exposing gg content searching.
 func NewGrepFilesTool(baseDir string) (tool.Tool, error) {
 	return functiontool.New(functiontool.Config{
 		Name:        "grep_files",
-		Description: "Fast content search (ffgrep) across workspace files. Returns matching file paths, line numbers, and content excerpts.",
+		Description: "Fast content search (gg grep) across workspace files. Returns matching file paths, line numbers, and content excerpts using pure Go SIMD/regex searcher.",
 	}, func(ctx agent.Context, args GrepFilesArgs) (GrepFilesResult, error) {
 		return GrepFiles(baseDir, args.Directory, args.Pattern, args.FilePattern, args.MaxResults)
 	})
