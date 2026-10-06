@@ -104,13 +104,10 @@ func FindFiles(baseDir, subDir, query string, maxResults int) (FindFilesResult, 
 	}, nil
 }
 
-// findFFFBinary locates the fff-mcp, fff, or ffgrep binary on the system.
+// findFFFBinary locates the fff-mcp binary on the system (PATH or ~/.local/bin/fff-mcp).
 func findFFFBinary() string {
-	candidates := []string{"fff-mcp", "fff", "ffgrep"}
-	for _, name := range candidates {
-		if path, err := exec.LookPath(name); err == nil && path != "" {
-			return path
-		}
+	if path, err := exec.LookPath("fff-mcp"); err == nil && path != "" {
+		return path
 	}
 	// Check standard user local bin installer location (~/.local/bin/fff-mcp)
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
@@ -251,7 +248,7 @@ func GrepFiles(baseDir, subDir, pattern, filePattern string, maxResults int) (Gr
 		return GrepFilesResult{}, err
 	}
 
-	// 1. Try native fff (fff-mcp / fff / ffgrep) if installed
+	// 1. Try native fff-mcp if installed
 	binName := findFFFBinary()
 	if binName != "" {
 		res, err := runFFFGrep(binName, searchRoot, pattern, filePattern, maxResults)
