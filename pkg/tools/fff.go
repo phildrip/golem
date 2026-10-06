@@ -3,6 +3,7 @@ package tools
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	"github.com/user/golem/pkg/search/gg"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/functiontool"
@@ -27,7 +29,7 @@ type FindFilesArgs struct {
 type FindFilesResult struct {
 	Files   []string `json:"files" jsonschema:"Matching file paths relative to search directory"`
 	Count   int      `json:"count" jsonschema:"Number of matching files found"`
-	Backend string   `json:"backend" jsonschema:"Search backend used: 'fff-native', 'git-ls', or 'walk'"`
+	Backend string   `json:"backend" jsonschema:"Search backend used: 'gg-native', 'fff-native', 'git-ls', or 'walk'"`
 }
 
 // GrepFilesArgs defines input for fast content searching (ffgrep).
@@ -49,7 +51,7 @@ type GrepMatch struct {
 type GrepFilesResult struct {
 	Matches []GrepMatch `json:"matches" jsonschema:"List of matching lines"`
 	Count   int         `json:"count" jsonschema:"Total matches found"`
-	Backend string      `json:"backend" jsonschema:"Search backend used: 'fff-native', 'ripgrep', or 'builtin'"`
+	Backend string      `json:"backend" jsonschema:"Search backend used: 'gg-native', 'fff-native', 'ripgrep', or 'builtin'"`
 }
 
 // FindFiles searches for file paths matching query within baseDir.
@@ -66,7 +68,20 @@ func FindFiles(baseDir, subDir, query string, maxResults int) (FindFilesResult, 
 		return FindFilesResult{}, err
 	}
 
-	// 1. Try fff or fff-mcp if installed
+	// 1. Primary: native pure Go gg engine (bigram inverted index + parallel fuzzy matcher)
+	if ggResults, err := gg.FindFiles(context.Background(), searchRoot, query, maxResults); err == nil {
+		var paths []string
+		for _, r := range ggResults {
+			paths = append(paths, r.Path)
+		}
+		return FindFilesResult{
+			Files:   paths,
+			Count:   len(paths),
+			Backend: "gg-native",
+		}, nil
+	}
+
+	// 2. Fallback: try fff or fff-mcp if installed
 	binName := findFFFBinary()
 	if binName != "" {
 		res, err := runFFFSearch(binName, searchRoot, query, maxResults)
@@ -248,7 +263,28 @@ func GrepFiles(baseDir, subDir, pattern, filePattern string, maxResults int) (Gr
 		return GrepFilesResult{}, err
 	}
 
-	// 1. Try native fff-mcp if installed
+	// 1. Primary: native pure Go gg grep engine (SIMD-optimized bytes.Index & regex)
+	if ggMatches, err := gg.GrepFiles(context.Background(), searchRoot, gg.GrepOptions{
+		Pattern:     pattern,
+		FilePattern: filePattern,
+		MaxMatches:  maxResults,
+	}); err == nil {
+		var matches []GrepMatch
+		for _, m := range ggMatches {
+			matches = append(matches, GrepMatch{
+				File:    m.File,
+				LineNum: m.LineNum,
+				Content: m.Content,
+			})
+		}
+		return GrepFilesResult{
+			Matches: matches,
+			Count:   len(matches),
+			Backend: "gg-native",
+		}, nil
+	}
+
+	// 2. Fallback: try native fff-mcp if installed
 	binName := findFFFBinary()
 	if binName != "" {
 		res, err := runFFFGrep(binName, searchRoot, pattern, filePattern, maxResults)

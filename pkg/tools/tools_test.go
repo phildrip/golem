@@ -408,3 +408,65 @@ func Run() {
 		t.Errorf("expected 'missing line hash' in error, got: %v", err)
 	}
 }
+
+func TestFindFilesGGNative(t *testing.T) {
+	tempDir := t.TempDir()
+
+	_ = os.MkdirAll(filepath.Join(tempDir, "pkg", "search"), 0755)
+	_ = os.WriteFile(filepath.Join(tempDir, "main.go"), []byte("package main"), 0644)
+	_ = os.WriteFile(filepath.Join(tempDir, "pkg", "search", "engine.go"), []byte("package search"), 0644)
+	_ = os.WriteFile(filepath.Join(tempDir, ".gitignore"), []byte("ignored.txt\n"), 0644)
+	_ = os.WriteFile(filepath.Join(tempDir, "ignored.txt"), []byte("secret"), 0644)
+
+	res, err := FindFiles(tempDir, "", "engine", 10)
+	if err != nil {
+		t.Fatalf("FindFiles failed: %v", err)
+	}
+
+	if res.Backend != "gg-native" {
+		t.Errorf("expected backend 'gg-native', got: %s", res.Backend)
+	}
+
+	if len(res.Files) != 1 || res.Files[0] != "pkg/search/engine.go" {
+		t.Errorf("expected pkg/search/engine.go, got: %v", res.Files)
+	}
+
+	// Verify ignored file is not found
+	resIgnored, err := FindFiles(tempDir, "", "ignored", 10)
+	if err != nil {
+		t.Fatalf("FindFiles failed: %v", err)
+	}
+	if len(resIgnored.Files) != 0 {
+		t.Errorf("expected 0 matches for ignored.txt, got: %v", resIgnored.Files)
+	}
+}
+
+func TestGrepFilesGGNative(t *testing.T) {
+	tempDir := t.TempDir()
+
+	_ = os.MkdirAll(filepath.Join(tempDir, "src"), 0755)
+	_ = os.WriteFile(filepath.Join(tempDir, "main.go"), []byte("package main\n\nfunc main() {\n\t// TODO: implement\n}\n"), 0644)
+	_ = os.WriteFile(filepath.Join(tempDir, "src", "helper.go"), []byte("package src\n\nfunc Helper() string {\n\treturn \"TODO here\"\n}\n"), 0644)
+	_ = os.WriteFile(filepath.Join(tempDir, "notes.txt"), []byte("TODO in notes\n"), 0644)
+
+	// Grep with file filter *.go
+	res, err := GrepFiles(tempDir, "", "TODO", "*.go", 10)
+	if err != nil {
+		t.Fatalf("GrepFiles failed: %v", err)
+	}
+
+	if res.Backend != "gg-native" {
+		t.Errorf("expected backend 'gg-native', got: %s", res.Backend)
+	}
+
+	if res.Count != 2 {
+		t.Errorf("expected 2 matches in *.go, got %d", res.Count)
+	}
+
+	for _, m := range res.Matches {
+		if !strings.HasSuffix(m.File, ".go") {
+			t.Errorf("expected .go match, got: %s", m.File)
+		}
+	}
+}
+
