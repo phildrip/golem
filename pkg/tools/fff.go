@@ -66,9 +66,10 @@ func FindFiles(baseDir, subDir, query string, maxResults int) (FindFilesResult, 
 		return FindFilesResult{}, err
 	}
 
-	// 1. Try fff if installed
-	if fffPath, err := exec.LookPath("fff"); err == nil && fffPath != "" {
-		res, err := runFFFSearch(fffPath, searchRoot, query, maxResults)
+	// 1. Try fff or fff-mcp if installed
+	binName := findFFFBinary()
+	if binName != "" {
+		res, err := runFFFSearch(binName, searchRoot, query, maxResults)
 		if err == nil && len(res) > 0 {
 			return FindFilesResult{
 				Files:   res,
@@ -101,6 +102,24 @@ func FindFiles(baseDir, subDir, query string, maxResults int) (FindFilesResult, 
 		Count:   len(res),
 		Backend: "walk",
 	}, nil
+}
+
+// findFFFBinary locates the fff-mcp, fff, or ffgrep binary on the system.
+func findFFFBinary() string {
+	candidates := []string{"fff-mcp", "fff", "ffgrep"}
+	for _, name := range candidates {
+		if path, err := exec.LookPath(name); err == nil && path != "" {
+			return path
+		}
+	}
+	// Check standard user local bin installer location (~/.local/bin/fff-mcp)
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		localPath := filepath.Join(home, ".local", "bin", "fff-mcp")
+		if info, err := os.Stat(localPath); err == nil && !info.IsDir() {
+			return localPath
+		}
+	}
+	return ""
 }
 
 func runFFFSearch(binPath, searchRoot, query string, maxResults int) ([]string, error) {
@@ -232,18 +251,10 @@ func GrepFiles(baseDir, subDir, pattern, filePattern string, maxResults int) (Gr
 		return GrepFilesResult{}, err
 	}
 
-	// 1. Try native fff (ffgrep / fff grep) if installed
-	if fffPath, err := exec.LookPath("fff"); err == nil && fffPath != "" {
-		res, err := runFFFGrep(fffPath, searchRoot, pattern, filePattern, maxResults)
-		if err == nil && len(res) > 0 {
-			return GrepFilesResult{
-				Matches: res,
-				Count:   len(res),
-				Backend: "fff-native",
-			}, nil
-		}
-	} else if ffgrepPath, err := exec.LookPath("ffgrep"); err == nil && ffgrepPath != "" {
-		res, err := runFFFGrep(ffgrepPath, searchRoot, pattern, filePattern, maxResults)
+	// 1. Try native fff (fff-mcp / fff / ffgrep) if installed
+	binName := findFFFBinary()
+	if binName != "" {
+		res, err := runFFFGrep(binName, searchRoot, pattern, filePattern, maxResults)
 		if err == nil && len(res) > 0 {
 			return GrepFilesResult{
 				Matches: res,
