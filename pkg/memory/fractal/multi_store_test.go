@@ -117,4 +117,10 @@ func TestMultiZoomAndRememberTools(t *testing.T) {
 	if !ok || !strings.Contains(ev.Text, "always run gofumpt") {
 		t.Errorf("expected remembered event in mountedStore, got: %+v", ev)
 	}
+
+	// Verify auto-folded level 0 node exists
+	node, hasNode := mountedStore.GetNode(0, 1)
+	if !hasNode || !strings.Contains(node.Text, "always run gofumpt") {
+		t.Errorf("expected level 0 node auto-folded in mountedStore, got: %+v", node)
+	}
 }

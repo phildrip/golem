@@ -261,6 +261,17 @@ func TestFFF_FindAndGrep(t *testing.T) {
 	if grepFiltered.Count != 1 {
 		t.Errorf("expected 1 match with filter, got: %+v", grepFiltered)
 	}
+
+	// 4. Test GrepFiles with hyphenated search pattern (e.g. '--flag' / '-v')
+	fHyphen := filepath.Join(tempDir, "flags.txt")
+	_ = os.WriteFile(fHyphen, []byte("enable --debug mode\nuse -v for verbose\n"), 0644)
+	grepHyphen, err := GrepFiles(tempDir, "", "--debug", "", 10)
+	if err != nil {
+		t.Fatalf("GrepFiles hyphenated pattern failed: %v", err)
+	}
+	if grepHyphen.Count != 1 || !strings.Contains(grepHyphen.Matches[0].Content, "--debug") {
+		t.Errorf("expected 1 match containing --debug, got: %+v", grepHyphen)
+	}
 }
 
 func TestHashline_ReadAndPatch(t *testing.T) {
@@ -360,5 +371,40 @@ func Run() {
 	diskCheck, _ := os.ReadFile(fullPath)
 	if strings.Contains(string(diskCheck), "package modified") {
 		t.Errorf("dry-run should not have modified file content on disk")
+	}
+
+	// 7. Test Empty 0-byte file read and initialization
+	emptyFile := "empty.txt"
+	emptyPath := filepath.Join(tempDir, emptyFile)
+	_ = os.WriteFile(emptyPath, []byte(""), 0644)
+
+	emptyRead, err := ReadFileWithHashlines(tempDir, emptyFile, 1, 10)
+	if err != nil {
+		t.Fatalf("ReadFileWithHashlines empty file failed: %v", err)
+	}
+	if emptyRead.TotalLines != 0 || len(emptyRead.Lines) != 0 {
+		t.Errorf("expected 0 lines for empty file, got %d", emptyRead.TotalLines)
+	}
+
+	initRes, err := PatchFileWithHashline(tempDir, emptyFile, "SWAP", "0", "first line\nsecond line", false)
+	if err != nil {
+		t.Fatalf("PatchFileWithHashline on empty file failed: %v", err)
+	}
+	if !initRes.Success {
+		t.Errorf("expected init success on empty file")
+	}
+
+	dataInit, _ := os.ReadFile(emptyPath)
+	if !strings.Contains(string(dataInit), "first line\nsecond line") {
+		t.Errorf("expected initialized file content, got: %s", string(dataInit))
+	}
+
+	// 8. Test Enforced Hash Anchor requirement (rejecting bare line numbers like "2")
+	_, err = PatchFileWithHashline(tempDir, targetFile, "SWAP", "2", "replacement", false)
+	if err == nil {
+		t.Fatalf("expected error when omitting hash in anchor, got nil")
+	}
+	if !strings.Contains(err.Error(), "missing line hash in start anchor") {
+		t.Errorf("expected 'missing line hash' in error, got: %v", err)
 	}
 }

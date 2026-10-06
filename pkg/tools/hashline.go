@@ -79,13 +79,25 @@ func ReadFileWithHashlines(baseDir, filePath string, startLine, lineCount int) (
 		return HashlineReadResult{}, errors.Wrapf(err, "reading file %s", safePath)
 	}
 
-	rawLines := strings.Split(string(data), "\n")
-	// Handle trailing empty line from standard UNIX files without counting extra line
-	if len(rawLines) > 0 && rawLines[len(rawLines)-1] == "" && strings.HasSuffix(string(data), "\n") {
-		rawLines = rawLines[:len(rawLines)-1]
+	var rawLines []string
+	if len(data) > 0 {
+		rawLines = strings.Split(string(data), "\n")
+		// Handle trailing empty line from standard UNIX files without counting extra line
+		if len(rawLines) > 0 && rawLines[len(rawLines)-1] == "" && strings.HasSuffix(string(data), "\n") {
+			rawLines = rawLines[:len(rawLines)-1]
+		}
 	}
 
 	total := len(rawLines)
+	if total == 0 {
+		return HashlineReadResult{
+			FilePath:   filePath,
+			TotalLines: 0,
+			Lines:      []HashlineReadLine{},
+			Rendered:   fmt.Sprintf("[%s#lines 0-0 of 0 (empty file)]\n", filePath),
+		}, nil
+	}
+
 	if startLine < 1 {
 		startLine = 1
 	}
@@ -124,7 +136,7 @@ func ReadFileWithHashlines(baseDir, filePath string, startLine, lineCount int) (
 type HashlinePatchArgs struct {
 	FilePath string `json:"file_path" jsonschema:"Path to the file to patch (must be within workspace)"`
 	Op       string `json:"op" jsonschema:"Operation type: 'SWAP', 'DEL', 'INS.PRE', or 'INS.POST'"`
-	Anchor   string `json:"anchor" jsonschema:"Target anchor: e.g. '42:a3' or range '42:a3..45:f1'"`
+	Anchor   string `json:"anchor" jsonschema:"Target anchor: e.g. '42:a3' or range '42:a3..45:f1' (or '0' for empty files)"`
 	Content  string `json:"content,omitempty" jsonschema:"New replacement or inserted content (lines can optionally begin with '+ ')"`
 	DryRun   bool   `json:"dry_run,omitempty" jsonschema:"If true, checks anchors without writing changes to disk"`
 }
@@ -148,10 +160,13 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 		return HashlinePatchResult{}, errors.Wrapf(err, "reading file %s for patch", safePath)
 	}
 
-	rawLines := strings.Split(string(data), "\n")
+	var rawLines []string
 	hasTrailingNewline := strings.HasSuffix(string(data), "\n")
-	if len(rawLines) > 0 && rawLines[len(rawLines)-1] == "" && hasTrailingNewline {
-		rawLines = rawLines[:len(rawLines)-1]
+	if len(data) > 0 {
+		rawLines = strings.Split(string(data), "\n")
+		if len(rawLines) > 0 && rawLines[len(rawLines)-1] == "" && hasTrailingNewline {
+			rawLines = rawLines[:len(rawLines)-1]
+		}
 	}
 
 	// Clean content lines (strip optional "+ " prefixes from unified diff / hashline bodies)
@@ -166,6 +181,31 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 				newBodyLines = append(newBodyLines, row)
 			}
 		}
+	}
+
+	normOp := strings.ToUpper(strings.TrimSpace(op))
+
+	// Handle empty file initialization
+	if len(rawLines) == 0 {
+		if normOp == "SWAP" || normOp == "REPLACE" || normOp == "INS.PRE" || normOp == "INS.POST" || normOp == "INSERT_BEFORE" || normOp == "INSERT_AFTER" {
+			outputStr := strings.Join(newBodyLines, "\n")
+			if len(newBodyLines) > 0 {
+				outputStr += "\n"
+			}
+			msg := fmt.Sprintf("Successfully initialized empty file with %d lines", len(newBodyLines))
+			if dryRun {
+				return HashlinePatchResult{
+					Success: true,
+					Message: "[DRY-RUN] " + msg,
+					Diff:    fmt.Sprintf("Lines before: 0, lines after: %d", len(newBodyLines)),
+				}, nil
+			}
+			if err := os.WriteFile(safePath, []byte(outputStr), 0644); err != nil {
+				return HashlinePatchResult{}, errors.Wrapf(err, "writing patched file %s", safePath)
+			}
+			return HashlinePatchResult{Success: true, Message: msg}, nil
+		}
+		return HashlinePatchResult{}, errors.Errorf("cannot apply %s on empty file", op)
 	}
 
 	// Parse anchor(s)
@@ -199,27 +239,31 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 		return HashlinePatchResult{}, errors.Errorf("end line %d out of bounds (file has %d lines)", endAnchor.LineNum, len(rawLines))
 	}
 
-	// Verify content hashes
-	if startAnchor.Hash != "" {
-		actualHash := LineHash(rawLines[startAnchor.LineNum-1])
-		if actualHash != startAnchor.Hash {
-			return HashlinePatchResult{}, errors.Errorf("stale read: line %d expected hash %s, but found %s (%q)",
-				startAnchor.LineNum, startAnchor.Hash, actualHash, rawLines[startAnchor.LineNum-1])
-		}
+	// Verify content hashes (enforce hash presence to prevent bypassing stale-read safety)
+	if startAnchor.Hash == "" {
+		return HashlinePatchResult{}, errors.Errorf("missing line hash in start anchor %q (hashline requires format 'line:hash', e.g. '%d:%s')",
+			anchorStr, startAnchor.LineNum, LineHash(rawLines[startAnchor.LineNum-1]))
 	}
-	if endAnchor.Hash != "" {
-		actualHash := LineHash(rawLines[endAnchor.LineNum-1])
-		if actualHash != endAnchor.Hash {
-			return HashlinePatchResult{}, errors.Errorf("stale read: line %d expected hash %s, but found %s (%q)",
-				endAnchor.LineNum, endAnchor.Hash, actualHash, rawLines[endAnchor.LineNum-1])
-		}
+	actualStartHash := LineHash(rawLines[startAnchor.LineNum-1])
+	if actualStartHash != startAnchor.Hash {
+		return HashlinePatchResult{}, errors.Errorf("stale read: line %d expected hash %s, but found %s (%q)",
+			startAnchor.LineNum, startAnchor.Hash, actualStartHash, rawLines[startAnchor.LineNum-1])
+	}
+
+	if endAnchor.Hash == "" {
+		return HashlinePatchResult{}, errors.Errorf("missing line hash in end anchor %q (hashline requires format 'line:hash', e.g. '%d:%s')",
+			anchorStr, endAnchor.LineNum, LineHash(rawLines[endAnchor.LineNum-1]))
+	}
+	actualEndHash := LineHash(rawLines[endAnchor.LineNum-1])
+	if actualEndHash != endAnchor.Hash {
+		return HashlinePatchResult{}, errors.Errorf("stale read: line %d expected hash %s, but found %s (%q)",
+			endAnchor.LineNum, endAnchor.Hash, actualEndHash, rawLines[endAnchor.LineNum-1])
 	}
 
 	// Apply operation
 	startIdx := startAnchor.LineNum - 1
 	endIdx := endAnchor.LineNum // exclusive slice bound
 
-	normOp := strings.ToUpper(strings.TrimSpace(op))
 	var resultLines []string
 
 	switch normOp {

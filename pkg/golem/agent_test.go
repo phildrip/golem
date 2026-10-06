@@ -301,5 +301,15 @@ func TestAgentProfileAndMountedMemory(t *testing.T) {
 	if !strings.Contains(combined, "<chat>") {
 		t.Errorf("expected primary <chat> in combined view, got:\n%s", combined)
 	}
+
+	// Test Agent.SwitchProfile hot switching
+	prof, err := agent.SwitchProfile(ctx, "personal")
+	if err != nil {
+		t.Fatalf("SwitchProfile failed: %v", err)
+	}
+	if agent.Config().Profile != "personal" {
+		t.Errorf("expected active profile 'personal', got: %s", agent.Config().Profile)
+	}
+	_ = prof
 }
 

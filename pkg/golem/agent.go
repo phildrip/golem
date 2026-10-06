@@ -676,6 +676,47 @@ func (a *Agent) Config() Config {
 	return a.cfg
 }
 
+// SwitchProfile hot-switches the active profile on the running Agent, mounting the profile memory store if needed.
+func (a *Agent) SwitchProfile(ctx context.Context, profileName string) (config.ProfileConfig, error) {
+	name, prof := config.ResolveActiveProfile(profileName, a.cfg.FileConfig)
+	a.cfg.Profile = name
+
+	if prof.Provider != "" {
+		a.cfg.Provider = prof.Provider
+	}
+	if prof.Model != "" {
+		a.cfg.ModelName = prof.Model
+	}
+	if prof.BaseURL != "" {
+		a.cfg.BaseURL = prof.BaseURL
+	}
+	if prof.APIKey != "" {
+		a.cfg.APIKey = prof.APIKey
+	}
+
+	// Mount target profile memory if configured and different from workspace storage
+	if name != "" && name != "default" && a.memoryMgr != nil {
+		profDir := prof.MemoryDir
+		if profDir == "" {
+			profDir, _ = config.ProfileMemoryDir(name)
+		}
+		if profDir != "" && profDir != a.cfg.StorageDir {
+			if _, exists := a.memoryMgr.GetStore(name); !exists {
+				if profStore, err := fractal.OpenStore(profDir); err == nil {
+					viewCfg := fractal.ViewConfig{
+						ViewBudgetBytes: a.cfg.ViewBudgetBytes,
+						LiveHeadCount:   a.cfg.LiveHeadCount,
+					}
+					profView := fractal.NewView(profStore, viewCfg)
+					a.memoryMgr.Mount(name, profStore, profView, true)
+				}
+			}
+		}
+	}
+
+	return prof, nil
+}
+
 // Store returns the underlying fractal event and node store.
 func (a *Agent) Store() *fractal.Store {
 	return a.store

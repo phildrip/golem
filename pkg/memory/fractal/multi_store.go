@@ -241,6 +241,21 @@ func Remember(registry StoreRegistry, defaultScope string, args RememberArgs) (R
 		return RememberResult{}, errors.Wrap(err, "appending memory event")
 	}
 
+	// Auto-sync views across registry so new event is immediately reflected in fractal tails
+	if syncable, ok := registry.(interface{ SyncAll() }); ok {
+		syncable.SyncAll()
+	}
+
+	// Auto-fold level 0 node for immediate tree structuring if not yet present
+	if _, hasNode := store.GetNode(0, ev.ID); !hasNode {
+		_ = store.SaveNode(Node{
+			Level: 0,
+			Index: ev.ID,
+			Text:  ev.FormatLine(),
+			Size:  ev.Size,
+		})
+	}
+
 	return RememberResult{
 		Message: fmt.Sprintf("Recorded to %s memory (event #%d): %s", targetScope, ev.ID, text),
 	}, nil

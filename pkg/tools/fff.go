@@ -262,7 +262,8 @@ func runRipgrep(rgPath, searchRoot, pattern, filePattern string, maxResults int)
 	if filePattern != "" {
 		args = append(args, "-g", filePattern)
 	}
-	args = append(args, pattern, ".")
+	// Use '--' to ensure hyphenated patterns (e.g. '--debug', '-v') are treated as search text, not flags
+	args = append(args, "--", pattern, ".")
 
 	cmd := exec.Command(rgPath, args...)
 	cmd.Dir = searchRoot

@@ -1417,7 +1417,7 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.currentProfile = targetProfile
 		info := fmt.Sprintf("Switched active profile to: %s", targetProfile)
 		if m.agent != nil {
-			_, prof := config.ResolveActiveProfile(targetProfile, m.agent.Config().FileConfig)
+			prof, _ := m.agent.SwitchProfile(context.Background(), targetProfile)
 			if prof.Provider != "" || prof.Model != "" {
 				info = fmt.Sprintf("Switched active profile to %s (provider: %s, model: %s)", targetProfile, prof.Provider, prof.Model)
 			}
