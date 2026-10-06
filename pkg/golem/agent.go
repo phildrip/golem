@@ -13,6 +13,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/user/golem/pkg/mcp"
 	"github.com/user/golem/pkg/memory/fractal"
+	"github.com/user/golem/pkg/subagent"
 	"github.com/user/golem/pkg/tools"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
@@ -33,6 +34,14 @@ type StreamHandler interface {
 	OnChunk(token string)
 	OnToolStart(toolName, command string)
 	OnToolDone(toolName, output string, exitCode int)
+}
+
+// SubagentStreamHandler optionally extends StreamHandler to receive specialized subagent events.
+type SubagentStreamHandler interface {
+	StreamHandler
+	OnSubagentStart(role, model, prompt string)
+	OnSubagentTool(role, model, toolName, command, output string, exitCode int, isRunning bool)
+	OnSubagentDone(role, model, result string, duration time.Duration, err error)
 }
 
 // Config defines the configuration parameters for Golem.
@@ -74,6 +83,7 @@ type Agent struct {
 	compactor        *fractal.Compactor
 	mcpManager       *mcp.Manager
 	mcpToolsets      []mcp.NamedToolset
+	subagentRunner   *subagent.Runner
 	runner           *runner.Runner
 	adkAgent         agent.Agent
 	userID           string
@@ -240,7 +250,31 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		}
 	}
 
-	// 6. Initialize Gemini ADK Model
+	var agentPtr *Agent
+
+	// 6. Initialize Subagent Runner & Delegation Tool
+	modelFactory := subagent.NewModelFactory(clientCfg, cfg.ModelName)
+	subagentRunner := subagent.NewRunner(subagent.RunnerConfig{
+		ModelFactory:   modelFactory,
+		WorkspaceDir:   workDir,
+		ReadOnlyTools:  []tool.Tool{readFileTool, zoomTool, dateTool},
+		ReadWriteTools: []tool.Tool{writeFileTool, replaceRegexTool, shellTool},
+		MCPToolsets:    adkToolsets,
+		EventHandler: func(ev subagent.Event) {
+			if agentPtr != nil {
+				agentPtr.dispatchSubagentEvent(ev)
+			}
+		},
+	})
+	invokeSubagentTool, err := subagent.NewInvokeTool(subagentRunner)
+	if err != nil {
+		store.Close()
+		mcpManager.Close()
+		return nil, errors.Wrap(err, "creating invoke_subagent tool")
+	}
+	allTools = append(allTools, invokeSubagentTool)
+
+	// 7. Initialize Gemini ADK Model
 	modelInstance, err := gemini.NewModel(ctx, cfg.ModelName, clientCfg)
 	if err != nil {
 		store.Close()
@@ -248,9 +282,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		return nil, errors.Wrapf(err, "initializing gemini model %s", cfg.ModelName)
 	}
 
-	var agentPtr *Agent
-
-	// 7. Build LLM Agent with dynamic fractal memory injection & logging callbacks
+	// 8. Build LLM Agent with dynamic fractal memory injection & logging callbacks
 	adkAgent, err := llmagent.New(llmagent.Config{
 		Name:        "golem",
 		Description: "An autonomous agent equipped with shell and file tools, and infinite fractal memory.",
@@ -357,6 +389,7 @@ Memory Navigation:
 		compactor:        compactor,
 		mcpManager:       mcpManager,
 		mcpToolsets:      mcpToolsets,
+		subagentRunner:   subagentRunner,
 		runner:           adkRunner,
 		adkAgent:         adkAgent,
 		userID:           "user",
@@ -535,6 +568,44 @@ func (a *Agent) MCPToolsets() []mcp.NamedToolset {
 // MCPConfigPaths returns the discovered configuration file paths.
 func (a *Agent) MCPConfigPaths() []string {
 	return a.cfg.MCPConfigPaths
+}
+
+// SubagentRunner returns the subagent delegation runner.
+func (a *Agent) SubagentRunner() *subagent.Runner {
+	return a.subagentRunner
+}
+
+func (a *Agent) dispatchSubagentEvent(ev subagent.Event) {
+	a.activeHandlerMu.RLock()
+	h := a.activeHandler
+	a.activeHandlerMu.RUnlock()
+	if h == nil {
+		return
+	}
+
+	if sh, ok := h.(SubagentStreamHandler); ok {
+		switch ev.Type {
+		case subagent.EventSubagentStart:
+			sh.OnSubagentStart(ev.Role, ev.Model, ev.Prompt)
+		case subagent.EventSubagentTool:
+			sh.OnSubagentTool(ev.Role, ev.Model, ev.ToolName, ev.Command, ev.ToolOutput, ev.ExitCode, ev.IsRunning)
+		case subagent.EventSubagentDone:
+			sh.OnSubagentDone(ev.Role, ev.Model, ev.Result, ev.Duration, ev.Err)
+		}
+		return
+	}
+
+	// Fallback to standard StreamHandler tool calls
+	switch ev.Type {
+	case subagent.EventSubagentStart:
+		h.OnToolStart("subagent:"+ev.Role, fmt.Sprintf("[%s] %s", ev.Model, ev.Prompt))
+	case subagent.EventSubagentDone:
+		if ev.Err != nil {
+			h.OnToolDone("subagent:"+ev.Role, fmt.Sprintf("error: %v", ev.Err), 1)
+		} else {
+			h.OnToolDone("subagent:"+ev.Role, ev.Result, 0)
+		}
+	}
 }
 
 // isTransientError detects high demand, rate limits, or transient gateway errors.

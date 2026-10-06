@@ -83,6 +83,47 @@ func buildConfig(opts CLIOptions, fileCfg config.FileConfig, apiKey string) gole
 	return cfg
 }
 
+// cliStreamBridge formats streaming tokens, tool executions, and subagents in CLI mode.
+type cliStreamBridge struct {
+	out io.Writer
+}
+
+func (h *cliStreamBridge) OnChunk(token string) {
+	fmt.Fprint(h.out, token)
+}
+
+func (h *cliStreamBridge) OnToolStart(toolName, command string) {
+	fmt.Fprintf(h.out, "\n[Tool: %s %s]\n", toolName, command)
+}
+
+func (h *cliStreamBridge) OnToolDone(toolName, output string, exitCode int) {
+	if exitCode != 0 {
+		fmt.Fprintf(h.out, "[Tool: %s exit code %d]\n", toolName, exitCode)
+	}
+}
+
+func (h *cliStreamBridge) OnSubagentStart(role, model, prompt string) {
+	fmt.Fprintf(h.out, "\n[Subagent %s (%s) started: %s]\n", role, model, prompt)
+}
+
+func (h *cliStreamBridge) OnSubagentTool(role, model, toolName, command, output string, exitCode int, isRunning bool) {
+	if isRunning {
+		fmt.Fprintf(h.out, "  [Subagent %s -> %s %s]\n", role, toolName, command)
+	}
+}
+
+func (h *cliStreamBridge) OnSubagentDone(role, model, result string, duration time.Duration, err error) {
+	if err != nil {
+		fmt.Fprintf(h.out, "[Subagent %s (%s) failed in %v: %v]\n", role, model, duration.Round(time.Millisecond), err)
+	} else {
+		fmt.Fprintf(h.out, "[Subagent %s (%s) completed in %v]\n", role, model, duration.Round(time.Millisecond))
+	}
+}
+
+type streamableAgent interface {
+	ProcessStream(ctx context.Context, prompt string, handler golem.StreamHandler) (string, error)
+}
+
 // runReadlineLoop executes non-TUI line-based conversation with Golem.
 func runReadlineLoop(ctx context.Context, agent AgentProcessor, scanner *bufio.Scanner, out io.Writer) error {
 	fmt.Fprintln(out, "Ready! Type your message, or 'exit' / 'quit' to end.")
@@ -101,11 +142,22 @@ func runReadlineLoop(ctx context.Context, agent AgentProcessor, scanner *bufio.S
 			break
 		}
 
-		response, err := agent.Process(ctx, input)
-		if err != nil {
-			fmt.Fprintf(out, "Error: %v\n\n", err)
+		if sa, ok := agent.(streamableAgent); ok {
+			fmt.Fprint(out, "\nGolem: ")
+			bridge := &cliStreamBridge{out: out}
+			_, err := sa.ProcessStream(ctx, input, bridge)
+			if err != nil {
+				fmt.Fprintf(out, "\nError: %v\n\n", err)
+			} else {
+				fmt.Fprintln(out)
+			}
 		} else {
-			fmt.Fprintf(out, "\nGolem: %s\n\n", response)
+			response, err := agent.Process(ctx, input)
+			if err != nil {
+				fmt.Fprintf(out, "Error: %v\n\n", err)
+			} else {
+				fmt.Fprintf(out, "\nGolem: %s\n\n", response)
+			}
 		}
 	}
 	return scanner.Err()

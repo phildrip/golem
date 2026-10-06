@@ -840,5 +840,58 @@ func TestModel_MCPModalToggling(t *testing.T) {
 	}
 }
 
+func TestModel_SubagentCardRendering(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := fractal.OpenStore(tmpDir)
+	defer store.Close()
+	view := fractal.NewView(store, fractal.DefaultViewConfig())
+	m := NewModel(nil, store, view)
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = newM.(Model)
+
+	// 1. Dispatch subagentStartMsg
+	newM, _ = m.Update(subagentStartMsg{
+		role:   "researcher",
+		model:  "gemini-2.5-pro",
+		prompt: "investigate memory leaks",
+	})
+	m = newM.(Model)
+
+	if len(m.entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(m.entries))
+	}
+	entry := m.entries[0]
+	if entry.Type != TypeSubagent || !entry.IsRunning || entry.SubagentRole != "researcher" || entry.SubagentModel != "gemini-2.5-pro" {
+		t.Errorf("unexpected subagent entry state: %+v", entry)
+	}
+
+	viewContent := m.viewport.View()
+	if !strings.Contains(viewContent, "Subagent") || !strings.Contains(viewContent, "RESEARCHER") || !strings.Contains(viewContent, "gemini-2.5-pro") || !strings.Contains(viewContent, "RUNNING") {
+		t.Errorf("viewport missing running subagent card details: %s", viewContent)
+	}
+
+	// 2. Dispatch subagentDoneMsg
+	newM, _ = m.Update(subagentDoneMsg{
+		role:   "researcher",
+		model:  "gemini-2.5-pro",
+		result: "No memory leaks detected in heap profile.",
+	})
+	m = newM.(Model)
+
+	entry = m.entries[0]
+	if entry.IsRunning {
+		t.Errorf("expected subagent to be marked done")
+	}
+	if entry.Content != "No memory leaks detected in heap profile." {
+		t.Errorf("unexpected content: %s", entry.Content)
+	}
+
+	viewContent = m.viewport.View()
+	if !strings.Contains(viewContent, "DONE") || !strings.Contains(viewContent, "No memory leaks detected") {
+		t.Errorf("viewport missing completed subagent card details: %s", viewContent)
+	}
+}
+
+
 
 

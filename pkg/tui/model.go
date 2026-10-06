@@ -25,17 +25,21 @@ const (
 	TypeUser MessageType = iota
 	TypeAgent
 	TypeTool
+	TypeSubagent
 	TypeSystem
 )
 
 // ChatEntry represents a single visual item in the conversation history.
 type ChatEntry struct {
-	Type      MessageType
-	Content   string
-	ToolName  string
-	Command   string
-	ExitCode  int
-	IsRunning bool
+	Type           MessageType
+	Content        string
+	ToolName       string
+	Command        string
+	ExitCode       int
+	IsRunning      bool
+	SubagentRole   string
+	SubagentModel  string
+	SubagentPrompt string
 }
 
 // Custom Bubbletea Messages
@@ -50,6 +54,20 @@ type toolDoneMsg struct {
 	toolName string
 	output   string
 	exitCode int
+}
+
+type subagentStartMsg struct {
+	role   string
+	model  string
+	prompt string
+}
+
+type subagentDoneMsg struct {
+	role     string
+	model    string
+	result   string
+	duration time.Duration
+	err      error
 }
 
 type streamMsg struct {
@@ -528,6 +546,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderConversationToViewport()
 		m.viewport.GotoBottom()
 
+	case subagentStartMsg:
+		m.entries = append(m.entries, ChatEntry{
+			Type:           TypeSubagent,
+			SubagentRole:   msg.role,
+			SubagentModel:  msg.model,
+			SubagentPrompt: msg.prompt,
+			IsRunning:      true,
+		})
+		m.renderConversationToViewport()
+		m.viewport.GotoBottom()
+
+	case subagentDoneMsg:
+		for i := len(m.entries) - 1; i >= 0; i-- {
+			if m.entries[i].Type == TypeSubagent && m.entries[i].SubagentRole == msg.role && m.entries[i].IsRunning {
+				m.entries[i].IsRunning = false
+				if msg.err != nil {
+					m.entries[i].Content = fmt.Sprintf("Error: %v", msg.err)
+					m.entries[i].ExitCode = 1
+				} else {
+					m.entries[i].Content = msg.result
+					m.entries[i].ExitCode = 0
+				}
+				break
+			}
+		}
+		m.renderConversationToViewport()
+		m.viewport.GotoBottom()
+
 	case agentDoneMsg:
 		if !m.isLoading {
 			// Already canceled or interrupted by Ctrl+C
@@ -679,6 +725,10 @@ func (m *Model) renderConversationToViewport() {
 			card := RenderToolCard(entry.ToolName, entry.Command, entry.Content, entry.ExitCode, entry.IsRunning, m.viewport.Width)
 			sb.WriteString(card + "\n")
 
+		case TypeSubagent:
+			card := RenderSubagentCard(entry.SubagentRole, entry.SubagentModel, entry.SubagentPrompt, entry.Content, entry.IsRunning, m.viewport.Width)
+			sb.WriteString(card + "\n")
+
 		case TypeSystem:
 			sb.WriteString(lipgloss.NewStyle().Foreground(ColorWarning).Italic(true).Render(entry.Content) + "\n\n")
 		}
@@ -714,6 +764,39 @@ func (b *tuiStreamBridge) OnToolDone(toolName, output string, exitCode int) {
 		toolName: toolName,
 		output:   output,
 		exitCode: exitCode,
+	}
+}
+
+func (b *tuiStreamBridge) OnSubagentStart(role, model, prompt string) {
+	b.msgChan <- subagentStartMsg{
+		role:   role,
+		model:  model,
+		prompt: prompt,
+	}
+}
+
+func (b *tuiStreamBridge) OnSubagentTool(role, model, toolName, command, output string, exitCode int, isRunning bool) {
+	if isRunning {
+		b.msgChan <- toolStartMsg{
+			toolName: fmt.Sprintf("[%s] %s", role, toolName),
+			command:  command,
+		}
+	} else {
+		b.msgChan <- toolDoneMsg{
+			toolName: fmt.Sprintf("[%s] %s", role, toolName),
+			output:   output,
+			exitCode: exitCode,
+		}
+	}
+}
+
+func (b *tuiStreamBridge) OnSubagentDone(role, model, result string, duration time.Duration, err error) {
+	b.msgChan <- subagentDoneMsg{
+		role:     role,
+		model:    model,
+		result:   result,
+		duration: duration,
+		err:      err,
 	}
 }
 

@@ -136,6 +136,55 @@ func RenderToolCard(toolName string, commandOrArgs string, output string, exitCo
 	return cardStyle.Render(cardContent)
 }
 
+// RenderSubagentCard formats a subagent execution and result as a styled card.
+func RenderSubagentCard(role, model, prompt, output string, isRunning bool, width int) string {
+	roleBadge := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(ColorSecondary).
+		Padding(0, 1).
+		Render(strings.ToUpper(role))
+
+	modelTag := lipgloss.NewStyle().
+		Foreground(ColorPrimary).
+		Italic(true).
+		Render("[" + model + "]")
+
+	var statusBadge string
+	if isRunning {
+		statusBadge = ToolRunningBadge.Render("RUNNING")
+	} else {
+		statusBadge = ToolSuccessBadge.Render("DONE")
+	}
+
+	header := fmt.Sprintf("🤖 Subagent: %s %s %s", roleBadge, modelTag, statusBadge)
+	contentLines := []string{header}
+
+	if prompt != "" {
+		cleanPrompt := strings.ReplaceAll(prompt, "\n", " ")
+		if len(cleanPrompt) > 80 {
+			cleanPrompt = cleanPrompt[:80] + "..."
+		}
+		contentLines = append(contentLines, lipgloss.NewStyle().Foreground(ColorMuted).Render("Objective: "+cleanPrompt))
+	}
+
+	if output != "" {
+		lines := strings.Split(output, "\n")
+		if len(lines) > 8 {
+			output = strings.Join(lines[:8], "\n") + fmt.Sprintf("\n... (%d more lines)", len(lines)-8)
+		}
+		contentLines = append(contentLines, lipgloss.NewStyle().Foreground(ColorHighlight).Render(output))
+	}
+
+	cardContent := strings.Join(contentLines, "\n")
+	cardStyle := ToolCardBox
+	if width > 4 {
+		cardStyle = cardStyle.Width(width - 4)
+	}
+
+	return cardStyle.Render(cardContent)
+}
+
 // RenderMemoryMinimap formats a single-line summary of fractal tree levels and live head.
 func RenderMemoryMinimap(totalEvents int, tailNodesByLevel map[int]int, liveHeadCount int, compactorActive bool) string {
 	parts := []string{
