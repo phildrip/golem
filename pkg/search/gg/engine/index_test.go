@@ -44,20 +44,37 @@ func TestInvertedIndex(t *testing.T) {
 		t.Errorf("expected 0 matches for 'zz', got: %v", matchesNone)
 	}
 
-	// 5. Short query (< 2 chars) returns all documents
+	// 5. Short query (< 2 chars) returns all active documents
 	matchesShort := idx.FilterCandidates("a")
 	if len(matchesShort) != 5 {
 		t.Errorf("expected all 5 docs for 1-char query, got: %d", len(matchesShort))
 	}
 
-	// 6. Test RemoveDocument
+	// 6. Multi-word query: "search index" matches doc 0
+	matchesMulti := idx.FilterCandidates("search index")
+	if len(matchesMulti) != 1 || matchesMulti[0] != 0 {
+		t.Errorf("expected doc 0 for multi-word query 'search index', got: %v", matchesMulti)
+	}
+
+	// 7. Test RemoveDocument
 	idx.RemoveDocument(1, files[1])
 	matchesAfterRemove := idx.FilterCandidates("parser")
 	if len(matchesAfterRemove) != 0 {
 		t.Errorf("expected 0 matches for 'parser' after removing doc 1, got: %v", matchesAfterRemove)
 	}
 
-	// 7. Test Reset
+	// Short query after remove: must only return the 4 active docs (not doc 1)
+	matchesShortAfterRemove := idx.FilterCandidates("")
+	if len(matchesShortAfterRemove) != 4 {
+		t.Errorf("expected 4 active docs after remove, got: %d", len(matchesShortAfterRemove))
+	}
+	for _, id := range matchesShortAfterRemove {
+		if id == 1 {
+			t.Errorf("removed doc 1 must not be returned in short query")
+		}
+	}
+
+	// 8. Test Reset
 	idx.Reset()
 	if len(idx.FilterCandidates("config")) != 0 {
 		t.Errorf("expected 0 matches after Reset")

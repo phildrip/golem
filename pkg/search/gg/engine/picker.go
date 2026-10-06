@@ -169,7 +169,7 @@ func (p *FilePicker) Len() int {
 func (p *FilePicker) QueryCandidates(queryStr string) []string {
 	q := parser.Parse(queryStr)
 
-	candidateIDs := p.index.FilterCandidates(q.FuzzyText)
+	candidateIDs := p.index.FilterWords(q.FuzzyWords)
 	if len(candidateIDs) == 0 {
 		return nil
 	}

@@ -62,6 +62,10 @@ func (w *Watcher) isIgnoredDir(absDir string) bool {
 		return false
 	}
 
+	if w.picker != nil && w.picker.scanner != nil {
+		return w.picker.scanner.IsIgnored(rel, true)
+	}
+
 	parts := toParts(rel)
 	for _, part := range parts {
 		if part == ".git" || part == "node_modules" || part == ".hg" || part == ".svn" {
@@ -69,6 +73,14 @@ func (w *Watcher) isIgnoredDir(absDir string) bool {
 		}
 	}
 
+	return false
+}
+
+// isIgnoredFile checks if a file path is ignored by gitignore or default rules.
+func (w *Watcher) isIgnoredFile(rel string) bool {
+	if w.picker != nil && w.picker.scanner != nil {
+		return w.picker.scanner.IsIgnored(rel, false)
+	}
 	return false
 }
 
@@ -176,7 +188,7 @@ func (w *Watcher) eventLoop() {
 						_ = filepath.WalkDir(ev.Name, func(p string, d os.DirEntry, err error) error {
 							if err == nil && !d.IsDir() {
 								fileRel, rErr := filepath.Rel(w.rootDir, p)
-								if rErr == nil {
+								if rErr == nil && !w.isIgnoredFile(fileRel) {
 									w.picker.AddFile(filepath.ToSlash(fileRel))
 								}
 							}
@@ -184,7 +196,7 @@ func (w *Watcher) eventLoop() {
 						})
 					}
 				} else {
-					if !w.isIgnoredDir(filepath.Dir(ev.Name)) {
+					if !w.isIgnoredDir(filepath.Dir(ev.Name)) && !w.isIgnoredFile(rel) {
 						w.picker.AddFile(relSlash)
 					}
 				}

@@ -175,9 +175,16 @@ func (s *Scanner) Scan(ctx context.Context) ([]string, error) {
 	)
 
 	// Watch context cancellation
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+
 	go func() {
-		<-ctx.Done()
-		queue.stop()
+		select {
+		case <-ctx.Done():
+			queue.stop()
+		case <-doneCh:
+			return
+		}
 	}()
 
 	numWorkers := s.opts.Concurrency
@@ -286,4 +293,48 @@ func (s *Scanner) Scan(ctx context.Context) ([]string, error) {
 	}
 
 	return results, nil
+}
+
+// IsIgnored tests whether a relative path is excluded by default ignores or local gitignores.
+func (s *Scanner) IsIgnored(relPath string, isDir bool) bool {
+	rootDir, err := filepath.Abs(s.opts.RootDir)
+	if err != nil {
+		return false
+	}
+	parts := toParts(relPath)
+	if len(parts) == 0 {
+		return false
+	}
+
+	// Check default ignores
+	for _, ign := range s.opts.DefaultIgnores {
+		for _, part := range parts {
+			if part == ign {
+				return true
+			}
+		}
+	}
+
+	// Load and evaluate gitignore patterns from root down the directory hierarchy
+	var patterns []gitignore.Pattern
+	for _, ign := range s.opts.DefaultIgnores {
+		patterns = append(patterns, gitignore.ParsePattern(ign, nil))
+	}
+
+	currDir := rootDir
+	if rootPatterns := loadGitignore(currDir, nil); len(rootPatterns) > 0 {
+		patterns = append(patterns, rootPatterns...)
+	}
+
+	var runningDomain []string
+	for i := 0; i < len(parts)-1; i++ {
+		currDir = filepath.Join(currDir, parts[i])
+		runningDomain = append(runningDomain, parts[i])
+		if dirPatterns := loadGitignore(currDir, runningDomain); len(dirPatterns) > 0 {
+			patterns = append(patterns, dirPatterns...)
+		}
+	}
+
+	matcher := gitignore.NewMatcher(patterns)
+	return matcher.Match(parts, isDir)
 }

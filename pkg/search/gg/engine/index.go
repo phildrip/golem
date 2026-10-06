@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-// BigramKey encodes two lowercase ASCII bytes (32..126) into a uint16.
+// BigramKey encodes two lowercase ASCII bytes into a uint16.
 func BigramKey(a, b byte) uint16 {
 	return (uint16(a) << 8) | uint16(b)
 }
@@ -13,9 +13,10 @@ func BigramKey(a, b byte) uint16 {
 // InvertedIndex stores bitsets of candidate file indices containing each bigram.
 // Uses flattened []uint64 bitsets for maximum CPU cache efficiency and minimal GC overhead.
 type InvertedIndex struct {
-	mu      sync.RWMutex
-	columns map[uint16][]uint64
-	numDocs int
+	mu         sync.RWMutex
+	columns    map[uint16][]uint64
+	activeDocs []uint64
+	numDocs    int
 }
 
 // NewInvertedIndex initializes an empty bigram inverted index.
@@ -36,6 +37,14 @@ func (idx *InvertedIndex) AddDocument(docID int, path string) {
 
 	wordIdx := docID / 64
 	bitMask := uint64(1) << (docID % 64)
+
+	// Mark doc as active
+	if wordIdx >= len(idx.activeDocs) {
+		newActive := make([]uint64, wordIdx+1)
+		copy(newActive, idx.activeDocs)
+		idx.activeDocs = newActive
+	}
+	idx.activeDocs[wordIdx] |= bitMask
 
 	cleanPath := strings.ToLower(path)
 	if len(cleanPath) < 2 {
@@ -61,13 +70,18 @@ func (idx *InvertedIndex) AddDocument(docID int, path string) {
 	}
 }
 
-// RemoveDocument removes bigrams for docID corresponding to path.
+// RemoveDocument removes bigrams for docID corresponding to path and marks it inactive.
 func (idx *InvertedIndex) RemoveDocument(docID int, path string) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
 	wordIdx := docID / 64
 	bitMask := uint64(1) << (docID % 64)
+
+	// Mark doc as inactive
+	if wordIdx < len(idx.activeDocs) {
+		idx.activeDocs[wordIdx] &^= bitMask
+	}
 
 	cleanPath := strings.ToLower(path)
 	if len(cleanPath) < 2 {
@@ -83,51 +97,46 @@ func (idx *InvertedIndex) RemoveDocument(docID int, path string) {
 	}
 }
 
-// FilterCandidates returns docIDs that contain all consecutive bigrams in query.
-// If query has < 2 characters, returns all candidate docIDs up to numDocs.
-func (idx *InvertedIndex) FilterCandidates(query string) []int {
+// FilterWords returns active docIDs that contain all bigrams across all input words.
+func (idx *InvertedIndex) FilterWords(words []string) []int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	clean := strings.ToLower(query)
-	if len(clean) < 2 {
-		all := make([]int, idx.numDocs)
-		for i := 0; i < idx.numDocs; i++ {
-			all[i] = i
-		}
-		return all
-	}
-
-	// Gather bigram keys from query
-	var keys []uint16
-	for i := 0; i < len(clean)-1; i++ {
-		keys = append(keys, BigramKey(clean[i], clean[i+1]))
-	}
-
-	wordsCount := (idx.numDocs + 63) / 64
+	wordsCount := len(idx.activeDocs)
 	if wordsCount == 0 {
 		return nil
 	}
 
-	// Initialize intersection bitset with all 1s
+	// Initialize intersection bitset with active documents
 	intersect := make([]uint64, wordsCount)
-	for i := range intersect {
-		intersect[i] = ^uint64(0)
-	}
+	copy(intersect, idx.activeDocs)
 
-	for _, k := range keys {
-		col, ok := idx.columns[k]
-		if !ok {
-			return nil // A required bigram does not exist in any file
+	hasBigramFilter := false
+
+	for _, w := range words {
+		clean := strings.ToLower(w)
+		if len(clean) < 2 {
+			continue
 		}
-		for i := 0; i < wordsCount; i++ {
-			if i < len(col) {
-				intersect[i] &= col[i]
-			} else {
-				intersect[i] = 0
+
+		hasBigramFilter = true
+		for i := 0; i < len(clean)-1; i++ {
+			k := BigramKey(clean[i], clean[i+1])
+			col, ok := idx.columns[k]
+			if !ok {
+				return nil // A required bigram does not exist in any file
+			}
+			for j := 0; j < wordsCount; j++ {
+				if j < len(col) {
+					intersect[j] &= col[j]
+				} else {
+					intersect[j] = 0
+				}
 			}
 		}
 	}
+
+	_ = hasBigramFilter
 
 	// Extract matching docIDs
 	var results []int
@@ -148,10 +157,17 @@ func (idx *InvertedIndex) FilterCandidates(query string) []int {
 	return results
 }
 
+// FilterCandidates returns active docIDs matching all tokens in query without treating spaces as bigrams.
+func (idx *InvertedIndex) FilterCandidates(query string) []int {
+	words := strings.Fields(query)
+	return idx.FilterWords(words)
+}
+
 // Reset clears the index.
 func (idx *InvertedIndex) Reset() {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	idx.columns = make(map[uint16][]uint64)
+	idx.activeDocs = nil
 	idx.numDocs = 0
 }

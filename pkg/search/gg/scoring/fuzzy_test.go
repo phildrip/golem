@@ -58,6 +58,18 @@ func TestFuzzyScore(t *testing.T) {
 		t.Fatalf("expected CamelCase match")
 	}
 
+	// Multi-word query matching: "src controller" matching "src/controller.go"
+	sMulti, _, mMulti := FuzzyScore("src controller", "src/controller.go")
+	if !mMulti || sMulti <= 0 {
+		t.Fatalf("expected multi-word match for 'src controller', got m=%v, s=%d", mMulti, sMulti)
+	}
+
+	// UTF-8 path with boundary bonus
+	sUTF8, _, mUTF8 := FuzzyScore("コント", "日本語/コントローラー.tsx")
+	if !mUTF8 || sUTF8 <= 0 {
+		t.Fatalf("expected UTF-8 match for 'コント', got m=%v, s=%d", mUTF8, sUTF8)
+	}
+
 	// Non-matching
 	_, _, mNone := FuzzyScore("xyz", "main.go")
 	if mNone {

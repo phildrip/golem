@@ -17,7 +17,27 @@ type MatchResult struct {
 }
 
 // FastSubsequenceCheck verifies if all runes of pattern exist in target in order (case-insensitive).
+// For multi-word queries with spaces, verifies that each word individually matches the target.
 func FastSubsequenceCheck(pattern, target string) bool {
+	trimmed := strings.TrimSpace(pattern)
+	if len(trimmed) == 0 {
+		return true
+	}
+
+	words := strings.Fields(trimmed)
+	if len(words) > 1 {
+		for _, w := range words {
+			if !fastSubsequenceSingle(w, target) {
+				return false
+			}
+		}
+		return true
+	}
+
+	return fastSubsequenceSingle(trimmed, target)
+}
+
+func fastSubsequenceSingle(pattern, target string) bool {
 	if len(pattern) == 0 {
 		return true
 	}
@@ -43,32 +63,32 @@ func FastSubsequenceCheck(pattern, target string) bool {
 	return false
 }
 
-// isSeparator checks if character is a word or path delimiter.
-func isSeparator(ch byte) bool {
-	return ch == '/' || ch == '\\' || ch == '_' || ch == '-' || ch == '.' || ch == ' '
+// isSeparator checks if rune is a word or path delimiter.
+func isSeparator(r rune) bool {
+	return r == '/' || r == '\\' || r == '_' || r == '-' || r == '.' || r == ' '
 }
 
-// bonusForIndex calculates boundary and contextual bonuses for index j in target.
-func bonusForIndex(target string, j int, lastSlash int) int {
+// bonusForIndex calculates boundary and contextual bonuses for rune index j in tRunes.
+func bonusForIndex(tRunes []rune, j int, lastSlashRune int) int {
 	if j == 0 {
 		bonus := 25
-		if lastSlash < 0 {
+		if lastSlashRune < 0 {
 			bonus += 10
 		}
 		return bonus
 	}
 
 	bonus := 0
-	prev := target[j-1]
-	curr := target[j]
+	prev := tRunes[j-1]
+	curr := tRunes[j]
 
 	if isSeparator(prev) {
 		bonus += 25
-	} else if unicode.IsLower(rune(prev)) && unicode.IsUpper(rune(curr)) {
+	} else if unicode.IsLower(prev) && unicode.IsUpper(curr) {
 		bonus += 20 // CamelCase
 	}
 
-	if j > lastSlash {
+	if j > lastSlashRune {
 		bonus += 10 // In basename
 	}
 
@@ -76,11 +96,36 @@ func bonusForIndex(target string, j int, lastSlash int) int {
 }
 
 // FuzzyScore computes optimal subsequence alignment score and match positions using dynamic programming.
+// For multi-word patterns, scores each word component and aggregates results.
 func FuzzyScore(pattern, target string) (score int, positions []int, matched bool) {
+	trimmed := strings.TrimSpace(pattern)
+	if len(trimmed) == 0 {
+		return 0, nil, true
+	}
+
+	words := strings.Fields(trimmed)
+	if len(words) > 1 {
+		totalScore := 0
+		var allPositions []int
+		for _, w := range words {
+			s, pos, m := fuzzyScoreSingle(w, target)
+			if !m {
+				return 0, nil, false
+			}
+			totalScore += s
+			allPositions = append(allPositions, pos...)
+		}
+		return totalScore, allPositions, true
+	}
+
+	return fuzzyScoreSingle(trimmed, target)
+}
+
+func fuzzyScoreSingle(pattern, target string) (score int, positions []int, matched bool) {
 	if len(pattern) == 0 {
 		return 0, nil, true
 	}
-	if !FastSubsequenceCheck(pattern, target) {
+	if !fastSubsequenceSingle(pattern, target) {
 		return 0, nil, false
 	}
 
@@ -98,7 +143,13 @@ func FuzzyScore(pattern, target string) (score int, positions []int, matched boo
 		return 0, nil, false
 	}
 
-	lastSlash := strings.LastIndexAny(target, "/\\")
+	lastSlashRune := -1
+	for idx := len(tRunes) - 1; idx >= 0; idx-- {
+		if tRunes[idx] == '/' || tRunes[idx] == '\\' {
+			lastSlashRune = idx
+			break
+		}
+	}
 
 	const (
 		gapStart = 5
@@ -121,7 +172,7 @@ func FuzzyScore(pattern, target string) (score int, positions []int, matched boo
 
 	for j := 0; j < N; j++ {
 		if pLower[0] == tLower[j] {
-			bonus := bonusForIndex(target, j, lastSlash)
+			bonus := bonusForIndex(tRunes, j, lastSlashRune)
 			D[0][j] = bonus
 		}
 		if j == 0 {
@@ -143,7 +194,7 @@ func FuzzyScore(pattern, target string) (score int, positions []int, matched boo
 				if prevS > bestPrev {
 					bestPrev = prevS
 				}
-				bonus := bonusForIndex(target, j, lastSlash)
+				bonus := bonusForIndex(tRunes, j, lastSlashRune)
 				D[i][j] = bestPrev + bonus
 			}
 			S[i][j] = S[i][j-1] - gapExt
@@ -173,17 +224,13 @@ func FuzzyScore(pattern, target string) (score int, positions []int, matched boo
 	positions[M-1] = currJ
 
 	for i := M - 1; i > 0; i-- {
-		// Was it consecutive match (from D[i-1][currJ-1]) or gap (from S[i-1][k])?
-		targetBonus := bonusForIndex(target, currJ, lastSlash)
+		targetBonus := bonusForIndex(tRunes, currJ, lastSlashRune)
 		if currJ > 0 && D[i-1][currJ-1]+consec+targetBonus == D[i][currJ] {
 			currJ--
 		} else {
-			// Find k < currJ where S[i-1][k] produced best
 			found := false
 			for k := currJ - 1; k >= i-1; k-- {
 				if S[i-1][k]-gapStart+targetBonus == D[i][currJ] {
-					// Found the best state in S[i-1]
-					// Now find the j where D[i-1][j] equals S[i-1][k]
 					for j := k; j >= i-1; j-- {
 						if D[i-1][j]-(k-j)*gapExt == S[i-1][k] {
 							currJ = j

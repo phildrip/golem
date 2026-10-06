@@ -25,6 +25,7 @@ type Constraint struct {
 // Query represents a parsed query containing structured constraints and a cleaned fuzzy search text.
 type Query struct {
 	Raw         string
+	FuzzyWords  []string
 	FuzzyText   string
 	Constraints []Constraint
 }
@@ -101,6 +102,7 @@ func Parse(raw string) Query {
 
 	return Query{
 		Raw:         raw,
+		FuzzyWords:  fuzzyWords,
 		FuzzyText:   strings.Join(fuzzyWords, " "),
 		Constraints: constraints,
 	}

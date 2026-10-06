@@ -166,4 +166,17 @@ func TestSearchFiles(t *testing.T) {
 	if len(matchesHyphen) != 1 || matchesHyphen[0].File != "flags.txt" {
 		t.Errorf("expected match for --debug in flags.txt, got: %+v", matchesHyphen)
 	}
+
+	// Test literal pattern with parentheses: "Run()"
+	optsParens := GrepOptions{
+		Pattern:     "Run()",
+		Concurrency: 2,
+	}
+	matchesParens, err := SearchFiles(context.Background(), tempDir, allPaths, optsParens)
+	if err != nil {
+		t.Fatalf("literal parens search failed: %v", err)
+	}
+	if len(matchesParens) != 1 || matchesParens[0].File != "a.go" {
+		t.Errorf("expected match for 'Run()' in a.go, got: %+v", matchesParens)
+	}
 }

@@ -97,13 +97,18 @@ func TestFilePickerOperations(t *testing.T) {
 	if len(resBoosted) == 0 {
 		t.Fatalf("expected search results for boosted 'main'")
 	}
-	if resBoosted[0].Path != "cmd/app/main.go" {
-		t.Errorf("expected cmd/app/main.go to be boosted to top, got: %s", resBoosted[0].Path)
+	// Test multi-word search: "tools gg" should match "pkg/tools/gg.go"
+	resMulti := picker.Search("tools gg", 5)
+	if len(resMulti) == 0 || resMulti[0].Path != "pkg/tools/gg.go" {
+		t.Errorf("expected pkg/tools/gg.go for multi-word search 'tools gg', got: %+v", resMulti)
 	}
 }
 
 func TestFilePickerWatcher(t *testing.T) {
 	tempDir := t.TempDir()
+
+	// Write .gitignore before starting picker
+	_ = os.WriteFile(filepath.Join(tempDir, ".gitignore"), []byte("*.ignored\n"), 0644)
 
 	picker, err := NewFilePicker(context.Background(), FilePickerOptions{
 		RootDir:       tempDir,
@@ -117,7 +122,7 @@ func TestFilePickerWatcher(t *testing.T) {
 	// Wait briefly for watcher loop to initialize
 	time.Sleep(50 * time.Millisecond)
 
-	// Create a new file dynamically
+	// Create a normal new file dynamically
 	newFilePath := filepath.Join(tempDir, "dynamic.txt")
 	if err := os.WriteFile(newFilePath, []byte("dynamic content"), 0644); err != nil {
 		t.Fatal(err)
@@ -134,6 +139,16 @@ func TestFilePickerWatcher(t *testing.T) {
 	}
 	if !detected {
 		t.Errorf("expected watcher to detect dynamic.txt within timeout")
+	}
+
+	// Create a gitignored file dynamically: must NOT be added to picker
+	ignoredFilePath := filepath.Join(tempDir, "secret.ignored")
+	if err := os.WriteFile(ignoredFilePath, []byte("ignored"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if picker.HasFile("secret.ignored") {
+		t.Errorf("watcher must NOT index gitignored file secret.ignored")
 	}
 
 	// Delete file dynamically

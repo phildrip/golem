@@ -72,6 +72,23 @@ func SearchData(data []byte, relPath string, opts GrepOptions, targetBytes []byt
 		return nil
 	}
 
+	// Fast pre-filter: verify pattern presence in whole file before splitting lines
+	if re != nil {
+		if !re.Match(data) {
+			return nil
+		}
+	} else {
+		if opts.CaseSensitive {
+			if !bytes.Contains(data, targetBytes) {
+				return nil
+			}
+		} else {
+			if !bytes.Contains(bytes.ToLower(data), targetBytes) {
+				return nil
+			}
+		}
+	}
+
 	lines := bytes.Split(data, []byte("\n"))
 	var matches []GrepMatch
 
@@ -138,6 +155,16 @@ func SearchData(data []byte, relPath string, opts GrepOptions, targetBytes []byt
 	return matches
 }
 
+// isExplicitRegexPattern checks for regex operators that are unlikely to be plain literal text.
+func isExplicitRegexPattern(p string) bool {
+	return strings.Contains(p, `\`) ||
+		strings.Contains(p, `.*`) ||
+		strings.Contains(p, `.+`) ||
+		strings.HasPrefix(p, "^") ||
+		strings.HasSuffix(p, "$") ||
+		strings.HasPrefix(p, "(?")
+}
+
 // SearchFiles concurrently greps matching files within rootDir.
 func SearchFiles(ctx context.Context, rootDir string, filePaths []string, opts GrepOptions) ([]GrepMatch, error) {
 	if opts.Concurrency <= 0 {
@@ -152,7 +179,7 @@ func SearchFiles(ctx context.Context, rootDir string, filePaths []string, opts G
 		re          *regexp.Regexp
 	)
 
-	if opts.IsRegex || strings.ContainsAny(opts.Pattern, `*+?^$()[]{}|\`) {
+	if opts.IsRegex || isExplicitRegexPattern(opts.Pattern) {
 		pattern := opts.Pattern
 		if !opts.CaseSensitive && !strings.HasPrefix(pattern, "(?i)") {
 			pattern = "(?i)" + pattern
