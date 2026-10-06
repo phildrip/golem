@@ -3,6 +3,8 @@ package fractal
 import (
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -102,16 +104,7 @@ func TestStorePersistenceAndDurability(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	// 2. Simulate appending a torn partial line to test crash recovery
-	eventsPath := filepath.Join(tempDir, "events.jsonl")
-	f, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		t.Fatalf("failed to open events for torn line append: %v", err)
-	}
-	_, _ = f.WriteString(`{"id": 2, "kind": "use`) // incomplete JSON
-	f.Close()
-
-	// 3. Re-open store and verify recovery
+	// 2. Re-open store and verify bbolt recovery
 	store2, err := OpenStore(tempDir)
 	if err != nil {
 		t.Fatalf("OpenStore on re-open failed: %v", err)
@@ -157,6 +150,93 @@ func TestStorePersistenceAndDurability(t *testing.T) {
 	}
 }
 
+func TestStoreLegacyJSONLMigration(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Pre-create legacy events.jsonl and tree.jsonl with a torn trailing line
+	eventsPath := filepath.Join(tempDir, "events.jsonl")
+	eventsData := `{"id": 0, "kind": "user", "text": "legacy user message", "timestamp": "2026-10-06T12:00:00Z", "size": 25}
+{"id": 1, "kind": "talk", "text": "legacy talk message", "timestamp": "2026-10-06T12:00:01Z", "size": 25}
+{"id": 2, "kind": "corrup` // torn line
+	if err := os.WriteFile(eventsPath, []byte(eventsData), 0644); err != nil {
+		t.Fatalf("failed to write legacy events.jsonl: %v", err)
+	}
+
+	treePath := filepath.Join(tempDir, "tree.jsonl")
+	treeData := `{"level": 0, "index": 0, "text": "legacy summary 0+1", "size": 20}
+{"level": 0, "index": 1, "text": "legacy summary 1+1", "size": 20}
+{"level": 1, "index": 0, "text": "corrup` // torn line
+	if err := os.WriteFile(treePath, []byte(treeData), 0644); err != nil {
+		t.Fatalf("failed to write legacy tree.jsonl: %v", err)
+	}
+
+	// OpenStore should seamlessly migrate valid entries into bbolt
+	store, err := OpenStore(tempDir)
+	if err != nil {
+		t.Fatalf("OpenStore with legacy files failed: %v", err)
+	}
+	defer store.Close()
+
+	if store.CountEvents() != 2 {
+		t.Fatalf("expected 2 legacy events migrated, got %d", store.CountEvents())
+	}
+	ev0, ok := store.GetEvent(0)
+	if !ok || ev0.Text != "legacy user message" {
+		t.Errorf("expected legacy event 0 migrated, got %v", ev0)
+	}
+
+	n0, ok := store.GetNode(0, 0)
+	if !ok || n0.Text != "legacy summary 0+1" {
+		t.Errorf("expected legacy node (0, 0) migrated, got %v", n0)
+	}
+	n1, ok := store.GetNode(0, 1)
+	if !ok || n1.Text != "legacy summary 1+1" {
+		t.Errorf("expected legacy node (0, 1) migrated, got %v", n1)
+	}
+}
+
+func TestStoreReactivePubSub(t *testing.T) {
+	tempDir := t.TempDir()
+	store, err := OpenStore(tempDir)
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	var receivedCount int32
+	var receivedTexts []string
+	var mu sync.Mutex
+
+	store.OnEvent(func(ev Event) {
+		atomic.AddInt32(&receivedCount, 1)
+		mu.Lock()
+		receivedTexts = append(receivedTexts, ev.Text)
+		mu.Unlock()
+	})
+
+	for i := 0; i < 5; i++ {
+		_, err := store.AppendEvent(KindUser, "msg")
+		if err != nil {
+			t.Fatalf("AppendEvent failed: %v", err)
+		}
+	}
+
+	// Closing store drains eventChan and waits for runDispatcher to finish completely
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Verify all 5 events were strictly dispatched
+	if count := atomic.LoadInt32(&receivedCount); count != 5 {
+		t.Errorf("expected 5 events received by listener, got %d", count)
+	}
+	mu.Lock()
+	if len(receivedTexts) != 5 {
+		t.Errorf("expected 5 received texts, got %d", len(receivedTexts))
+	}
+	mu.Unlock()
+}
+
 func TestParseAddressErrors(t *testing.T) {
 	tests := []struct {
 		name string
@@ -179,43 +259,5 @@ func TestParseAddressErrors(t *testing.T) {
 				t.Errorf("expected error for id=%d, n=%d, got nil", tc.id, tc.n)
 			}
 		})
-	}
-}
-
-func TestTreeTornLineRecovery(t *testing.T) {
-	tempDir := t.TempDir()
-	store, err := OpenStore(tempDir)
-	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
-	}
-
-	node := Node{Level: 0, Index: 0, Text: "valid node"}
-	if err := store.SaveNode(node); err != nil {
-		t.Fatalf("SaveNode failed: %v", err)
-	}
-	store.Close()
-
-	// Append torn line to tree.jsonl
-	treePath := filepath.Join(tempDir, "tree.jsonl")
-	f, err := os.OpenFile(treePath, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		t.Fatalf("failed to open tree.jsonl: %v", err)
-	}
-	_, _ = f.WriteString(`{"level": 1, "index": 0, "text": "corrup`)
-	f.Close()
-
-	// Reopen and verify valid node is intact
-	store2, err := OpenStore(tempDir)
-	if err != nil {
-		t.Fatalf("re-open failed: %v", err)
-	}
-	defer store2.Close()
-
-	n, ok := store2.GetNode(0, 0)
-	if !ok || n.Text != "valid node" {
-		t.Errorf("expected valid node recovered, got %v", n)
-	}
-	if _, ok := store2.GetNode(1, 0); ok {
-		t.Errorf("expected torn node not recovered")
 	}
 }
