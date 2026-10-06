@@ -11,11 +11,36 @@ import (
 	"github.com/pkg/errors"
 )
 
-// FileConfig represents the JSON structure stored in ~/.config/golem/config.json.
+// Provider constants
+const (
+	ProviderGemini     = "gemini"
+	ProviderOpenCode   = "opencode"
+	ProviderOpenAI     = "openai"
+	ProviderOpenRouter = "openrouter"
+)
+
+// Default Base URLs
+const (
+	DefaultOpenCodeBaseURL   = "https://api.opencode.ai/v1"
+	DefaultOpenAIBaseURL     = "https://api.openai.com/v1"
+	DefaultOpenRouterBaseURL = "https://openrouter.ai/api/v1"
+)
+
+// ProviderConfig stores credentials and endpoint for an individual model provider.
+type ProviderConfig struct {
+	APIKey  string `json:"api_key,omitempty"`
+	BaseURL string `json:"base_url,omitempty"`
+	Model   string `json:"model,omitempty"`
+}
+
+// FileConfig represents the JSON structure stored in ~/.golem/config.json or ~/.config/golem/config.json.
 type FileConfig struct {
-	APIKey    string `json:"api_key,omitempty"`
-	Model     string `json:"model,omitempty"`
-	MemoryDir string `json:"memory_dir,omitempty"`
+	Provider  string                    `json:"provider,omitempty"`
+	APIKey    string                    `json:"api_key,omitempty"`
+	BaseURL   string                    `json:"base_url,omitempty"`
+	Model     string                    `json:"model,omitempty"`
+	MemoryDir string                    `json:"memory_dir,omitempty"`
+	Providers map[string]ProviderConfig `json:"providers,omitempty"`
 }
 
 // UserDir returns Golem's user configuration directory.
@@ -183,3 +208,139 @@ func ResolveAPIKey(flagKey string, configPath string, scanner *bufio.Scanner) (s
 
 	return inputKey, nil
 }
+
+// ResolveProvider determines the active provider ("gemini", "opencode", "openai", "openrouter").
+// Priority:
+// 1. Explicit CLI flag / parameter
+// 2. GOLEM_PROVIDER environment variable
+// 3. FileConfig.Provider
+// 4. Inferred from Model name prefix (e.g. "opencode/...", "openai/...", "openrouter/...")
+// 5. Default: "gemini"
+func ResolveProvider(flagProvider string, fileCfg FileConfig, modelName string) string {
+	if clean := strings.ToLower(strings.TrimSpace(flagProvider)); clean != "" {
+		return clean
+	}
+	if env := strings.ToLower(strings.TrimSpace(os.Getenv("GOLEM_PROVIDER"))); env != "" {
+		return env
+	}
+	if clean := strings.ToLower(strings.TrimSpace(fileCfg.Provider)); clean != "" {
+		return clean
+	}
+	if strings.Contains(modelName, "/") {
+		parts := strings.SplitN(modelName, "/", 2)
+		prefix := strings.ToLower(strings.TrimSpace(parts[0]))
+		switch prefix {
+		case ProviderOpenCode, ProviderOpenAI, ProviderOpenRouter, ProviderGemini:
+			return prefix
+		}
+	}
+	return ProviderGemini
+}
+
+// ResolveProviderKey determines the API key for a specific provider.
+func ResolveProviderKey(provider string, flagKey string, fileCfg FileConfig) string {
+	if strings.TrimSpace(flagKey) != "" {
+		return strings.TrimSpace(flagKey)
+	}
+
+	cleanProvider := strings.ToLower(strings.TrimSpace(provider))
+	switch cleanProvider {
+	case ProviderOpenCode:
+		if k := strings.TrimSpace(os.Getenv("OPENCODE_API_KEY")); k != "" {
+			return k
+		}
+		if k := strings.TrimSpace(os.Getenv("OPENCODE_KEY")); k != "" {
+			return k
+		}
+		if k := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); k != "" {
+			return k
+		}
+		if pCfg, ok := fileCfg.Providers[ProviderOpenCode]; ok && strings.TrimSpace(pCfg.APIKey) != "" {
+			return strings.TrimSpace(pCfg.APIKey)
+		}
+
+	case ProviderOpenRouter:
+		if k := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")); k != "" {
+			return k
+		}
+		if k := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); k != "" {
+			return k
+		}
+		if pCfg, ok := fileCfg.Providers[ProviderOpenRouter]; ok && strings.TrimSpace(pCfg.APIKey) != "" {
+			return strings.TrimSpace(pCfg.APIKey)
+		}
+
+	case ProviderOpenAI:
+		if k := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); k != "" {
+			return k
+		}
+		if pCfg, ok := fileCfg.Providers[ProviderOpenAI]; ok && strings.TrimSpace(pCfg.APIKey) != "" {
+			return strings.TrimSpace(pCfg.APIKey)
+		}
+
+	default: // Gemini
+		if k := strings.TrimSpace(os.Getenv("GEMINI_API_KEY")); k != "" {
+			return k
+		}
+		if k := strings.TrimSpace(os.Getenv("GOOGLE_API_KEY")); k != "" {
+			return k
+		}
+		if pCfg, ok := fileCfg.Providers[ProviderGemini]; ok && strings.TrimSpace(pCfg.APIKey) != "" {
+			return strings.TrimSpace(pCfg.APIKey)
+		}
+	}
+
+	return strings.TrimSpace(fileCfg.APIKey)
+}
+
+// ResolveBaseURL determines the API endpoint base URL for the given provider.
+func ResolveBaseURL(provider string, flagURL string, fileCfg FileConfig) string {
+	if strings.TrimSpace(flagURL) != "" {
+		return strings.TrimSpace(flagURL)
+	}
+
+	cleanProvider := strings.ToLower(strings.TrimSpace(provider))
+	switch cleanProvider {
+	case ProviderOpenCode:
+		if u := strings.TrimSpace(os.Getenv("OPENCODE_BASE_URL")); u != "" {
+			return u
+		}
+		if u := strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")); u != "" {
+			return u
+		}
+		if pCfg, ok := fileCfg.Providers[ProviderOpenCode]; ok && strings.TrimSpace(pCfg.BaseURL) != "" {
+			return strings.TrimSpace(pCfg.BaseURL)
+		}
+		if strings.TrimSpace(fileCfg.BaseURL) != "" {
+			return strings.TrimSpace(fileCfg.BaseURL)
+		}
+		return DefaultOpenCodeBaseURL
+
+	case ProviderOpenRouter:
+		if u := strings.TrimSpace(os.Getenv("OPENROUTER_BASE_URL")); u != "" {
+			return u
+		}
+		if pCfg, ok := fileCfg.Providers[ProviderOpenRouter]; ok && strings.TrimSpace(pCfg.BaseURL) != "" {
+			return strings.TrimSpace(pCfg.BaseURL)
+		}
+		if strings.TrimSpace(fileCfg.BaseURL) != "" {
+			return strings.TrimSpace(fileCfg.BaseURL)
+		}
+		return DefaultOpenRouterBaseURL
+
+	case ProviderOpenAI:
+		if u := strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")); u != "" {
+			return u
+		}
+		if pCfg, ok := fileCfg.Providers[ProviderOpenAI]; ok && strings.TrimSpace(pCfg.BaseURL) != "" {
+			return strings.TrimSpace(pCfg.BaseURL)
+		}
+		if strings.TrimSpace(fileCfg.BaseURL) != "" {
+			return strings.TrimSpace(fileCfg.BaseURL)
+		}
+		return DefaultOpenAIBaseURL
+	}
+
+	return strings.TrimSpace(fileCfg.BaseURL)
+}
+

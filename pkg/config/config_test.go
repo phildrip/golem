@@ -142,3 +142,34 @@ func TestUserDirAndWorkspaceDir(t *testing.T) {
 		t.Errorf("expected /custom/golem/config, got %s", dir)
 	}
 }
+
+func TestMultiProviderResolution(t *testing.T) {
+	// 1. ResolveProvider
+	if p := ResolveProvider("opencode", FileConfig{}, ""); p != ProviderOpenCode {
+		t.Errorf("expected opencode, got %s", p)
+	}
+	if p := ResolveProvider("", FileConfig{Provider: "openrouter"}, ""); p != ProviderOpenRouter {
+		t.Errorf("expected openrouter, got %s", p)
+	}
+	if p := ResolveProvider("", FileConfig{}, "opencode/deepseek-chat"); p != ProviderOpenCode {
+		t.Errorf("expected opencode from model prefix, got %s", p)
+	}
+	if p := ResolveProvider("", FileConfig{}, "gemini-flash-latest"); p != ProviderGemini {
+		t.Errorf("expected gemini default, got %s", p)
+	}
+
+	// 2. ResolveProviderKey
+	t.Setenv("OPENCODE_API_KEY", "opencode-key-test")
+	if k := ResolveProviderKey(ProviderOpenCode, "", FileConfig{}); k != "opencode-key-test" {
+		t.Errorf("expected opencode-key-test, got %s", k)
+	}
+
+	// 3. ResolveBaseURL
+	if u := ResolveBaseURL(ProviderOpenCode, "", FileConfig{}); u != DefaultOpenCodeBaseURL {
+		t.Errorf("expected %s, got %s", DefaultOpenCodeBaseURL, u)
+	}
+	if u := ResolveBaseURL(ProviderOpenCode, "https://custom.opencode/v1", FileConfig{}); u != "https://custom.opencode/v1" {
+		t.Errorf("expected custom url, got %s", u)
+	}
+}
+

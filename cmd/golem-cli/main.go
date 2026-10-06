@@ -22,6 +22,8 @@ import (
 
 // CLIOptions holds parsed command-line flags.
 type CLIOptions struct {
+	Provider   string
+	BaseURL    string
 	Model      string
 	MemoryDir  string
 	APIKey     string
@@ -38,9 +40,11 @@ type AgentProcessor interface {
 // parseFlags parses command-line flags into CLIOptions.
 func parseFlags(args []string) (CLIOptions, error) {
 	fs := flag.NewFlagSet("golem", flag.ContinueOnError)
-	modelFlag := fs.String("model", "", "Gemini model name")
+	providerFlag := fs.String("provider", "", "LLM provider: gemini (default), opencode, openai, openrouter")
+	baseURLFlag := fs.String("base-url", "", "Custom API base URL (e.g. for OpenCode Go, OpenAI, or Ollama)")
+	modelFlag := fs.String("model", "", "Model name (e.g. gemini-flash-latest, deepseek-chat)")
 	storageFlag := fs.String("memory-dir", "", "Directory to store append-only fractal memory")
-	apiKeyFlag := fs.String("api-key", "", "Gemini API key")
+	apiKeyFlag := fs.String("api-key", "", "API key for the selected provider")
 	configPathFlag := fs.String("config", "", "Path to config file")
 	noTuiFlag := fs.Bool("no-tui", false, "Disable rich TUI and fall back to standard readline CLI")
 	tuiFlag := fs.Bool("tui", false, "Force enable rich TUI even if terminal detection is ambiguous")
@@ -50,6 +54,8 @@ func parseFlags(args []string) (CLIOptions, error) {
 	}
 
 	return CLIOptions{
+		Provider:   *providerFlag,
+		BaseURL:    *baseURLFlag,
 		Model:      *modelFlag,
 		MemoryDir:  *storageFlag,
 		APIKey:     *apiKeyFlag,
@@ -79,7 +85,14 @@ func buildConfig(opts CLIOptions, fileCfg config.FileConfig, apiKey string) gole
 	if opts.MemoryDir != "" {
 		cfg.StorageDir = opts.MemoryDir
 	}
+
+	provider := config.ResolveProvider(opts.Provider, fileCfg, cfg.ModelName)
+	baseURL := config.ResolveBaseURL(provider, opts.BaseURL, fileCfg)
+
+	cfg.Provider = provider
+	cfg.BaseURL = baseURL
 	cfg.APIKey = apiKey
+	cfg.FileConfig = fileCfg
 	return cfg
 }
 
@@ -177,10 +190,14 @@ func main() {
 
 	scanner := bufio.NewScanner(os.Stdin)
 
-	// Resolve API key (flag -> env -> config file -> interactive prompt)
-	apiKey, err := config.ResolveAPIKey(opts.APIKey, opts.ConfigPath, scanner)
-	if err != nil {
-		log.Fatalf("Error resolving API key: %v", err)
+	// Resolve provider and API key
+	provider := config.ResolveProvider(opts.Provider, fileCfg, opts.Model)
+	apiKey := config.ResolveProviderKey(provider, opts.APIKey, fileCfg)
+	if apiKey == "" && provider == config.ProviderGemini {
+		apiKey, err = config.ResolveAPIKey(opts.APIKey, opts.ConfigPath, scanner)
+		if err != nil {
+			log.Fatalf("Error resolving API key: %v", err)
+		}
 	}
 
 	cfg := buildConfig(opts, fileCfg, apiKey)

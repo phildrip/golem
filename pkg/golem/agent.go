@@ -11,12 +11,15 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/mcp"
 	"github.com/user/golem/pkg/memory/fractal"
+	"github.com/user/golem/pkg/provider/openai"
 	"github.com/user/golem/pkg/subagent"
 	"github.com/user/golem/pkg/tools"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
+	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/model/gemini"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/tool"
@@ -46,6 +49,8 @@ type SubagentStreamHandler interface {
 
 // Config defines the configuration parameters for Golem.
 type Config struct {
+	Provider          string
+	BaseURL           string
 	ModelName         string
 	APIKey            string
 	StorageDir        string
@@ -56,6 +61,7 @@ type Config struct {
 	OnRetry           RetryCallback
 	MCPConfig         *mcp.Config
 	MCPConfigPaths    []string
+	FileConfig        config.FileConfig
 }
 
 // DefaultConfig provides recommended settings.
@@ -97,11 +103,14 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	if cfg.ModelName == "" {
 		cfg.ModelName = DefaultModelName
 	}
+	if cfg.Provider == "" {
+		cfg.Provider = config.ResolveProvider("", cfg.FileConfig, cfg.ModelName)
+	}
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = config.ResolveBaseURL(cfg.Provider, "", cfg.FileConfig)
+	}
 	if cfg.APIKey == "" {
-		cfg.APIKey = os.Getenv("GEMINI_API_KEY")
-		if cfg.APIKey == "" {
-			cfg.APIKey = os.Getenv("GOOGLE_API_KEY")
-		}
+		cfg.APIKey = config.ResolveProviderKey(cfg.Provider, "", cfg.FileConfig)
 	}
 	if cfg.StorageDir == "" {
 		cfg.StorageDir = DefaultConfig().StorageDir
@@ -120,58 +129,68 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 	view := fractal.NewView(store, viewCfg)
 
-	attempts := int32(5)
-	initialDelay := 1.0
-	maxDelay := 30.0
-	expBase := 2.0
-	jitter := 0.5
+	// 3. Initialize Model (Gemini or OpenAI-compatible provider)
+	var clientCfg *genai.ClientConfig
+	var modelInstance model.LLM
 
-	clientCfg := &genai.ClientConfig{
-		APIKey: cfg.APIKey,
-		HTTPOptions: genai.HTTPOptions{
-			RetryOptions: &genai.HTTPRetryOptions{
-				Attempts:        &attempts,
-				InitialDelay:    &initialDelay,
-				MaxDelay:        &maxDelay,
-				ExpBase:         &expBase,
-				Jitter:          &jitter,
-				HTTPStatusCodes: []int32{408, 429, 500, 502, 503, 504},
+	if cfg.Provider == config.ProviderGemini {
+		attempts := int32(5)
+		initialDelay := 1.0
+		maxDelay := 30.0
+		expBase := 2.0
+		jitter := 0.5
+
+		clientCfg = &genai.ClientConfig{
+			APIKey: cfg.APIKey,
+			HTTPOptions: genai.HTTPOptions{
+				RetryOptions: &genai.HTTPRetryOptions{
+					Attempts:        &attempts,
+					InitialDelay:    &initialDelay,
+					MaxDelay:        &maxDelay,
+					ExpBase:         &expBase,
+					Jitter:          &jitter,
+					HTTPStatusCodes: []int32{408, 429, 500, 502, 503, 504},
+				},
 			},
-		},
-	}
+		}
 
-	// If no API key is provided, check for Vertex AI environment or Antigravity configuration
-	if cfg.APIKey == "" {
-		if os.Getenv("GOOGLE_GENAI_USE_VERTEXAI") == "" && os.Getenv("GOOGLE_CLOUD_PROJECT") == "" {
-			home, _ := os.UserHomeDir()
-			if home != "" {
-				settingsPath := filepath.Join(home, ".gemini/antigravity-cli/settings.json")
-				if data, err := os.ReadFile(settingsPath); err == nil {
-					var s struct {
-						GCP struct {
-							Project  string `json:"project"`
-							Location string `json:"location"`
-						} `json:"gcp"`
-					}
-					if err := json.Unmarshal(data, &s); err == nil && s.GCP.Project != "" {
-						clientCfg.Backend = genai.BackendVertexAI
-						clientCfg.Project = s.GCP.Project
-						clientCfg.Location = s.GCP.Location
-						if clientCfg.Location == "" {
-							clientCfg.Location = "global"
+		// If no API key is provided, check for Vertex AI environment or Antigravity configuration
+		if cfg.APIKey == "" {
+			if os.Getenv("GOOGLE_GENAI_USE_VERTEXAI") == "" && os.Getenv("GOOGLE_CLOUD_PROJECT") == "" {
+				home, _ := os.UserHomeDir()
+				if home != "" {
+					settingsPath := filepath.Join(home, ".gemini/antigravity-cli/settings.json")
+					if data, err := os.ReadFile(settingsPath); err == nil {
+						var s struct {
+							GCP struct {
+								Project  string `json:"project"`
+								Location string `json:"location"`
+							} `json:"gcp"`
+						}
+						if err := json.Unmarshal(data, &s); err == nil && s.GCP.Project != "" {
+							clientCfg.Backend = genai.BackendVertexAI
+							clientCfg.Project = s.GCP.Project
+							clientCfg.Location = s.GCP.Location
+							if clientCfg.Location == "" {
+								clientCfg.Location = "global"
+							}
 						}
 					}
 				}
 			}
 		}
-	}
-	genaiClient, err := genai.NewClient(ctx, clientCfg)
-	if err != nil {
-		store.Close()
-		return nil, errors.Wrap(err, "initializing genai client")
+
+		gm, err := gemini.NewModel(ctx, cfg.ModelName, clientCfg)
+		if err != nil {
+			store.Close()
+			return nil, errors.Wrapf(err, "initializing gemini model %s", cfg.ModelName)
+		}
+		modelInstance = gm
+	} else {
+		modelInstance = openai.NewClient(cfg.ModelName, cfg.BaseURL, cfg.APIKey, nil)
 	}
 
-	summarizer := fractal.NewGeminiSummarizer(genaiClient, cfg.ModelName)
+	summarizer := fractal.NewLLMSummarizer(modelInstance)
 	compactor := fractal.NewCompactor(store, view, summarizer, fractal.DefaultCompactorConfig())
 
 	// Start background compactor if interval is configured
@@ -253,7 +272,14 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	var agentPtr *Agent
 
 	// 6. Initialize Subagent Runner & Delegation Tool
-	modelFactory := subagent.NewModelFactory(clientCfg, cfg.ModelName)
+	modelFactory := subagent.NewModelFactoryWithConfig(subagent.FactoryConfig{
+		ClientConfig:    clientCfg,
+		DefaultModel:    cfg.ModelName,
+		DefaultProvider: cfg.Provider,
+		DefaultBaseURL:  cfg.BaseURL,
+		DefaultAPIKey:   cfg.APIKey,
+		FileConfig:      cfg.FileConfig,
+	})
 	subagentRunner := subagent.NewRunner(subagent.RunnerConfig{
 		ModelFactory:   modelFactory,
 		WorkspaceDir:   workDir,
@@ -265,6 +291,27 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 				agentPtr.dispatchSubagentEvent(ev)
 			}
 		},
+		MemoryContext: func() string {
+			if view != nil {
+				view.Sync()
+				liveHead := view.LiveHeadEvents()
+				if len(liveHead) == 0 {
+					return ""
+				}
+				var sb strings.Builder
+				sb.WriteString("<recent_live_head>\n")
+				for _, ev := range liveHead {
+					clean := strings.ReplaceAll(ev.Text, "\n", " ")
+					if len(clean) > 120 {
+						clean = clean[:120] + "..."
+					}
+					sb.WriteString(fmt.Sprintf("#%d [%s]: %s\n", ev.ID, ev.Kind, clean))
+				}
+				sb.WriteString("</recent_live_head>")
+				return sb.String()
+			}
+			return ""
+		},
 	})
 	invokeSubagentTool, err := subagent.NewInvokeTool(subagentRunner)
 	if err != nil {
@@ -274,15 +321,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 	allTools = append(allTools, invokeSubagentTool)
 
-	// 7. Initialize Gemini ADK Model
-	modelInstance, err := gemini.NewModel(ctx, cfg.ModelName, clientCfg)
-	if err != nil {
-		store.Close()
-		mcpManager.Close()
-		return nil, errors.Wrapf(err, "initializing gemini model %s", cfg.ModelName)
-	}
-
-	// 8. Build LLM Agent with dynamic fractal memory injection & logging callbacks
+	// 7. Build LLM Agent with dynamic fractal memory injection & logging callbacks
 	adkAgent, err := llmagent.New(llmagent.Config{
 		Name:        "golem",
 		Description: "An autonomous agent equipped with shell and file tools, and infinite fractal memory.",
@@ -305,6 +344,11 @@ Memory Navigation:
 - zoom(id, 1) returns the exact verbatim message in full.
 - Always zoom before guessing or asking the user about past facts.
 - Use date(id) to check the timestamp of any message.
+
+Subagents & Delegation:
+- Use invoke_subagent to delegate focused investigations, file explorations, or complex coding tasks to subagents.
+- Subagents run with isolated context windows, preventing context bloat.
+- Both you and your subagents share the same fractal memory store. Subagents can use zoom(id, n) and date(id) to inspect past rulings and history.
 
 `)
 			if renderedView != "" {

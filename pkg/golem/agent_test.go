@@ -139,3 +139,44 @@ func TestAgentLifecycle(t *testing.T) {
 	}
 }
 
+func TestAgentMultiProviderInit(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := Config{
+		Provider:        "opencode",
+		BaseURL:         "https://api.opencode.ai/v1",
+		ModelName:       "deepseek-chat",
+		APIKey:          "opencode-test-key",
+		StorageDir:      tempDir,
+		LiveHeadCount:   4,
+		ViewBudgetBytes: 1024,
+	}
+
+	ctx := context.Background()
+	agent, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("New agent with OpenCode provider failed: %v", err)
+	}
+	defer agent.Close()
+
+	if agent.Store() == nil {
+		t.Errorf("expected Store() to be non-nil")
+	}
+	if agent.View() == nil {
+		t.Errorf("expected View() to be non-nil")
+	}
+	if agent.Compactor() == nil {
+		t.Errorf("expected Compactor() to be non-nil")
+	}
+
+	// Verify appending event and syncing view
+	if _, err := agent.Store().AppendEvent(fractal.KindUser, "opencode test"); err != nil {
+		t.Fatalf("AppendEvent failed: %v", err)
+	}
+	agent.View().Sync()
+
+	liveEvents := agent.View().LiveHeadEvents()
+	if len(liveEvents) != 1 || !strings.Contains(liveEvents[0].Text, "opencode test") {
+		t.Errorf("expected live head to contain opencode test, got %v", liveEvents)
+	}
+}
+

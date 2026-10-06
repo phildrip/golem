@@ -1,6 +1,7 @@
 package subagent
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -100,5 +101,77 @@ func TestNewInvokeTool_Metadata(t *testing.T) {
 		!strings.Contains(invokeTool.Description(), "coder") ||
 		!strings.Contains(invokeTool.Description(), "model") {
 		t.Errorf("expected description to document roles and model, got: %s", invokeTool.Description())
+	}
+}
+
+func TestModelFactory_MultiProvider(t *testing.T) {
+	ctx := context.Background()
+	factory := NewModelFactoryWithConfig(FactoryConfig{
+		DefaultModel:    "deepseek-chat",
+		DefaultProvider: "opencode",
+		DefaultBaseURL:  "https://api.opencode.ai/v1",
+		DefaultAPIKey:   "opencode-secret",
+	})
+
+	// 1. Empty / inherit returns default provider model
+	m1, resolved, err := factory.GetModel(ctx, "")
+	if err != nil {
+		t.Fatalf("GetModel failed: %v", err)
+	}
+	if resolved != "deepseek-chat" || m1.Name() != "deepseek-chat" {
+		t.Errorf("expected deepseek-chat, got %s / %s", resolved, m1.Name())
+	}
+
+	// 2. Specific opencode prefix
+	m2, _, err := factory.GetModel(ctx, "opencode/deepseek-coder")
+	if err != nil {
+		t.Fatalf("GetModel opencode failed: %v", err)
+	}
+	if m2.Name() != "deepseek-coder" {
+		t.Errorf("expected deepseek-coder, got %s", m2.Name())
+	}
+
+	// 3. OpenAI prefix
+	m3, _, err := factory.GetModel(ctx, "openai/gpt-4o")
+	if err != nil {
+		t.Fatalf("GetModel openai failed: %v", err)
+	}
+	if m3.Name() != "gpt-4o" {
+		t.Errorf("expected gpt-4o, got %s", m3.Name())
+	}
+
+	// 4. OpenRouter prefix
+	m4, _, err := factory.GetModel(ctx, "openrouter/anthropic/claude-3.5-sonnet")
+	if err != nil {
+		t.Fatalf("GetModel openrouter failed: %v", err)
+	}
+	if m4.Name() != "anthropic/claude-3.5-sonnet" {
+		t.Errorf("expected anthropic/claude-3.5-sonnet, got %s", m4.Name())
+	}
+
+	// 5. Caching: retrieving same model returns cached instance
+	m1Again, _, _ := factory.GetModel(ctx, "deepseek-chat")
+	if m1 != m1Again {
+		t.Errorf("expected cached instance to match")
+	}
+}
+
+func TestRunner_FractalMemoryGuidanceAndLiveHead(t *testing.T) {
+	runner := NewRunner(RunnerConfig{
+		ModelFactory: NewModelFactory(nil, "gemini-flash-latest"),
+		MemoryContext: func() string {
+			return "<recent_live_head>\n#1 [user]: write fractal tests\n</recent_live_head>"
+		},
+	})
+
+	prompt := runner.BuildSystemPrompt(RoleCoder)
+	if !strings.Contains(prompt, "Fractal Memory Architecture") {
+		t.Errorf("expected system prompt to explain fractal memory architecture, got: %s", prompt)
+	}
+	if !strings.Contains(prompt, "zoom(id, n)") || !strings.Contains(prompt, "date(id)") {
+		t.Errorf("expected prompt to mention zoom and date tools, got: %s", prompt)
+	}
+	if !strings.Contains(prompt, "<recent_live_head>") || !strings.Contains(prompt, "write fractal tests") {
+		t.Errorf("expected prompt to contain recent live head context, got: %s", prompt)
 	}
 }

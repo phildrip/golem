@@ -24,6 +24,7 @@ type RunnerConfig struct {
 	ReadWriteTools []tool.Tool
 	MCPToolsets    []tool.Toolset
 	EventHandler   EventHandler
+	MemoryContext  func() string
 }
 
 // Runner manages spawning and running isolated subagent instances.
@@ -65,6 +66,16 @@ func (r *Runner) SelectTools(role string) []tool.Tool {
 	}
 }
 
+const subagentMemoryGuidance = `
+
+Fractal Memory Architecture & Navigation:
+- You share Golem's append-only fractal memory store with the parent agent.
+- Past conversation events and historical decisions are organized into hierarchical binary tree nodes.
+- You have tools to query past memory when needed:
+  - zoom(id, n): Inspects a compacted hierarchical node (id+n) or retrieves the exact verbatim message when n=1 (e.g. zoom(0, 1)).
+  - date(id): Returns the creation timestamp for a specific event ID.
+- Use zoom when you need to inspect past requirements, verify architectural decisions, or check verbatim past user rulings without guessing.`
+
 // SystemPromptForRole returns tailored instructions based on the archetype.
 func (r *Runner) SystemPromptForRole(role string) string {
 	cleanRole := strings.ToLower(strings.TrimSpace(role))
@@ -75,7 +86,7 @@ Your goal is to inspect, search, and analyze the workspace codebase and document
 RULES:
 1. You have READ-ONLY tools. You CANNOT and MUST NOT attempt to create or edit files.
 2. Provide exact file paths, line references, and structured findings.
-3. Be concise, factual, and direct.`
+3. Be concise, factual, and direct.` + subagentMemoryGuidance
 
 	case RoleCoder:
 		return `You are an autonomous Coding Subagent.
@@ -83,12 +94,24 @@ Your goal is to implement, debug, or refactor code in accordance with the parent
 RULES:
 1. Make targeted, careful modifications.
 2. Run tests or build checks when appropriate to verify your changes.
-3. Report exactly what files were modified and the outcome of your verification.`
+3. Report exactly what files were modified and the outcome of your verification.` + subagentMemoryGuidance
 
 	default:
 		return `You are an autonomous Assistant Subagent delegated to accomplish a targeted task for the parent agent.
-Provide clear and accurate results.`
+Provide clear and accurate results.` + subagentMemoryGuidance
 	}
+}
+
+// BuildSystemPrompt returns the complete system prompt for a role, including
+// base role archetype instructions, fractal memory guidance, and dynamic live-head context.
+func (r *Runner) BuildSystemPrompt(role string) string {
+	systemPrompt := r.SystemPromptForRole(role)
+	if r.cfg.MemoryContext != nil {
+		if memCtx := r.cfg.MemoryContext(); memCtx != "" {
+			systemPrompt += "\n\nRecent Memory Context:\n" + memCtx
+		}
+	}
+	return systemPrompt
 }
 
 // Invoke launches the subagent in an isolated session, streams events, and returns the result.
@@ -121,7 +144,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 	}
 
 	tools := r.SelectTools(role)
-	systemPrompt := r.SystemPromptForRole(role)
+	systemPrompt := r.BuildSystemPrompt(role)
 
 	var toolCallsCount int32
 
