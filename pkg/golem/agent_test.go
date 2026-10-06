@@ -3,9 +3,11 @@ package golem
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/memory/fractal"
 )
 
@@ -177,6 +179,127 @@ func TestAgentMultiProviderInit(t *testing.T) {
 	liveEvents := agent.View().LiveHeadEvents()
 	if len(liveEvents) != 1 || !strings.Contains(liveEvents[0].Text, "opencode test") {
 		t.Errorf("expected live head to contain opencode test, got %v", liveEvents)
+	}
+}
+
+func TestAgentProfileAndMountedMemory(t *testing.T) {
+	primaryDir := t.TempDir()
+	workDir := t.TempDir()
+	docsDir := t.TempDir()
+
+	// Seed work store with knowledge (enough events beyond LiveHeadCount so tail folds into View)
+	workStore, err := fractal.OpenStore(workDir)
+	if err != nil {
+		t.Fatalf("OpenStore work failed: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		_, _ = workStore.AppendEvent(fractal.KindUser, fmt.Sprintf("work decision %d", i))
+		_ = workStore.SaveNode(fractal.Node{Level: 0, Index: i, Text: fmt.Sprintf("work convention %d", i)})
+	}
+	workStore.Close()
+
+	// Seed primary store with events so it has a folded tail
+	primaryStore, err := fractal.OpenStore(primaryDir)
+	if err != nil {
+		t.Fatalf("OpenStore primary failed: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		_, _ = primaryStore.AppendEvent(fractal.KindUser, fmt.Sprintf("primary task %d", i))
+		_ = primaryStore.SaveNode(fractal.Node{Level: 0, Index: i, Text: fmt.Sprintf("primary note %d", i)})
+	}
+	primaryStore.Close()
+
+	// Seed docs store
+	docsStore, err := fractal.OpenStore(docsDir)
+	if err != nil {
+		t.Fatalf("OpenStore docs failed: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		_, _ = docsStore.AppendEvent(fractal.KindUser, fmt.Sprintf("API doc %d", i))
+		_ = docsStore.SaveNode(fractal.Node{Level: 0, Index: i, Text: fmt.Sprintf("reference %d", i)})
+	}
+	docsStore.Close()
+
+	cfg := Config{
+		Provider:        "opencode",
+		BaseURL:         "https://api.opencode.ai/v1",
+		ModelName:       "deepseek-chat",
+		APIKey:          "opencode-test-key",
+		StorageDir:      primaryDir,
+		Profile:         "work",
+		MountedMemories: []config.MountedMemoryConfig{
+			{Name: "shared-docs", Path: docsDir, ReadOnly: true},
+		},
+		LiveHeadCount:   2,
+		ViewBudgetBytes: 2048,
+	}
+
+	ctx := context.Background()
+	agent, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("New agent failed: %v", err)
+	}
+	defer agent.Close()
+
+	// Verify memory manager initialized and contains primary + mounted
+	mgr := agent.MemoryManager()
+	if mgr == nil {
+		t.Fatalf("expected MemoryManager() to be non-nil")
+	}
+
+	// Mount work store explicitly into memory manager (simulating profile mount)
+	workOpened, _ := fractal.OpenStore(workDir)
+	defer workOpened.Close()
+	mgr.Mount("work", workOpened, fractal.NewView(workOpened, fractal.ViewConfig{LiveHeadCount: 2, ViewBudgetBytes: 1024}), true)
+
+	// Test Zoom across primary and mounted
+	zoomWork, err := fractal.Zoom(mgr, fractal.ZoomArgs{
+		Target: "work",
+		ID:     0,
+		N:      1,
+	})
+	if err != nil {
+		t.Fatalf("Zoom work store failed: %v", err)
+	}
+	if !strings.Contains(zoomWork.Result, "work decision 0") {
+		t.Errorf("expected zoomWork to contain 'work decision 0', got: %s", zoomWork.Result)
+	}
+
+	// Test Zoom on non-existent store
+	zoomMissing, _ := fractal.Zoom(mgr, fractal.ZoomArgs{
+		Target: "non-existent",
+		ID:     0,
+		N:      1,
+	})
+	if !strings.Contains(zoomMissing.Result, "not found") {
+		t.Errorf("expected not found message, got: %s", zoomMissing.Result)
+	}
+
+	// Test Remember tool recording into profile memory
+	remRes, err := fractal.Remember(mgr, "work", fractal.RememberArgs{
+		Text:  "Always run tests with -race flag",
+		Scope: "work",
+	})
+	if err != nil {
+		t.Fatalf("Remember failed: %v", err)
+	}
+	if !strings.Contains(remRes.Message, "Recorded to work memory") {
+		t.Errorf("unexpected Remember response: %s", remRes.Message)
+	}
+
+	// Verify the remembered event exists in work store
+	lastWorkEvent, has := workOpened.GetEvent(workOpened.CountEvents() - 1)
+	if !has || !strings.Contains(lastWorkEvent.Text, "-race") {
+		t.Errorf("expected remembered event in work store, got: %v", lastWorkEvent)
+	}
+
+	// Test RenderCombined includes mounted memories
+	combined := mgr.RenderCombined()
+	if !strings.Contains(combined, "<mounted_memory name=\"work\"") {
+		t.Errorf("expected <mounted_memory name=\"work\"> in combined view, got:\n%s", combined)
+	}
+	if !strings.Contains(combined, "<chat>") {
+		t.Errorf("expected primary <chat> in combined view, got:\n%s", combined)
 	}
 }
 

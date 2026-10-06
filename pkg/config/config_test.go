@@ -173,3 +173,98 @@ func TestMultiProviderResolution(t *testing.T) {
 	}
 }
 
+func TestProfilesAndMountedMemories(t *testing.T) {
+	t.Setenv("WORK_SECRET_KEY", "work-secret-env-123")
+
+	fileCfg := FileConfig{
+		ActiveProfile: "personal",
+		Profiles: map[string]ProfileConfig{
+			"personal": {
+				Provider:  "gemini",
+				Model:     "gemini-flash-latest",
+				APIKey:    "personal-gemini-key",
+				MemoryDir: "/custom/personal/memory",
+			},
+			"work": {
+				Provider:  "opencode",
+				Model:     "deepseek-chat",
+				BaseURL:   "https://api.opencode.ai/v1",
+				APIKeyEnv: "WORK_SECRET_KEY",
+				MountedMemories: []MountedMemoryConfig{
+					{
+						Name:     "shared-docs",
+						Path:     "/company/shared-docs/memory",
+						ReadOnly: true,
+					},
+				},
+			},
+		},
+	}
+
+	// 1. Default active profile from config is 'personal'
+	name, prof := ResolveActiveProfile("", fileCfg)
+	if name != "personal" {
+		t.Errorf("expected profile 'personal', got %q", name)
+	}
+	if prof.Provider != "gemini" || prof.APIKey != "personal-gemini-key" || prof.MemoryDir != "/custom/personal/memory" {
+		t.Errorf("unexpected personal profile config: %+v", prof)
+	}
+
+	// 2. Explicit flag override to 'work'
+	name, prof = ResolveActiveProfile("work", fileCfg)
+	if name != "work" {
+		t.Errorf("expected profile 'work', got %q", name)
+	}
+	if prof.Provider != "opencode" || prof.Model != "deepseek-chat" {
+		t.Errorf("unexpected work profile config: %+v", prof)
+	}
+	if prof.APIKey != "work-secret-env-123" {
+		t.Errorf("expected APIKey resolved from WORK_SECRET_KEY, got %q", prof.APIKey)
+	}
+	if len(prof.MountedMemories) != 1 || prof.MountedMemories[0].Name != "shared-docs" {
+		t.Errorf("expected mounted memories in work profile, got %+v", prof.MountedMemories)
+	}
+
+	// 3. ApplyProfile updates FileConfig
+	applied := fileCfg.ApplyProfile("work", prof)
+	if applied.ActiveProfile != "work" || applied.Provider != "opencode" || applied.Model != "deepseek-chat" {
+		t.Errorf("ApplyProfile did not overlay settings: %+v", applied)
+	}
+}
+
+func TestMergeConfigs(t *testing.T) {
+	userCfg := FileConfig{
+		ActiveProfile: "personal",
+		Provider:      "gemini",
+		Profiles: map[string]ProfileConfig{
+			"personal": {Provider: "gemini"},
+		},
+	}
+
+	wsCfg := FileConfig{
+		ActiveProfile: "work",
+		Provider:      "opencode",
+		Profiles: map[string]ProfileConfig{
+			"work": {Provider: "opencode"},
+		},
+		MountedMemories: []MountedMemoryConfig{
+			{Name: "team-knowledge", Path: "/workspace/knowledge/memory", ReadOnly: true},
+		},
+	}
+
+	merged := MergeConfigs(userCfg, wsCfg)
+	if merged.ActiveProfile != "work" {
+		t.Errorf("expected workspace active profile 'work', got %q", merged.ActiveProfile)
+	}
+	if merged.Provider != "opencode" {
+		t.Errorf("expected workspace provider 'opencode', got %q", merged.Provider)
+	}
+	if len(merged.Profiles) != 2 {
+		t.Errorf("expected 2 merged profiles, got %d", len(merged.Profiles))
+	}
+	if len(merged.MountedMemories) != 1 {
+		t.Errorf("expected 1 mounted memory, got %d", len(merged.MountedMemories))
+	}
+}
+
+

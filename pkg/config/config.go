@@ -26,6 +26,25 @@ const (
 	DefaultOpenRouterBaseURL = "https://openrouter.ai/api/v1"
 )
 
+// MountedMemoryConfig specifies a secondary or peer fractal memory store mounted into the session.
+type MountedMemoryConfig struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	ReadOnly bool   `json:"read_only,omitempty"`
+}
+
+// ProfileConfig encapsulates provider settings, model preferences, and memory directories
+// for a named profile (e.g. "work", "personal").
+type ProfileConfig struct {
+	Provider        string                `json:"provider,omitempty"`
+	Model           string                `json:"model,omitempty"`
+	BaseURL         string                `json:"base_url,omitempty"`
+	APIKey          string                `json:"api_key,omitempty"`
+	APIKeyEnv       string                `json:"api_key_env,omitempty"`
+	MemoryDir       string                `json:"memory_dir,omitempty"`
+	MountedMemories []MountedMemoryConfig `json:"mounted_memories,omitempty"`
+}
+
 // ProviderConfig stores credentials and endpoint for an individual model provider.
 type ProviderConfig struct {
 	APIKey  string `json:"api_key,omitempty"`
@@ -33,14 +52,17 @@ type ProviderConfig struct {
 	Model   string `json:"model,omitempty"`
 }
 
-// FileConfig represents the JSON structure stored in ~/.golem/config.json or ~/.config/golem/config.json.
+// FileConfig represents the JSON structure stored in ~/.golem/config.json or .golem/config.json.
 type FileConfig struct {
-	Provider  string                    `json:"provider,omitempty"`
-	APIKey    string                    `json:"api_key,omitempty"`
-	BaseURL   string                    `json:"base_url,omitempty"`
-	Model     string                    `json:"model,omitempty"`
-	MemoryDir string                    `json:"memory_dir,omitempty"`
-	Providers map[string]ProviderConfig `json:"providers,omitempty"`
+	ActiveProfile   string                    `json:"active_profile,omitempty"`
+	Profiles        map[string]ProfileConfig  `json:"profiles,omitempty"`
+	Provider        string                    `json:"provider,omitempty"`
+	APIKey          string                    `json:"api_key,omitempty"`
+	BaseURL         string                    `json:"base_url,omitempty"`
+	Model           string                    `json:"model,omitempty"`
+	MemoryDir       string                    `json:"memory_dir,omitempty"`
+	MountedMemories []MountedMemoryConfig     `json:"mounted_memories,omitempty"`
+	Providers       map[string]ProviderConfig `json:"providers,omitempty"`
 }
 
 // UserDir returns Golem's user configuration directory.
@@ -343,4 +365,173 @@ func ResolveBaseURL(provider string, flagURL string, fileCfg FileConfig) string 
 
 	return strings.TrimSpace(fileCfg.BaseURL)
 }
+
+// ProfileMemoryDir returns the canonical storage directory for a profile's fractal memory.
+// Typically ~/.golem/profiles/<name>/memory
+func ProfileMemoryDir(profileName string) (string, error) {
+	if profileName == "" {
+		profileName = "default"
+	}
+	userDir, err := UserDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(userDir, "profiles", profileName, "memory"), nil
+}
+
+// MergeConfigs merges workspace config over user config.
+func MergeConfigs(userCfg, wsCfg FileConfig) FileConfig {
+	merged := userCfg
+
+	if wsCfg.ActiveProfile != "" {
+		merged.ActiveProfile = wsCfg.ActiveProfile
+	}
+	if wsCfg.Provider != "" {
+		merged.Provider = wsCfg.Provider
+	}
+	if wsCfg.APIKey != "" {
+		merged.APIKey = wsCfg.APIKey
+	}
+	if wsCfg.BaseURL != "" {
+		merged.BaseURL = wsCfg.BaseURL
+	}
+	if wsCfg.Model != "" {
+		merged.Model = wsCfg.Model
+	}
+	if wsCfg.MemoryDir != "" {
+		merged.MemoryDir = wsCfg.MemoryDir
+	}
+
+	if len(wsCfg.MountedMemories) > 0 {
+		merged.MountedMemories = append([]MountedMemoryConfig(nil), wsCfg.MountedMemories...)
+	}
+
+	if len(wsCfg.Providers) > 0 {
+		if merged.Providers == nil {
+			merged.Providers = make(map[string]ProviderConfig)
+		}
+		for k, v := range wsCfg.Providers {
+			merged.Providers[k] = v
+		}
+	}
+
+	if len(wsCfg.Profiles) > 0 {
+		if merged.Profiles == nil {
+			merged.Profiles = make(map[string]ProfileConfig)
+		}
+		for k, v := range wsCfg.Profiles {
+			merged.Profiles[k] = v
+		}
+	}
+
+	return merged
+}
+
+// LoadWorkspace loads the workspace configuration (.golem/config.json) if it exists.
+func LoadWorkspace(workspaceDir string) (FileConfig, error) {
+	if workspaceDir == "" {
+		return FileConfig{}, nil
+	}
+	wsConfigPath := filepath.Join(WorkspaceDir(workspaceDir), "config.json")
+	return Load(wsConfigPath)
+}
+
+// LoadAll loads user config and merges any workspace config found in workspaceDir.
+func LoadAll(workspaceDir string, customConfigPath string) (FileConfig, error) {
+	userCfg, err := Load(customConfigPath)
+	if err != nil {
+		return FileConfig{}, err
+	}
+	if workspaceDir == "" {
+		return userCfg, nil
+	}
+	wsCfg, err := LoadWorkspace(workspaceDir)
+	if err != nil {
+		return userCfg, err
+	}
+	return MergeConfigs(userCfg, wsCfg), nil
+}
+
+// ResolveActiveProfile resolves the active profile name and its merged profile configuration.
+// Resolution precedence for profile name:
+// 1. Explicit flagProfile (e.g. from -profile CLI flag)
+// 2. $GOLEM_PROFILE environment variable
+// 3. FileConfig.ActiveProfile
+// 4. Default: "default"
+func ResolveActiveProfile(flagProfile string, fileCfg FileConfig) (string, ProfileConfig) {
+	name := strings.TrimSpace(flagProfile)
+	if name == "" {
+		name = strings.TrimSpace(os.Getenv("GOLEM_PROFILE"))
+	}
+	if name == "" {
+		name = strings.TrimSpace(fileCfg.ActiveProfile)
+	}
+	if name == "" {
+		name = "default"
+	}
+
+	var prof ProfileConfig
+	if fileCfg.Profiles != nil {
+		if p, ok := fileCfg.Profiles[name]; ok {
+			prof = p
+		}
+	}
+
+	// Fallback to top-level FileConfig defaults if profile leaves them empty
+	if prof.Provider == "" && fileCfg.Provider != "" {
+		prof.Provider = fileCfg.Provider
+	}
+	if prof.Model == "" && fileCfg.Model != "" {
+		prof.Model = fileCfg.Model
+	}
+	if prof.BaseURL == "" && fileCfg.BaseURL != "" {
+		prof.BaseURL = fileCfg.BaseURL
+	}
+	if prof.APIKey == "" && prof.APIKeyEnv != "" {
+		prof.APIKey = os.Getenv(prof.APIKeyEnv)
+	}
+	if prof.APIKey == "" && fileCfg.APIKey != "" {
+		prof.APIKey = fileCfg.APIKey
+	}
+	if prof.MemoryDir == "" {
+		if name != "default" {
+			prof.MemoryDir, _ = ProfileMemoryDir(name)
+		} else if fileCfg.MemoryDir != "" {
+			prof.MemoryDir = fileCfg.MemoryDir
+		}
+	}
+
+	// Include top-level mounted memories if profile doesn't define any
+	if len(prof.MountedMemories) == 0 && len(fileCfg.MountedMemories) > 0 {
+		prof.MountedMemories = fileCfg.MountedMemories
+	}
+
+	return name, prof
+}
+
+// ApplyProfile overlays the resolved profile onto FileConfig.
+func (c FileConfig) ApplyProfile(profileName string, prof ProfileConfig) FileConfig {
+	updated := c
+	updated.ActiveProfile = profileName
+	if prof.Provider != "" {
+		updated.Provider = prof.Provider
+	}
+	if prof.Model != "" {
+		updated.Model = prof.Model
+	}
+	if prof.BaseURL != "" {
+		updated.BaseURL = prof.BaseURL
+	}
+	if prof.APIKey != "" {
+		updated.APIKey = prof.APIKey
+	}
+	if prof.MemoryDir != "" {
+		updated.MemoryDir = prof.MemoryDir
+	}
+	if len(prof.MountedMemories) > 0 {
+		updated.MountedMemories = prof.MountedMemories
+	}
+	return updated
+}
+
 

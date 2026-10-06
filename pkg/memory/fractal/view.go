@@ -220,8 +220,9 @@ func (v *View) LiveHeadEvents() []Event {
 
 // ZoomArgs defines arguments for the zoom tool.
 type ZoomArgs struct {
-	ID int `json:"id" jsonschema:"Starting message ID of the node to unpack"`
-	N  int `json:"n" jsonschema:"Number of messages covered (power of 2). Pass n=1 for verbatim full message text."`
+	Target string `json:"target,omitempty" jsonschema:"Optional mounted memory store name (e.g. 'work' or 'shared-docs'). Defaults to primary memory if omitted."`
+	ID     int    `json:"id" jsonschema:"Starting message ID of the node to unpack"`
+	N      int    `json:"n" jsonschema:"Number of messages covered (power of 2). Pass n=1 for verbatim full message text."`
 }
 
 // ZoomResult defines output from zoom tool.
@@ -229,49 +230,64 @@ type ZoomResult struct {
 	Result string `json:"result" jsonschema:"The unpacked summary lines or full message text"`
 }
 
-// NewZoomTool creates the native ADK zoom tool for inspecting memory nodes.
+// NewZoomTool creates the native ADK zoom tool for inspecting memory nodes in a single store.
 func NewZoomTool(store *Store) (tool.Tool, error) {
+	return NewMultiZoomTool(&SingleStoreRegistry{Store: store})
+}
+
+// Zoom executes the zoom logic against the primary or mounted memory store.
+func Zoom(registry StoreRegistry, args ZoomArgs) (ZoomResult, error) {
+	if args.N < 1 || (args.N&(args.N-1)) != 0 {
+		return ZoomResult{}, errors.Errorf("n must be a positive power of 2, got %d", args.N)
+	}
+	if args.ID < 0 || args.ID%args.N != 0 {
+		return ZoomResult{}, errors.Errorf("id %d must be a multiple of n %d", args.ID, args.N)
+	}
+
+	store, ok := registry.GetStore(args.Target)
+	if !ok || store == nil {
+		return ZoomResult{Result: fmt.Sprintf("Memory store %q not found", args.Target)}, nil
+	}
+
+	if args.N == 1 {
+		ev, ok := store.GetEvent(args.ID)
+		if !ok {
+			return ZoomResult{Result: fmt.Sprintf("No message at id %d in %s", args.ID, args.Target)}, nil
+		}
+		return ZoomResult{Result: fmt.Sprintf("%d+1|%s", args.ID, ev.FormatLine())}, nil
+	}
+
+	// n > 1: get two children of size n/2
+	childN := args.N / 2
+	child0ID := args.ID
+	child1ID := args.ID + childN
+
+	child0, ok0 := store.GetNodeByAddress(child0ID, childN)
+	child1, ok1 := store.GetNodeByAddress(child1ID, childN)
+
+	var lines []string
+	if ok0 {
+		lines = append(lines, fmt.Sprintf("%d+%d|%s", child0ID, childN, child0.Text))
+	} else {
+		lines = append(lines, fmt.Sprintf("%d+%d|(not summarized yet)", child0ID, childN))
+	}
+
+	if ok1 {
+		lines = append(lines, fmt.Sprintf("%d+%d|%s", child1ID, childN, child1.Text))
+	} else {
+		lines = append(lines, fmt.Sprintf("%d+%d|(not summarized yet)", child1ID, childN))
+	}
+
+	return ZoomResult{Result: strings.Join(lines, "\n")}, nil
+}
+
+// NewMultiZoomTool creates a zoom tool capable of inspecting primary and mounted memory stores.
+func NewMultiZoomTool(registry StoreRegistry) (tool.Tool, error) {
 	t, err := functiontool.New(functiontool.Config{
 		Name:        "zoom",
-		Description: "Opens line id+n of the memory view into the two constituent lines of n/2 under it. When n=1, returns the full verbatim message.",
+		Description: "Opens line id+n of the memory view into the two constituent lines of n/2 under it. When n=1, returns the full verbatim message. Optional target specifies mounted memory name.",
 	}, func(ctx agent.Context, args ZoomArgs) (ZoomResult, error) {
-		if args.N < 1 || (args.N&(args.N-1)) != 0 {
-			return ZoomResult{}, errors.Errorf("n must be a positive power of 2, got %d", args.N)
-		}
-		if args.ID < 0 || args.ID%args.N != 0 {
-			return ZoomResult{}, errors.Errorf("id %d must be a multiple of n %d", args.ID, args.N)
-		}
-
-		if args.N == 1 {
-			ev, ok := store.GetEvent(args.ID)
-			if !ok {
-				return ZoomResult{Result: fmt.Sprintf("No message at id %d", args.ID)}, nil
-			}
-			return ZoomResult{Result: fmt.Sprintf("%d+1|%s", args.ID, ev.FormatLine())}, nil
-		}
-
-		// n > 1: get two children of size n/2
-		childN := args.N / 2
-		child0ID := args.ID
-		child1ID := args.ID + childN
-
-		child0, ok0 := store.GetNodeByAddress(child0ID, childN)
-		child1, ok1 := store.GetNodeByAddress(child1ID, childN)
-
-		var lines []string
-		if ok0 {
-			lines = append(lines, fmt.Sprintf("%d+%d|%s", child0ID, childN, child0.Text))
-		} else {
-			lines = append(lines, fmt.Sprintf("%d+%d|(not summarized yet)", child0ID, childN))
-		}
-
-		if ok1 {
-			lines = append(lines, fmt.Sprintf("%d+%d|%s", child1ID, childN, child1.Text))
-		} else {
-			lines = append(lines, fmt.Sprintf("%d+%d|(not summarized yet)", child1ID, childN))
-		}
-
-		return ZoomResult{Result: strings.Join(lines, "\n")}, nil
+		return Zoom(registry, args)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "creating zoom tool")
@@ -281,7 +297,8 @@ func NewZoomTool(store *Store) (tool.Tool, error) {
 
 // DateArgs defines input for the date lookup tool.
 type DateArgs struct {
-	ID int `json:"id" jsonschema:"The message ID to inspect date and time for"`
+	Target string `json:"target,omitempty" jsonschema:"Optional mounted memory store name. Defaults to primary memory if omitted."`
+	ID     int    `json:"id" jsonschema:"The message ID to inspect date and time for"`
 }
 
 // DateResult defines output from date lookup.
@@ -289,12 +306,22 @@ type DateResult struct {
 	Timestamp string `json:"timestamp" jsonschema:"ISO8601 formatted timestamp of the message"`
 }
 
-// NewDateTool creates the native ADK date tool.
+// NewDateTool creates the native ADK date tool for a single store.
 func NewDateTool(store *Store) (tool.Tool, error) {
+	return NewMultiDateTool(&SingleStoreRegistry{Store: store})
+}
+
+// NewMultiDateTool creates a date tool supporting primary and mounted memory stores.
+func NewMultiDateTool(registry StoreRegistry) (tool.Tool, error) {
 	t, err := functiontool.New(functiontool.Config{
 		Name:        "date",
-		Description: "Returns the recorded date and timestamp for a specific message ID.",
+		Description: "Returns the recorded date and timestamp for a specific message ID in primary or mounted memory.",
 	}, func(ctx agent.Context, args DateArgs) (DateResult, error) {
+		store, ok := registry.GetStore(args.Target)
+		if !ok || store == nil {
+			return DateResult{Timestamp: fmt.Sprintf("Memory store %q not found", args.Target)}, nil
+		}
+
 		ev, ok := store.GetEvent(args.ID)
 		if !ok {
 			return DateResult{Timestamp: fmt.Sprintf("Message ID %d not found", args.ID)}, nil

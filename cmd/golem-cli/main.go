@@ -22,6 +22,7 @@ import (
 
 // CLIOptions holds parsed command-line flags.
 type CLIOptions struct {
+	Profile    string
 	Provider   string
 	BaseURL    string
 	Model      string
@@ -40,6 +41,7 @@ type AgentProcessor interface {
 // parseFlags parses command-line flags into CLIOptions.
 func parseFlags(args []string) (CLIOptions, error) {
 	fs := flag.NewFlagSet("golem", flag.ContinueOnError)
+	profileFlag := fs.String("profile", "", "Named profile to use (e.g. work, personal)")
 	providerFlag := fs.String("provider", "", "LLM provider: gemini (default), opencode, openai, openrouter")
 	baseURLFlag := fs.String("base-url", "", "Custom API base URL (e.g. for OpenCode Go, OpenAI, or Ollama)")
 	modelFlag := fs.String("model", "", "Model name (e.g. gemini-flash-latest, deepseek-chat)")
@@ -54,6 +56,7 @@ func parseFlags(args []string) (CLIOptions, error) {
 	}
 
 	return CLIOptions{
+		Profile:    *profileFlag,
 		Provider:   *providerFlag,
 		BaseURL:    *baseURLFlag,
 		Model:      *modelFlag,
@@ -182,11 +185,16 @@ func main() {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
-	// Load stored config file (~/.config/golem/config.json) if available
-	fileCfg, err := config.Load(opts.ConfigPath)
+	// Load stored config file (~/.golem/config.json) merged with workspace config (.golem/config.json)
+	workDir, _ := os.Getwd()
+	fileCfg, err := config.LoadAll(workDir, opts.ConfigPath)
 	if err != nil {
 		log.Printf("Note: could not load config file: %v", err)
 	}
+
+	// Resolve active profile
+	profileName, prof := config.ResolveActiveProfile(opts.Profile, fileCfg)
+	fileCfg = fileCfg.ApplyProfile(profileName, prof)
 
 	scanner := bufio.NewScanner(os.Stdin)
 

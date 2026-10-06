@@ -14,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/memory/fractal"
 )
@@ -108,6 +109,10 @@ type Model struct {
 	shortcutsViewport  viewport.Model
 	showMCPModal       bool
 	mcpViewport        viewport.Model
+	showProfileModal   bool
+	profileContent     string
+	profileViewport    viewport.Model
+	currentProfile     string
 	inputHistory       []string
 	historyIndex    int
 	currentDraft    string
@@ -151,16 +156,22 @@ func NewModel(agentInstance *golem.Agent, store *fractal.Store, viewEngine *frac
 		}
 	}
 
+	currentProfile := "default"
+	if agentInstance != nil && agentInstance.Config().Profile != "" {
+		currentProfile = agentInstance.Config().Profile
+	}
+
 	return Model{
-		agent:        agentInstance,
-		store:        store,
-		viewEngine:   viewEngine,
-		textarea:     ta,
-		spinner:      sp,
-		renderer:     renderer,
-		entries:      []ChatEntry{},
-		inputHistory: initialHistory,
-		historyIndex: len(initialHistory),
+		agent:          agentInstance,
+		store:          store,
+		viewEngine:     viewEngine,
+		textarea:       ta,
+		spinner:        sp,
+		renderer:       renderer,
+		entries:        []ChatEntry{},
+		currentProfile: currentProfile,
+		inputHistory:   initialHistory,
+		historyIndex:   len(initialHistory),
 		memoryStats: memoryStatsMsg{
 			tailLevels: make(map[int]int),
 		},
@@ -201,6 +212,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.treeViewport = viewport.New(msg.Width-10, msg.Height-8)
 			m.shortcutsViewport = viewport.New(msg.Width-10, msg.Height-8)
 			m.mcpViewport = viewport.New(msg.Width-10, msg.Height-8)
+			m.profileViewport = viewport.New(msg.Width-10, msg.Height-8)
 			m.ready = true
 		} else {
 			m.viewport.Width = msg.Width
@@ -211,6 +223,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.shortcutsViewport.Height = msg.Height - 8
 			m.mcpViewport.Width = msg.Width - 10
 			m.mcpViewport.Height = msg.Height - 8
+			m.profileViewport.Width = msg.Width - 10
+			m.profileViewport.Height = msg.Height - 8
 		}
 
 		m.textarea.SetWidth(msg.Width - 4)
@@ -225,6 +239,54 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderConversationToViewport()
 
 	case tea.KeyMsg:
+		if m.showProfileModal {
+			switch msg.Type {
+			case tea.KeyCtrlC, tea.KeyCtrlD:
+				return m, tea.Quit
+			case tea.KeyEsc:
+				m.showProfileModal = false
+				if !m.isBlurred {
+					m.textarea.Focus()
+				}
+				return m, nil
+			case tea.KeyUp:
+				m.profileViewport.LineUp(1)
+				return m, nil
+			case tea.KeyDown:
+				m.profileViewport.LineDown(1)
+				return m, nil
+			case tea.KeyPgUp:
+				m.profileViewport.HalfViewUp()
+				return m, nil
+			case tea.KeyPgDown:
+				m.profileViewport.HalfViewDown()
+				return m, nil
+			case tea.KeyHome:
+				m.profileViewport.GotoTop()
+				return m, nil
+			case tea.KeyEnd:
+				m.profileViewport.GotoBottom()
+				return m, nil
+			default:
+				if msg.String() == "q" {
+					m.showProfileModal = false
+					if !m.isBlurred {
+						m.textarea.Focus()
+					}
+					return m, nil
+				}
+				if msg.String() == "j" {
+					m.profileViewport.LineDown(1)
+					return m, nil
+				}
+				if msg.String() == "k" {
+					m.profileViewport.LineUp(1)
+					return m, nil
+				}
+				return m, nil
+			}
+		}
+
 		if m.showMCPModal {
 			switch msg.Type {
 			case tea.KeyCtrlC, tea.KeyCtrlD:
@@ -613,7 +675,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.FocusMsg:
 		m.isBlurred = false
-		if !m.showTreeModal && !m.showShortcutsModal && !m.showMCPModal {
+		if !m.showTreeModal && !m.showShortcutsModal && !m.showMCPModal && !m.showProfileModal {
 			tiCmd = m.textarea.Focus()
 		}
 
@@ -637,6 +699,10 @@ func (m Model) View() string {
 		return "Initializing Golem TUI..."
 	}
 
+	if m.showProfileModal {
+		return m.renderProfileModalView()
+	}
+
 	if m.showShortcutsModal {
 		return m.renderShortcutsModalView()
 	}
@@ -651,7 +717,21 @@ func (m Model) View() string {
 
 	// 1. Header
 	title := HeaderTitleStyle.Render("GOLEM")
-	sub := HeaderSubStyle.Render(" ADK v2 • Gemini Flash • Fractal Memory")
+	profStr := m.currentProfile
+	if profStr == "" {
+		profStr = "default"
+	}
+	provStr := "gemini"
+	modelStr := "gemini-flash-latest"
+	if m.agent != nil {
+		if m.agent.Config().Provider != "" {
+			provStr = m.agent.Config().Provider
+		}
+		if m.agent.Config().ModelName != "" {
+			modelStr = m.agent.Config().ModelName
+		}
+	}
+	sub := HeaderSubStyle.Render(fmt.Sprintf(" [%s | %s:%s] • Fractal Memory", profStr, provStr, modelStr))
 	minimap := RenderMemoryMinimap(m.memoryStats.totalEvents, m.memoryStats.tailLevels, m.memoryStats.liveCount, false)
 
 	header := lipgloss.JoinVertical(
@@ -1206,12 +1286,187 @@ func (m *Model) generateMCPVisual() string {
 	return sb.String()
 }
 
+// renderProfileModalView renders the overlay popup when /profile is active.
+func (m Model) renderProfileModalView() string {
+	modalStyle := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(ColorPrimary).
+		Padding(1, 2).
+		Width(m.width - 6).
+		Height(m.height - 4)
+
+	footerHint := StatusBarKeyHintStyle.Render("\n[↑/↓: Scroll • PgUp/PgDn: Page • Esc/q: Back to Chat]")
+	return modalStyle.Render(m.profileViewport.View() + footerHint)
+}
+
+// generateProfileVisual formats a summary of available provider profiles.
+func (m *Model) generateProfileVisual() string {
+	var sb strings.Builder
+
+	titleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(ColorHighlight).
+		Background(ColorPrimary).
+		Padding(0, 1)
+
+	headerSection := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(ColorSecondary).
+		MarginTop(1)
+
+	sb.WriteString(titleStyle.Render("GOLEM PROVIDER PROFILES") + "\n\n")
+	sb.WriteString(headerSection.Render("■ Configured Profiles") + "\n")
+
+	active := m.currentProfile
+	if active == "" {
+		active = "default"
+	}
+
+	var profiles map[string]config.ProfileConfig
+	if m.agent != nil {
+		profiles = m.agent.Config().FileConfig.Profiles
+	}
+
+	if len(profiles) == 0 {
+		sb.WriteString(fmt.Sprintf("  • %s %s\n",
+			lipgloss.NewStyle().Bold(true).Foreground(ColorSuccess).Render("default"),
+			lipgloss.NewStyle().Foreground(ColorMuted).Render("[ACTIVE]"),
+		))
+		if m.agent != nil {
+			sb.WriteString(fmt.Sprintf("    Provider: %s | Model: %s\n",
+				m.agent.Config().Provider, m.agent.Config().ModelName))
+			sb.WriteString(fmt.Sprintf("    Memory:   %s\n", m.agent.Config().StorageDir))
+		}
+	} else {
+		names := make([]string, 0, len(profiles))
+		for n := range profiles {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+
+		for _, name := range names {
+			p := profiles[name]
+			isActive := (name == active)
+			badge := ""
+			nameRender := lipgloss.NewStyle().Bold(true).Foreground(ColorHighlight).Render(name)
+			if isActive {
+				badge = " " + lipgloss.NewStyle().Bold(true).Foreground(ColorSuccess).Render("[ACTIVE]")
+				nameRender = lipgloss.NewStyle().Bold(true).Foreground(ColorSuccess).Render("★ " + name)
+			} else {
+				nameRender = "• " + nameRender
+			}
+
+			sb.WriteString(fmt.Sprintf("  %s%s\n", nameRender, badge))
+
+			provider := p.Provider
+			if provider == "" {
+				provider = "gemini"
+			}
+			model := p.Model
+			if model == "" {
+				model = "gemini-flash-latest"
+			}
+			sb.WriteString(fmt.Sprintf("    Provider: %s | Model: %s\n",
+				lipgloss.NewStyle().Foreground(ColorPrimary).Render(provider),
+				lipgloss.NewStyle().Foreground(ColorHighlight).Render(model),
+			))
+			if p.BaseURL != "" {
+				sb.WriteString(fmt.Sprintf("    Endpoint: %s\n", p.BaseURL))
+			}
+			memDir := p.MemoryDir
+			if memDir == "" {
+				memDir, _ = config.ProfileMemoryDir(name)
+			}
+			sb.WriteString(fmt.Sprintf("    Memory:   %s\n", memDir))
+
+			if len(p.MountedMemories) > 0 {
+				sb.WriteString("    Mounted Histories:\n")
+				for _, mm := range p.MountedMemories {
+					sb.WriteString(fmt.Sprintf("      - %s (%s, read_only=%t)\n", mm.Name, mm.Path, mm.ReadOnly))
+				}
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	sb.WriteString("\n" + lipgloss.NewStyle().Foreground(ColorMuted).Render("Commands: /profile <name> to switch profiles • /remember <text> to persist knowledge • q/Esc to close"))
+	return sb.String()
+}
+
 // handleSlashCommand parses and executes slash palette commands.
 func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 	parts := strings.Fields(input)
 	cmd := strings.ToLower(parts[0])
 
 	switch cmd {
+	case "/profile", "/profiles":
+		if len(parts) == 1 {
+			m.textarea.Blur()
+			m.showProfileModal = true
+			m.profileContent = m.generateProfileVisual()
+			m.profileViewport.SetContent(m.profileContent)
+			m.profileViewport.GotoTop()
+			return m, nil
+		}
+
+		targetProfile := parts[1]
+		if targetProfile == "switch" && len(parts) > 2 {
+			targetProfile = parts[2]
+		}
+
+		m.currentProfile = targetProfile
+		info := fmt.Sprintf("Switched active profile to: %s", targetProfile)
+		if m.agent != nil {
+			_, prof := config.ResolveActiveProfile(targetProfile, m.agent.Config().FileConfig)
+			if prof.Provider != "" || prof.Model != "" {
+				info = fmt.Sprintf("Switched active profile to %s (provider: %s, model: %s)", targetProfile, prof.Provider, prof.Model)
+			}
+		}
+
+		m.entries = append(m.entries, ChatEntry{
+			Type:    TypeSystem,
+			Content: info,
+		})
+		m.renderConversationToViewport()
+		m.statusMessage = fmt.Sprintf("Profile: %s", targetProfile)
+		m.statusMessageAt = time.Now()
+		return m, nil
+
+	case "/remember":
+		if len(parts) < 2 {
+			m.entries = append(m.entries, ChatEntry{
+				Type:    TypeSystem,
+				Content: "Usage: /remember <text> (records preference or decision into profile memory)",
+			})
+			m.renderConversationToViewport()
+			return m, nil
+		}
+
+		remText := strings.TrimSpace(input[len(parts[0]):])
+		var remMsg string
+		if m.agent != nil && m.agent.MemoryManager() != nil {
+			res, err := fractal.Remember(m.agent.MemoryManager(), m.currentProfile, fractal.RememberArgs{
+				Text:  remText,
+				Scope: m.currentProfile,
+			})
+			if err != nil {
+				remMsg = fmt.Sprintf("Error remembering: %v", err)
+			} else {
+				remMsg = res.Message
+			}
+		} else {
+			remMsg = fmt.Sprintf("Remembered: %s", remText)
+		}
+
+		m.entries = append(m.entries, ChatEntry{
+			Type:    TypeSystem,
+			Content: remMsg,
+		})
+		m.renderConversationToViewport()
+		m.statusMessage = "Memory recorded"
+		m.statusMessageAt = time.Now()
+		return m, nil
+
 	case "/mcp":
 		m.textarea.Blur()
 		m.showMCPModal = true
@@ -1250,30 +1505,50 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		if len(parts) < 3 {
 			m.entries = append(m.entries, ChatEntry{
 				Type:    TypeSystem,
-				Content: "Usage: /zoom <id> <n> (e.g. /zoom 0 1 for verbatim message 0)",
+				Content: "Usage: /zoom <id> <n> or /zoom <target> <id> <n> (e.g. /zoom 0 1 for verbatim message 0)",
 			})
 			m.renderConversationToViewport()
 			return m, nil
 		}
-		var id, n int
-		_, _ = fmt.Sscanf(parts[1], "%d", &id)
-		_, _ = fmt.Sscanf(parts[2], "%d", &n)
 
-		tool, err := fractal.NewZoomTool(m.store)
-		if err != nil {
-			return m, nil
+		var target string
+		var id, n int
+		if len(parts) >= 4 {
+			target = parts[1]
+			_, _ = fmt.Sscanf(parts[2], "%d", &id)
+			_, _ = fmt.Sscanf(parts[3], "%d", &n)
+		} else {
+			_, _ = fmt.Sscanf(parts[1], "%d", &id)
+			_, _ = fmt.Sscanf(parts[2], "%d", &n)
 		}
-		_ = tool
-		node, ok := m.store.GetNodeByAddress(id, n)
+
+		var res fractal.ZoomResult
+		var err error
+		if m.agent != nil && m.agent.MemoryManager() != nil {
+			res, err = fractal.Zoom(m.agent.MemoryManager(), fractal.ZoomArgs{
+				Target: target,
+				ID:     id,
+				N:      n,
+			})
+		} else if m.store != nil {
+			res, err = fractal.Zoom(&fractal.SingleStoreRegistry{Store: m.store}, fractal.ZoomArgs{
+				Target: target,
+				ID:     id,
+				N:      n,
+			})
+		}
+
 		var text string
-		if ok {
-			text = fmt.Sprintf("Zoom %d+%d: %s", id, n, node.Text)
-		} else if n == 1 {
-			ev, has := m.store.GetEvent(id)
-			if has {
-				text = fmt.Sprintf("Verbatim %d: %s", id, ev.FormatLine())
+		if n < 1 || (n&(n-1)) != 0 || id < 0 || id%n != 0 {
+			text = fmt.Sprintf("No node at %d+%d", id, n)
+		} else if err != nil {
+			text = fmt.Sprintf("Zoom error: %v", err)
+		} else if res.Result != "" {
+			if n == 1 && strings.HasPrefix(res.Result, fmt.Sprintf("%d+1|", id)) {
+				raw := strings.TrimPrefix(res.Result, fmt.Sprintf("%d+1|", id))
+				text = fmt.Sprintf("Verbatim %d: %s", id, raw)
 			} else {
-				text = fmt.Sprintf("No message at %d", id)
+				text = res.Result
 			}
 		} else {
 			text = fmt.Sprintf("No node at %d+%d", id, n)
@@ -1295,12 +1570,14 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 
 	case "/help":
 		helpText := `Available Slash Commands:
+/profile [name] - View configured profiles or switch active profile
+/remember <text>- Record key preference or decision into profile memory
 /tree, /memory  - Visualize the fractal memory binary tree hierarchy
-/zoom <id> <n>  - Inspect any memory node or raw message (n=1 for verbatim)
+/zoom [t] id n  - Inspect memory node or raw message (n=1 for verbatim)
 /compact        - Trigger an immediate background compaction pass
 /clear          - Clear viewport chat history (disk storage untouched)
-/mcp            - Inspect active MCP servers, tools count, and discovered configs
-/shortcuts      - Display interactive keyboard shortcuts & controls cheat sheet
+/mcp            - Inspect active MCP servers, tools count, and configs
+/shortcuts      - Display interactive keyboard shortcuts cheat sheet
 /help           - Display this help message
 /exit, /quit    - Exit Golem`
 		m.entries = append(m.entries, ChatEntry{

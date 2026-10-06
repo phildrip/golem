@@ -49,12 +49,14 @@ type SubagentStreamHandler interface {
 
 // Config defines the configuration parameters for Golem.
 type Config struct {
+	Profile           string
 	Provider          string
 	BaseURL           string
 	ModelName         string
 	APIKey            string
 	StorageDir        string
 	WorkspaceDir      string
+	MountedMemories   []config.MountedMemoryConfig
 	LiveHeadCount     int
 	ViewBudgetBytes   int
 	CompactorInterval time.Duration
@@ -86,6 +88,7 @@ type Agent struct {
 	cfg              Config
 	store            *fractal.Store
 	view             *fractal.View
+	memoryMgr        *fractal.MemoryManager
 	compactor        *fractal.Compactor
 	mcpManager       *mcp.Manager
 	mcpToolsets      []mcp.NamedToolset
@@ -102,6 +105,12 @@ type Agent struct {
 func New(ctx context.Context, cfg Config) (*Agent, error) {
 	if cfg.ModelName == "" {
 		cfg.ModelName = DefaultModelName
+	}
+	if cfg.Profile == "" {
+		cfg.Profile = cfg.FileConfig.ActiveProfile
+		if cfg.Profile == "" {
+			cfg.Profile = "default"
+		}
 	}
 	if cfg.Provider == "" {
 		cfg.Provider = config.ResolveProvider("", cfg.FileConfig, cfg.ModelName)
@@ -122,12 +131,36 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		return nil, errors.Wrapf(err, "opening fractal store at %s", cfg.StorageDir)
 	}
 
-	// 2. Initialize fractal view
+	// 2. Initialize fractal view & multi-store MemoryManager
 	viewCfg := fractal.ViewConfig{
 		ViewBudgetBytes: cfg.ViewBudgetBytes,
 		LiveHeadCount:   cfg.LiveHeadCount,
 	}
 	view := fractal.NewView(store, viewCfg)
+	memoryMgr := fractal.NewMemoryManager(store, view)
+
+	// Mount profile memory if configured and different from primary workspace memory
+	if cfg.Profile != "" && cfg.Profile != "default" {
+		profDir, _ := config.ProfileMemoryDir(cfg.Profile)
+		if profDir != "" && profDir != cfg.StorageDir {
+			if profStore, err := fractal.OpenStore(profDir); err == nil {
+				profView := fractal.NewView(profStore, viewCfg)
+				memoryMgr.Mount(cfg.Profile, profStore, profView, true)
+			}
+		}
+	}
+
+	// Mount explicit mounted memories from Config or FileConfig
+	allMounted := append([]config.MountedMemoryConfig(nil), cfg.MountedMemories...)
+	allMounted = append(allMounted, cfg.FileConfig.MountedMemories...)
+	for _, mm := range allMounted {
+		if mm.Path != "" && mm.Path != cfg.StorageDir {
+			if mStore, err := fractal.OpenStore(mm.Path); err == nil {
+				mView := fractal.NewView(mStore, viewCfg)
+				memoryMgr.Mount(mm.Name, mStore, mView, mm.ReadOnly)
+			}
+		}
+	}
 
 	// 3. Initialize Model (Gemini or OpenAI-compatible provider)
 	var clientCfg *genai.ClientConfig
@@ -224,16 +257,22 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		return nil, errors.Wrap(err, "creating replace_regex tool")
 	}
 
-	zoomTool, err := fractal.NewZoomTool(store)
+	zoomTool, err := fractal.NewMultiZoomTool(memoryMgr)
 	if err != nil {
-		store.Close()
+		memoryMgr.Close()
 		return nil, errors.Wrap(err, "creating zoom tool")
 	}
 
-	dateTool, err := fractal.NewDateTool(store)
+	dateTool, err := fractal.NewMultiDateTool(memoryMgr)
 	if err != nil {
-		store.Close()
+		memoryMgr.Close()
 		return nil, errors.Wrap(err, "creating date tool")
+	}
+
+	rememberTool, err := fractal.NewRememberTool(memoryMgr, cfg.Profile)
+	if err != nil {
+		memoryMgr.Close()
+		return nil, errors.Wrap(err, "creating remember tool")
 	}
 
 	allTools := []tool.Tool{
@@ -243,6 +282,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		replaceRegexTool,
 		zoomTool,
 		dateTool,
+		rememberTool,
 	}
 
 	// 5. Discover & Build MCP Toolsets
@@ -284,7 +324,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		ModelFactory:   modelFactory,
 		WorkspaceDir:   workDir,
 		ReadOnlyTools:  []tool.Tool{readFileTool, zoomTool, dateTool},
-		ReadWriteTools: []tool.Tool{writeFileTool, replaceRegexTool, shellTool},
+		ReadWriteTools: []tool.Tool{writeFileTool, replaceRegexTool, shellTool, rememberTool},
 		MCPToolsets:    adkToolsets,
 		EventHandler: func(ev subagent.Event) {
 			if agentPtr != nil {
@@ -330,25 +370,26 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		Toolsets:    adkToolsets,
 		IncludeContents: llmagent.IncludeContentsNone,
 		InstructionProvider: func(rc agent.ReadonlyContext) (string, error) {
-			view.Sync()
-			renderedView := view.Render()
+			memoryMgr.SyncAll()
+			renderedView := memoryMgr.RenderCombined()
 
 			var sb strings.Builder
 			sb.WriteString(`You are Golem, an AI agent working with the user across long-running sessions.
 You have access to local file operations, a shell execution environment, and an infinite fractal memory.
 
-Memory Navigation:
-- The <chat> section below contains multi-resolution summaries of older messages, oldest first.
+Memory Navigation & Scopes:
+- The memory section below contains multi-resolution summaries of older messages and mounted profile memories.
 - Each line is formatted: id+n|summary (where id is the starting message ID and n is the message count).
-- When you need exact details, verbatim code, or specific past rulings, use zoom(id, n) to open the line.
+- When you need exact details, verbatim code, or specific past rulings, use zoom(id, n) (with optional target, e.g. target="work") to open the line.
 - zoom(id, 1) returns the exact verbatim message in full.
 - Always zoom before guessing or asking the user about past facts.
 - Use date(id) to check the timestamp of any message.
+- Use remember(text, scope) to persist important user preferences, architectural decisions, or conventions into profile memory.
 
 Subagents & Delegation:
 - Use invoke_subagent to delegate focused investigations, file explorations, or complex coding tasks to subagents.
 - Subagents run with isolated context windows, preventing context bloat.
-- Both you and your subagents share the same fractal memory store. Subagents can use zoom(id, n) and date(id) to inspect past rulings and history.
+- Both you and your subagents share the same fractal memory store. Subagents can use zoom(id, n), date(id), and remember(text) to inspect and update memory.
 
 `)
 			if renderedView != "" {
@@ -430,6 +471,7 @@ Subagents & Delegation:
 		cfg:              cfg,
 		store:            store,
 		view:             view,
+		memoryMgr:        memoryMgr,
 		compactor:        compactor,
 		mcpManager:       mcpManager,
 		mcpToolsets:      mcpToolsets,
@@ -578,10 +620,23 @@ func (a *Agent) Close() error {
 	if a.mcpManager != nil {
 		a.mcpManager.Close()
 	}
+	if a.memoryMgr != nil {
+		return a.memoryMgr.Close()
+	}
 	if a.store != nil {
 		return a.store.Close()
 	}
 	return nil
+}
+
+// MemoryManager returns the multi-store memory manager coordinating primary and mounted stores.
+func (a *Agent) MemoryManager() *fractal.MemoryManager {
+	return a.memoryMgr
+}
+
+// Config returns the active agent configuration.
+func (a *Agent) Config() Config {
+	return a.cfg
 }
 
 // Store returns the underlying fractal event and node store.

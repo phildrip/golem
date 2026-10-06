@@ -892,6 +892,58 @@ func TestModel_SubagentCardRendering(t *testing.T) {
 	}
 }
 
+func TestModel_ProfileModalAndCommands(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := fractal.OpenStore(tmpDir)
+	defer store.Close()
+	view := fractal.NewView(store, fractal.DefaultViewConfig())
+	m := NewModel(nil, store, view)
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = newM.(Model)
 
+	// 1. Open profile modal with /profile
+	newM, _ = m.handleSlashCommand("/profile")
+	m = newM.(Model)
+	if !m.showProfileModal {
+		t.Fatalf("expected profile modal to be open after /profile")
+	}
 
+	rendered := m.View()
+	if !strings.Contains(rendered, "GOLEM PROVIDER PROFILES") {
+		t.Errorf("expected View() to render profile modal, got: %s", rendered)
+	}
 
+	// 2. Close profile modal with 'q'
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	m = newM.(Model)
+	if m.showProfileModal {
+		t.Fatalf("expected profile modal to close on 'q'")
+	}
+
+	// 3. Switch profile via /profile <name>
+	newM, _ = m.handleSlashCommand("/profile work")
+	m = newM.(Model)
+	if m.currentProfile != "work" {
+		t.Errorf("expected currentProfile to be 'work', got: %s", m.currentProfile)
+	}
+	lastEntry := m.entries[len(m.entries)-1]
+	if !strings.Contains(lastEntry.Content, "Switched active profile to") {
+		t.Errorf("expected switch notification entry, got: %s", lastEntry.Content)
+	}
+
+	// 4. Test /remember command
+	newM, _ = m.handleSlashCommand("/remember Prefer concise answers")
+	m = newM.(Model)
+	lastEntry = m.entries[len(m.entries)-1]
+	if !strings.Contains(lastEntry.Content, "Remembered: Prefer concise answers") {
+		t.Errorf("expected remember confirmation, got: %s", lastEntry.Content)
+	}
+
+	// 5. Test /remember missing argument
+	newM, _ = m.handleSlashCommand("/remember")
+	m = newM.(Model)
+	lastEntry = m.entries[len(m.entries)-1]
+	if !strings.Contains(lastEntry.Content, "Usage: /remember <text>") {
+		t.Errorf("expected usage info for /remember, got: %s", lastEntry.Content)
+	}
+}
