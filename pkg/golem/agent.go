@@ -275,11 +275,39 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		return nil, errors.Wrap(err, "creating remember tool")
 	}
 
+	findFilesTool, err := tools.NewFindFilesTool(workDir)
+	if err != nil {
+		memoryMgr.Close()
+		return nil, errors.Wrap(err, "creating find_files tool")
+	}
+
+	grepFilesTool, err := tools.NewGrepFilesTool(workDir)
+	if err != nil {
+		memoryMgr.Close()
+		return nil, errors.Wrap(err, "creating grep_files tool")
+	}
+
+	hashlineReadTool, err := tools.NewHashlineReadTool(workDir)
+	if err != nil {
+		memoryMgr.Close()
+		return nil, errors.Wrap(err, "creating hashline_read tool")
+	}
+
+	hashlinePatchTool, err := tools.NewHashlinePatchTool(workDir)
+	if err != nil {
+		memoryMgr.Close()
+		return nil, errors.Wrap(err, "creating hashline_patch tool")
+	}
+
 	allTools := []tool.Tool{
 		shellTool,
 		readFileTool,
 		writeFileTool,
 		replaceRegexTool,
+		findFilesTool,
+		grepFilesTool,
+		hashlineReadTool,
+		hashlinePatchTool,
 		zoomTool,
 		dateTool,
 		rememberTool,
@@ -323,8 +351,8 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	subagentRunner := subagent.NewRunner(subagent.RunnerConfig{
 		ModelFactory:   modelFactory,
 		WorkspaceDir:   workDir,
-		ReadOnlyTools:  []tool.Tool{readFileTool, zoomTool, dateTool},
-		ReadWriteTools: []tool.Tool{writeFileTool, replaceRegexTool, shellTool, rememberTool},
+		ReadOnlyTools:  []tool.Tool{readFileTool, findFilesTool, grepFilesTool, hashlineReadTool, zoomTool, dateTool},
+		ReadWriteTools: []tool.Tool{writeFileTool, replaceRegexTool, hashlinePatchTool, shellTool, rememberTool},
 		MCPToolsets:    adkToolsets,
 		EventHandler: func(ev subagent.Event) {
 			if agentPtr != nil {
@@ -385,6 +413,15 @@ Memory Navigation & Scopes:
 - Always zoom before guessing or asking the user about past facts.
 - Use date(id) to check the timestamp of any message.
 - Use remember(text, scope) to persist important user preferences, architectural decisions, or conventions into profile memory.
+
+Fast File Search & Safe Editing:
+- Use find_files to locate files by name or fuzzy path across the project.
+- Use grep_files to search for code occurrences or regular expressions across files.
+- For reading and editing files safely, prefer hashline_read and hashline_patch:
+  - hashline_read formats lines with stable xxHash anchors (e.g. 42:a3).
+  - hashline_patch applies changes ('SWAP', 'DEL', 'INS.PRE', 'INS.POST') bound to those anchors.
+  - This guarantees edits never hit wrong lines or stale content.
+- You may also use read_file, write_file, and replace_regex when standard editing is preferred.
 
 Subagents & Delegation:
 - Use invoke_subagent to delegate focused investigations, file explorations, or complex coding tasks to subagents.
