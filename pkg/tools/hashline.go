@@ -30,9 +30,11 @@ type LineAnchor struct {
 	Hash    string `json:"hash"`
 }
 
-// ParseAnchor parses "42:a3" or just "42" into a LineAnchor.
+// ParseAnchor parses "42:a3", "42:a3:", or just "42" into a LineAnchor.
 func ParseAnchor(raw string) (LineAnchor, error) {
 	raw = strings.TrimSpace(raw)
+	// Strip optional trailing colon (matches hashline tokenizer consume_optional_colon)
+	raw = strings.TrimSuffix(raw, ":")
 	parts := strings.Split(raw, ":")
 	num, err := strconv.Atoi(parts[0])
 	if err != nil {
@@ -356,19 +358,27 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 		if startAnchor.LineNum < 1 || startAnchor.LineNum > len(rawLines) {
 			return HashlinePatchResult{}, errors.Errorf("start line %d out of bounds (file has %d lines)", startAnchor.LineNum, len(rawLines))
 		}
-		// Verify start hash before resolution
-		if startAnchor.Hash != "" {
-			actualStartHash := LineHash(rawLines[startAnchor.LineNum-1])
-			if actualStartHash != startAnchor.Hash {
-				return HashlinePatchResult{}, errors.Errorf("stale read: line %d expected hash %s, but found %s (%q)",
-					startAnchor.LineNum, startAnchor.Hash, actualStartHash, rawLines[startAnchor.LineNum-1])
-			}
+		// Enforce start hash presence and validity BEFORE block resolution to prevent stale-read bypass
+		if startAnchor.Hash == "" {
+			return HashlinePatchResult{}, errors.Errorf("missing line hash in start anchor %q (hashline requires format 'line:hash', e.g. '%d:%s')",
+				anchorStr, startAnchor.LineNum, LineHash(rawLines[startAnchor.LineNum-1]))
+		}
+		actualStartHash := LineHash(rawLines[startAnchor.LineNum-1])
+		if actualStartHash != startAnchor.Hash {
+			return HashlinePatchResult{}, errors.Errorf("stale read: line %d expected hash %s, but found %s (%q)",
+				startAnchor.LineNum, startAnchor.Hash, actualStartHash, rawLines[startAnchor.LineNum-1])
 		}
 
 		resolver := NewBuiltinBlockResolver()
 		span, err := resolver.Resolve(filePath, string(data), startAnchor.LineNum)
 		if err != nil {
 			return HashlinePatchResult{}, err
+		}
+
+		// Reject single-line blocks (bare statements) per hashline reference
+		if span.Start == span.End {
+			return HashlinePatchResult{}, errors.Errorf("line %d: %s resolved a single-line block (line %d) — bare statement, not the opening line of a multi-line construct. Use a concrete line range instead.",
+				startAnchor.LineNum, normOp, span.Start)
 		}
 
 		startAnchor = LineAnchor{
@@ -422,18 +432,9 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 		resultLines = append(resultLines, newBodyLines...)
 		resultLines = append(resultLines, rawLines[endIdx:]...)
 
-	case "DEL", "DELETE":
+	case "DEL", "DELETE", "DEL.BLK":
 		resultLines = append(resultLines, rawLines[:startIdx]...)
 		resultLines = append(resultLines, rawLines[endIdx:]...)
-
-	case "DEL.BLK":
-		// DEL.BLK removes the block and also consumes any trailing blank line immediately after the block
-		trailingIdx := endIdx
-		if trailingIdx < len(rawLines) && strings.TrimSpace(rawLines[trailingIdx]) == "" {
-			trailingIdx++
-		}
-		resultLines = append(resultLines, rawLines[:startIdx]...)
-		resultLines = append(resultLines, rawLines[trailingIdx:]...)
 
 	case "INS.PRE", "INSERT_BEFORE", "INS.BLK.PRE":
 		resultLines = append(resultLines, rawLines[:startIdx]...)

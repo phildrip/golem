@@ -3,6 +3,7 @@ package tools
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -375,5 +376,64 @@ line5
 	expected := "line1\nreplacement\nline5\n"
 	if string(updated) != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, string(updated))
+	}
+}
+
+func TestHashline_BlockOp_RejectsMissingHash(t *testing.T) {
+	tempDir := t.TempDir()
+	filePath := "test.rs"
+	fullPath := filepath.Join(tempDir, filePath)
+
+	content := `fn hello() {
+    let x = 1;
+}
+`
+	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	// Attempting SWAP.BLK with bare line number "1" (no hash) must fail
+	_, err := PatchFileWithHashline(tempDir, filePath, "SWAP.BLK", "1", "fn foo() {}", false)
+	if err == nil {
+		t.Fatalf("expected missing line hash error, got nil")
+	}
+	if !strings.Contains(err.Error(), "missing line hash") {
+		t.Errorf("expected 'missing line hash' in error, got: %v", err)
+	}
+}
+
+func TestHashline_BlockOp_RejectsBareStatement(t *testing.T) {
+	tempDir := t.TempDir()
+	filePath := "test.py"
+	fullPath := filepath.Join(tempDir, filePath)
+
+	content := `x = 1
+y = 2
+`
+	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	readRes, _ := ReadFileWithHashlines(tempDir, filePath, 1, 2)
+	anchor1 := readRes.Lines[0].Anchor // line 1: x = 1
+
+	// Indentation analysis on line 1 of flat statements will resolve start=1, end=1 (single-line)
+	// Must be rejected as bare statement!
+	_, err := PatchFileWithHashline(tempDir, filePath, "SWAP.BLK", anchor1, "x = 99", false)
+	if err == nil {
+		t.Fatalf("expected error for bare statement block, got nil")
+	}
+	if !strings.Contains(err.Error(), "bare statement") {
+		t.Errorf("expected error to mention 'bare statement', got: %v", err)
+	}
+}
+
+func TestHashline_ParseAnchor_TrailingColon(t *testing.T) {
+	a, err := ParseAnchor("42:a3:")
+	if err != nil {
+		t.Fatalf("unexpected error parsing anchor with trailing colon: %v", err)
+	}
+	if a.LineNum != 42 || a.Hash != "a3" {
+		t.Errorf("expected 42:a3, got %d:%s", a.LineNum, a.Hash)
 	}
 }
