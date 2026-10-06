@@ -3,6 +3,7 @@ package tools
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -135,8 +136,8 @@ func ReadFileWithHashlines(baseDir, filePath string, startLine, lineCount int) (
 // HashlinePatchArgs defines input for applying a content-hash anchored patch.
 type HashlinePatchArgs struct {
 	FilePath string `json:"file_path" jsonschema:"Path to the file to patch (must be within workspace)"`
-	Op       string `json:"op" jsonschema:"Operation type: 'SWAP', 'DEL', 'INS.PRE', or 'INS.POST'"`
-	Anchor   string `json:"anchor" jsonschema:"Target anchor: e.g. '42:a3' or range '42:a3..45:f1' (or '0' for empty files)"`
+	Op       string `json:"op" jsonschema:"Operation type: 'SWAP', 'DEL', 'INS.PRE', 'INS.POST', 'SWAP.BLK', 'DEL.BLK', 'INS.BLK.PRE', or 'INS.BLK.POST'"`
+	Anchor   string `json:"anchor" jsonschema:"Target anchor: e.g. '42:a3', range '42:a3..45:f1', two-anchor '42:a3 45:f1', block anchor '42:a3', or '0' for empty files"`
 	Content  string `json:"content,omitempty" jsonschema:"New replacement or inserted content (lines can optionally begin with '+ ')"`
 	DryRun   bool   `json:"dry_run,omitempty" jsonschema:"If true, checks anchors without writing changes to disk"`
 }
@@ -146,6 +147,103 @@ type HashlinePatchResult struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 	Diff    string `json:"diff,omitempty"`
+}
+
+// HashlineFindBlockArgs defines input for finding the structural block around an anchor.
+type HashlineFindBlockArgs struct {
+	FilePath string `json:"file_path" jsonschema:"Path to the file (must be within workspace)"`
+	Anchor   string `json:"anchor" jsonschema:"Anchor inside or at the header of the target block, e.g. '42:a3'"`
+}
+
+// HashlineFindBlockResult defines output of finding a structural block.
+type HashlineFindBlockResult struct {
+	FilePath   string             `json:"file_path"`
+	TotalLines int                `json:"total_lines"`
+	Language   string             `json:"language"`
+	BlockStart int                `json:"block_start" jsonschema:"First line of block (1-based, inclusive)"`
+	BlockEnd   int                `json:"block_end" jsonschema:"Last line of block (1-based, inclusive)"`
+	Lines      []HashlineReadLine `json:"lines"`
+	Rendered   string             `json:"rendered"`
+}
+
+// FindBlockWithHashline locates the enclosing syntactic block around an anchor.
+func FindBlockWithHashline(baseDir, filePath, anchorStr string) (HashlineFindBlockResult, error) {
+	safePath, err := resolveSafePath(baseDir, filePath)
+	if err != nil {
+		return HashlineFindBlockResult{}, err
+	}
+
+	data, err := os.ReadFile(safePath)
+	if err != nil {
+		return HashlineFindBlockResult{}, errors.Wrapf(err, "reading file %s for find_block", safePath)
+	}
+
+	text := string(data)
+	var rawLines []string
+	if len(data) > 0 {
+		rawLines = strings.Split(text, "\n")
+		if len(rawLines) > 0 && rawLines[len(rawLines)-1] == "" && strings.HasSuffix(text, "\n") {
+			rawLines = rawLines[:len(rawLines)-1]
+		}
+	}
+
+	if len(rawLines) == 0 {
+		return HashlineFindBlockResult{}, errors.Errorf("file is empty")
+	}
+
+	anchor, err := ParseAnchor(anchorStr)
+	if err != nil {
+		return HashlineFindBlockResult{}, err
+	}
+
+	if anchor.LineNum < 1 || anchor.LineNum > len(rawLines) {
+		return HashlineFindBlockResult{}, errors.Errorf("anchor line %d out of bounds (file has %d lines)", anchor.LineNum, len(rawLines))
+	}
+
+	if anchor.Hash != "" {
+		actualHash := LineHash(rawLines[anchor.LineNum-1])
+		if actualHash != anchor.Hash {
+			return HashlineFindBlockResult{}, errors.Errorf("stale read: line %d expected hash %s, but found %s",
+				anchor.LineNum, anchor.Hash, actualHash)
+		}
+	}
+
+	resolver := NewBuiltinBlockResolver()
+	span, err := resolver.Resolve(filePath, text, anchor.LineNum)
+	if err != nil {
+		return HashlineFindBlockResult{}, err
+	}
+
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(filePath), "."))
+	lang := LanguageForExtension(ext)
+
+	var blockLines []HashlineReadLine
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("OK file=%s lang=%s lines=%d block=%d..%d\n", filePath, lang, len(rawLines), span.Start, span.End))
+
+	for i := span.Start - 1; i <= span.End-1 && i < len(rawLines); i++ {
+		lNum := i + 1
+		row := rawLines[i]
+		h := LineHash(row)
+		aStr := fmt.Sprintf("%d:%s", lNum, h)
+		blockLines = append(blockLines, HashlineReadLine{
+			Anchor:  aStr,
+			LineNum: lNum,
+			Hash:    h,
+			Content: row,
+		})
+		sb.WriteString(fmt.Sprintf("%s|%s\n", aStr, row))
+	}
+
+	return HashlineFindBlockResult{
+		FilePath:   filePath,
+		TotalLines: len(rawLines),
+		Language:   lang,
+		BlockStart: span.Start,
+		BlockEnd:   span.End,
+		Lines:      blockLines,
+		Rendered:   sb.String(),
+	}, nil
 }
 
 // PatchFileWithHashline applies a hash-verified edit to a file.
@@ -187,7 +285,8 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 
 	// Handle empty file initialization
 	if len(rawLines) == 0 {
-		if normOp == "SWAP" || normOp == "REPLACE" || normOp == "INS.PRE" || normOp == "INS.POST" || normOp == "INSERT_BEFORE" || normOp == "INSERT_AFTER" {
+		if normOp == "SWAP" || normOp == "REPLACE" || normOp == "INS.PRE" || normOp == "INS.POST" ||
+			normOp == "INSERT_BEFORE" || normOp == "INSERT_AFTER" {
 			outputStr := strings.Join(newBodyLines, "\n")
 			if len(newBodyLines) > 0 {
 				outputStr += "\n"
@@ -209,10 +308,16 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 	}
 
 	// Parse anchor(s)
-	// Supports "42:a3..45:f1" or "42:a3" or "42..45"
+	// Supports:
+	// - Range format: "42:a3..45:f1"
+	// - Two-anchor space format: "42:a3 45:f1"
+	// - Single anchor: "42:a3"
+	trimmedAnchor := strings.TrimSpace(anchorStr)
 	var startAnchor, endAnchor LineAnchor
-	if strings.Contains(anchorStr, "..") {
-		parts := strings.SplitN(anchorStr, "..", 2)
+	isTwoAnchor := false
+
+	if strings.Contains(trimmedAnchor, "..") {
+		parts := strings.SplitN(trimmedAnchor, "..", 2)
 		var err error
 		startAnchor, err = ParseAnchor(parts[0])
 		if err != nil {
@@ -222,13 +327,58 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 		if err != nil {
 			return HashlinePatchResult{}, err
 		}
+		isTwoAnchor = true
+	} else if fields := strings.Fields(trimmedAnchor); len(fields) == 2 {
+		var err error
+		startAnchor, err = ParseAnchor(fields[0])
+		if err != nil {
+			return HashlinePatchResult{}, err
+		}
+		endAnchor, err = ParseAnchor(fields[1])
+		if err != nil {
+			return HashlinePatchResult{}, err
+		}
+		isTwoAnchor = true
 	} else {
 		var err error
-		startAnchor, err = ParseAnchor(anchorStr)
+		startAnchor, err = ParseAnchor(trimmedAnchor)
 		if err != nil {
 			return HashlinePatchResult{}, err
 		}
 		endAnchor = startAnchor
+	}
+
+	isBlockOp := normOp == "SWAP.BLK" || normOp == "DEL.BLK" || normOp == "INS.BLK.PRE" || normOp == "INS.BLK.POST"
+
+	// If it's a block operation and only a single anchor was provided, resolve the structural block
+	if isBlockOp && !isTwoAnchor {
+		// Validate start anchor line first
+		if startAnchor.LineNum < 1 || startAnchor.LineNum > len(rawLines) {
+			return HashlinePatchResult{}, errors.Errorf("start line %d out of bounds (file has %d lines)", startAnchor.LineNum, len(rawLines))
+		}
+		// Verify start hash before resolution
+		if startAnchor.Hash != "" {
+			actualStartHash := LineHash(rawLines[startAnchor.LineNum-1])
+			if actualStartHash != startAnchor.Hash {
+				return HashlinePatchResult{}, errors.Errorf("stale read: line %d expected hash %s, but found %s (%q)",
+					startAnchor.LineNum, startAnchor.Hash, actualStartHash, rawLines[startAnchor.LineNum-1])
+			}
+		}
+
+		resolver := NewBuiltinBlockResolver()
+		span, err := resolver.Resolve(filePath, string(data), startAnchor.LineNum)
+		if err != nil {
+			return HashlinePatchResult{}, err
+		}
+
+		startAnchor = LineAnchor{
+			LineNum: span.Start,
+			Hash:    LineHash(rawLines[span.Start-1]),
+		}
+		endAnchor = LineAnchor{
+			LineNum: span.End,
+			Hash:    LineHash(rawLines[span.End-1]),
+		}
 	}
 
 	// Validate bounds (1-indexed)
@@ -267,7 +417,7 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 	var resultLines []string
 
 	switch normOp {
-	case "SWAP", "REPLACE":
+	case "SWAP", "REPLACE", "SWAP.BLK":
 		resultLines = append(resultLines, rawLines[:startIdx]...)
 		resultLines = append(resultLines, newBodyLines...)
 		resultLines = append(resultLines, rawLines[endIdx:]...)
@@ -276,23 +426,35 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 		resultLines = append(resultLines, rawLines[:startIdx]...)
 		resultLines = append(resultLines, rawLines[endIdx:]...)
 
-	case "INS.PRE", "INSERT_BEFORE":
+	case "DEL.BLK":
+		// DEL.BLK removes the block and also consumes any trailing blank line immediately after the block
+		trailingIdx := endIdx
+		if trailingIdx < len(rawLines) && strings.TrimSpace(rawLines[trailingIdx]) == "" {
+			trailingIdx++
+		}
+		resultLines = append(resultLines, rawLines[:startIdx]...)
+		resultLines = append(resultLines, rawLines[trailingIdx:]...)
+
+	case "INS.PRE", "INSERT_BEFORE", "INS.BLK.PRE":
 		resultLines = append(resultLines, rawLines[:startIdx]...)
 		resultLines = append(resultLines, newBodyLines...)
 		resultLines = append(resultLines, rawLines[startIdx:]...)
 
-	case "INS.POST", "INSERT_AFTER":
+	case "INS.POST", "INSERT_AFTER", "INS.BLK.POST":
 		resultLines = append(resultLines, rawLines[:endIdx]...)
 		resultLines = append(resultLines, newBodyLines...)
 		resultLines = append(resultLines, rawLines[endIdx:]...)
 
 	default:
-		return HashlinePatchResult{}, errors.Errorf("unsupported hashline operation %q (use SWAP, DEL, INS.PRE, or INS.POST)", op)
+		return HashlinePatchResult{}, errors.Errorf("unsupported hashline operation %q (use SWAP, DEL, INS.PRE, INS.POST, SWAP.BLK, DEL.BLK, INS.BLK.PRE, or INS.BLK.POST)", op)
 	}
 
-	outputStr := strings.Join(resultLines, "\n")
-	if hasTrailingNewline || len(resultLines) > 0 {
-		outputStr += "\n"
+	var outputStr string
+	if len(resultLines) > 0 {
+		outputStr = strings.Join(resultLines, "\n")
+		if hasTrailingNewline {
+			outputStr += "\n"
+		}
 	}
 
 	msg := fmt.Sprintf("Successfully applied %s at anchor %s (%d lines affected)", normOp, anchorStr, len(resultLines)-len(rawLines))
@@ -324,11 +486,21 @@ func NewHashlineReadTool(baseDir string) (tool.Tool, error) {
 	})
 }
 
+// NewHashlineFindBlockTool creates the ADK tool for locating structural code blocks around anchors.
+func NewHashlineFindBlockTool(baseDir string) (tool.Tool, error) {
+	return functiontool.New(functiontool.Config{
+		Name:        "hashline_find_block",
+		Description: "Finds the enclosing syntactic code block (function, struct, class, if/for block) around a line:hash anchor. Useful before SWAP.BLK or DEL.BLK.",
+	}, func(ctx agent.Context, args HashlineFindBlockArgs) (HashlineFindBlockResult, error) {
+		return FindBlockWithHashline(baseDir, args.FilePath, args.Anchor)
+	})
+}
+
 // NewHashlinePatchTool creates the ADK tool for hash-anchored file patching.
 func NewHashlinePatchTool(baseDir string) (tool.Tool, error) {
 	return functiontool.New(functiontool.Config{
 		Name:        "hashline_patch",
-		Description: "Applies a robust content-hashed patch ('SWAP', 'DEL', 'INS.PRE', 'INS.POST') using verified anchors like '42:a3' or '42:a3..45:f1'. Rejects stale edits if lines changed.",
+		Description: "Applies a robust content-hashed patch ('SWAP', 'DEL', 'INS.PRE', 'INS.POST', 'SWAP.BLK', 'DEL.BLK', 'INS.BLK.PRE', 'INS.BLK.POST') using verified anchors like '42:a3', range '42:a3..45:f1', or block anchor. Rejects stale edits if lines changed.",
 	}, func(ctx agent.Context, args HashlinePatchArgs) (HashlinePatchResult, error) {
 		return PatchFileWithHashline(baseDir, args.FilePath, args.Op, args.Anchor, args.Content, args.DryRun)
 	})

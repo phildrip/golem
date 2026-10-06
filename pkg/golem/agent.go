@@ -293,6 +293,12 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		return nil, errors.Wrap(err, "creating hashline_read tool")
 	}
 
+	hashlineFindBlockTool, err := tools.NewHashlineFindBlockTool(workDir)
+	if err != nil {
+		memoryMgr.Close()
+		return nil, errors.Wrap(err, "creating hashline_find_block tool")
+	}
+
 	hashlinePatchTool, err := tools.NewHashlinePatchTool(workDir)
 	if err != nil {
 		memoryMgr.Close()
@@ -307,6 +313,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		findFilesTool,
 		grepFilesTool,
 		hashlineReadTool,
+		hashlineFindBlockTool,
 		hashlinePatchTool,
 		zoomTool,
 		dateTool,
@@ -351,7 +358,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	subagentRunner := subagent.NewRunner(subagent.RunnerConfig{
 		ModelFactory:   modelFactory,
 		WorkspaceDir:   workDir,
-		ReadOnlyTools:  []tool.Tool{readFileTool, findFilesTool, grepFilesTool, hashlineReadTool, zoomTool, dateTool},
+		ReadOnlyTools:  []tool.Tool{readFileTool, findFilesTool, grepFilesTool, hashlineReadTool, hashlineFindBlockTool, zoomTool, dateTool},
 		ReadWriteTools: []tool.Tool{writeFileTool, replaceRegexTool, hashlinePatchTool, shellTool, rememberTool},
 		MCPToolsets:    adkToolsets,
 		EventHandler: func(ev subagent.Event) {
@@ -417,9 +424,10 @@ Memory Navigation & Scopes:
 Fast File Search & Safe Editing:
 - Use find_files to locate files by name or fuzzy path across the project.
 - Use grep_files to search for code occurrences or regular expressions across files.
-- For reading and editing files safely, prefer hashline_read and hashline_patch:
+- For reading and editing files safely, prefer hashline_read, hashline_find_block, and hashline_patch:
   - hashline_read formats lines with stable xxHash anchors (e.g. 42:a3).
-  - hashline_patch applies changes ('SWAP', 'DEL', 'INS.PRE', 'INS.POST') bound to those anchors.
+  - hashline_find_block locates the enclosing syntactic block (function, struct, etc.) around an anchor.
+  - hashline_patch applies changes ('SWAP', 'DEL', 'INS.PRE', 'INS.POST', 'SWAP.BLK', 'DEL.BLK', 'INS.BLK.PRE', 'INS.BLK.POST') bound to anchors.
   - This guarantees edits never hit wrong lines or stale content.
 - You may also use read_file, write_file, and replace_regex when standard editing is preferred.
 
