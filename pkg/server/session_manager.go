@@ -60,14 +60,13 @@ func (sm *SessionManager) CreateSession(ctx context.Context, title string) (*Ses
 	if cfg.StorageDir == "" {
 		cfg.StorageDir = golem.DefaultConfig().StorageDir
 	}
-	cfg.StorageDir = filepath.Join(cfg.StorageDir, id)
-
-	agentInstance, err := golem.New(ctx, cfg)
+	sessCtx, cancel := context.WithCancel(context.Background())
+	agentInstance, err := golem.New(sessCtx, cfg)
 	if err != nil {
+		cancel()
 		return nil, errors.Wrap(err, "initializing agent for session")
 	}
 
-	sessCtx, cancel := context.WithCancel(context.Background())
 	sess := &Session{
 		ID:        id,
 		Title:     title,
@@ -120,13 +119,14 @@ func (sm *SessionManager) CreateSessionWithImport(ctx context.Context, title str
 	}
 	cfg.StorageDir = filepath.Join(cfg.StorageDir, id)
 
-	agentInstance, err := golem.New(ctx, cfg)
+	sessCtx, cancel := context.WithCancel(context.Background())
+	agentInstance, err := golem.New(sessCtx, cfg)
 	if err != nil {
 		sm.mu.Unlock()
+		cancel()
 		return nil, errors.Wrap(err, "initializing agent for session")
 	}
 
-	sessCtx, cancel := context.WithCancel(context.Background())
 	sess := &Session{
 		ID:        id,
 		Title:     title,

@@ -33,6 +33,16 @@ type MountedMemoryConfig struct {
 	ReadOnly bool   `json:"read_only,omitempty"`
 }
 
+// CompactorConfig defines custom provider and model settings for the background fractal memory compactor.
+type CompactorConfig struct {
+	Provider    string `json:"provider,omitempty"`
+	Model       string `json:"model,omitempty"`
+	BaseURL     string `json:"base_url,omitempty"`
+	APIKey      string `json:"api_key,omitempty"`
+	APIKeyEnv   string `json:"api_key_env,omitempty"`
+	TargetBytes int    `json:"target_bytes,omitempty"`
+}
+
 // ProfileConfig encapsulates provider settings, model preferences, and memory directories
 // for a named profile (e.g. "work", "personal").
 type ProfileConfig struct {
@@ -43,6 +53,7 @@ type ProfileConfig struct {
 	APIKeyEnv       string                `json:"api_key_env,omitempty"`
 	MemoryDir       string                `json:"memory_dir,omitempty"`
 	MountedMemories []MountedMemoryConfig `json:"mounted_memories,omitempty"`
+	Compactor       *CompactorConfig      `json:"compactor,omitempty"`
 }
 
 // ProviderConfig stores credentials and endpoint for an individual model provider.
@@ -63,6 +74,7 @@ type FileConfig struct {
 	MemoryDir       string                    `json:"memory_dir,omitempty"`
 	MountedMemories []MountedMemoryConfig     `json:"mounted_memories,omitempty"`
 	Providers       map[string]ProviderConfig `json:"providers,omitempty"`
+	Compactor       *CompactorConfig          `json:"compactor,omitempty"`
 }
 
 // UserDir returns Golem's user configuration directory.
@@ -231,6 +243,29 @@ func ResolveAPIKey(flagKey string, configPath string, scanner *bufio.Scanner) (s
 	return inputKey, nil
 }
 
+// DeduceProviderFromModel inspects model prefixes and common names to guess the provider.
+func DeduceProviderFromModel(modelName string) string {
+	lower := strings.ToLower(strings.TrimSpace(modelName))
+	if strings.Contains(lower, "/") {
+		parts := strings.SplitN(lower, "/", 2)
+		prefix := strings.TrimSpace(parts[0])
+		switch prefix {
+		case ProviderOpenCode, ProviderOpenAI, ProviderOpenRouter, ProviderGemini:
+			return prefix
+		}
+	}
+	if strings.HasPrefix(lower, "gemini") {
+		return ProviderGemini
+	}
+	if strings.HasPrefix(lower, "gpt-") || strings.HasPrefix(lower, "o1") || strings.HasPrefix(lower, "o3") {
+		return ProviderOpenAI
+	}
+	if strings.HasPrefix(lower, "deepseek") || strings.HasPrefix(lower, "claude") {
+		return ProviderOpenCode
+	}
+	return ""
+}
+
 // ResolveProvider determines the active provider ("gemini", "opencode", "openai", "openrouter").
 // Priority:
 // 1. Explicit CLI flag / parameter
@@ -245,16 +280,11 @@ func ResolveProvider(flagProvider string, fileCfg FileConfig, modelName string) 
 	if env := strings.ToLower(strings.TrimSpace(os.Getenv("GOLEM_PROVIDER"))); env != "" {
 		return env
 	}
+	if deduced := DeduceProviderFromModel(modelName); deduced != "" {
+		return deduced
+	}
 	if clean := strings.ToLower(strings.TrimSpace(fileCfg.Provider)); clean != "" {
 		return clean
-	}
-	if strings.Contains(modelName, "/") {
-		parts := strings.SplitN(modelName, "/", 2)
-		prefix := strings.ToLower(strings.TrimSpace(parts[0]))
-		switch prefix {
-		case ProviderOpenCode, ProviderOpenAI, ProviderOpenRouter, ProviderGemini:
-			return prefix
-		}
 	}
 	return ProviderGemini
 }
@@ -312,7 +342,15 @@ func ResolveProviderKey(provider string, flagKey string, fileCfg FileConfig) str
 		}
 	}
 
-	return strings.TrimSpace(fileCfg.APIKey)
+	// Only fall back to generic fileCfg.APIKey if the requested provider matches
+	// the fileCfg.Provider (or if fileCfg.Provider is empty and provider is gemini default),
+	// to avoid poisoning one provider with another provider's credential.
+	cfgProvider := strings.ToLower(strings.TrimSpace(fileCfg.Provider))
+	if cleanProvider == cfgProvider || (cfgProvider == "" && cleanProvider == ProviderGemini) {
+		return strings.TrimSpace(fileCfg.APIKey)
+	}
+
+	return ""
 }
 
 // ResolveBaseURL determines the API endpoint base URL for the given provider.
@@ -424,6 +462,33 @@ func MergeConfigs(userCfg, wsCfg FileConfig) FileConfig {
 		}
 	}
 
+	if wsCfg.Compactor != nil {
+		if merged.Compactor == nil {
+			merged.Compactor = &CompactorConfig{}
+		} else {
+			clone := *merged.Compactor
+			merged.Compactor = &clone
+		}
+		if wsCfg.Compactor.Provider != "" {
+			merged.Compactor.Provider = wsCfg.Compactor.Provider
+		}
+		if wsCfg.Compactor.Model != "" {
+			merged.Compactor.Model = wsCfg.Compactor.Model
+		}
+		if wsCfg.Compactor.BaseURL != "" {
+			merged.Compactor.BaseURL = wsCfg.Compactor.BaseURL
+		}
+		if wsCfg.Compactor.APIKey != "" {
+			merged.Compactor.APIKey = wsCfg.Compactor.APIKey
+		}
+		if wsCfg.Compactor.APIKeyEnv != "" {
+			merged.Compactor.APIKeyEnv = wsCfg.Compactor.APIKeyEnv
+		}
+		if wsCfg.Compactor.TargetBytes > 0 {
+			merged.Compactor.TargetBytes = wsCfg.Compactor.TargetBytes
+		}
+	}
+
 	return merged
 }
 
@@ -506,6 +571,11 @@ func ResolveActiveProfile(flagProfile string, fileCfg FileConfig) (string, Profi
 		prof.MountedMemories = fileCfg.MountedMemories
 	}
 
+	// Inherit compactor config from top-level if profile doesn't specify one
+	if prof.Compactor == nil && fileCfg.Compactor != nil {
+		prof.Compactor = fileCfg.Compactor
+	}
+
 	return name, prof
 }
 
@@ -530,6 +600,9 @@ func (c FileConfig) ApplyProfile(profileName string, prof ProfileConfig) FileCon
 	}
 	if len(prof.MountedMemories) > 0 {
 		updated.MountedMemories = prof.MountedMemories
+	}
+	if prof.Compactor != nil {
+		updated.Compactor = prof.Compactor
 	}
 	return updated
 }

@@ -60,6 +60,10 @@ type Config struct {
 	LiveHeadCount     int
 	ViewBudgetBytes   int
 	CompactorInterval time.Duration
+	CompactorProvider string
+	CompactorModel    string
+	CompactorBaseURL  string
+	CompactorAPIKey   string
 	OnRetry           RetryCallback
 	MCPConfig         *mcp.Config
 	MCPConfigPaths    []string
@@ -99,6 +103,7 @@ type Agent struct {
 	activeHandlerMu  sync.RWMutex
 	activeHandler    StreamHandler
 	compactorTrigger chan struct{}
+	workerCancel     context.CancelFunc
 }
 
 // New constructs an operational Golem agent.
@@ -223,13 +228,60 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		modelInstance = openai.NewClient(cfg.ModelName, cfg.BaseURL, cfg.APIKey, nil)
 	}
 
-	summarizer := fractal.NewLLMSummarizer(modelInstance)
-	compactor := fractal.NewCompactor(store, view, summarizer, fractal.DefaultCompactorConfig())
-
-	// Start background compactor if interval is configured
-	if cfg.CompactorInterval > 0 {
-		compactor.StartBackground(ctx, cfg.CompactorInterval)
+	// 4. Initialize Compactor Model (either dedicated compactor model or shared primary model)
+	compactorModelInstance := modelInstance
+	compactorModelName := cfg.CompactorModel
+	compactorProvider := cfg.CompactorProvider
+	if compactorModelName == "" && cfg.FileConfig.Compactor != nil {
+		compactorModelName = cfg.FileConfig.Compactor.Model
 	}
+	if compactorProvider == "" && cfg.FileConfig.Compactor != nil {
+		compactorProvider = cfg.FileConfig.Compactor.Provider
+	}
+
+	if compactorModelName != "" && compactorModelName != cfg.ModelName {
+		if compactorProvider == "" {
+			compactorProvider = config.DeduceProviderFromModel(compactorModelName)
+			if compactorProvider == "" {
+				compactorProvider = config.ResolveProvider("", cfg.FileConfig, compactorModelName)
+			}
+		}
+		compactorBaseURL := cfg.CompactorBaseURL
+		if compactorBaseURL == "" && cfg.FileConfig.Compactor != nil {
+			compactorBaseURL = cfg.FileConfig.Compactor.BaseURL
+		}
+		compactorBaseURL = config.ResolveBaseURL(compactorProvider, compactorBaseURL, cfg.FileConfig)
+
+		compactorAPIKey := cfg.CompactorAPIKey
+		if compactorAPIKey == "" && cfg.FileConfig.Compactor != nil {
+			compactorAPIKey = cfg.FileConfig.Compactor.APIKey
+			if compactorAPIKey == "" && cfg.FileConfig.Compactor.APIKeyEnv != "" {
+				compactorAPIKey = os.Getenv(cfg.FileConfig.Compactor.APIKeyEnv)
+			}
+		}
+		compactorAPIKey = config.ResolveProviderKey(compactorProvider, compactorAPIKey, cfg.FileConfig)
+
+		if compactorProvider == config.ProviderGemini {
+			cmClientCfg := clientCfg
+			if compactorAPIKey != "" && (cmClientCfg == nil || cmClientCfg.APIKey != compactorAPIKey) {
+				cmClientCfg = &genai.ClientConfig{APIKey: compactorAPIKey}
+			}
+			cgm, err := gemini.NewModel(ctx, compactorModelName, cmClientCfg)
+			if err == nil {
+				compactorModelInstance = cgm
+			}
+		} else {
+			compactorModelInstance = openai.NewClient(compactorModelName, compactorBaseURL, compactorAPIKey, nil)
+		}
+	}
+
+	compactorCfg := fractal.DefaultCompactorConfig()
+	if cfg.FileConfig.Compactor != nil && cfg.FileConfig.Compactor.TargetBytes > 0 {
+		compactorCfg.TargetBytes = cfg.FileConfig.Compactor.TargetBytes
+	}
+
+	summarizer := fractal.NewLLMSummarizer(compactorModelInstance)
+	compactor := fractal.NewCompactor(store, view, summarizer, compactorCfg)
 
 	// 4. Initialize Tools (sandboxed to current working directory)
 	workDir, _ := os.Getwd()
@@ -512,6 +564,7 @@ Subagents & Delegation:
 		return nil, errors.Wrap(err, "creating in-memory adk runner")
 	}
 
+	workerCtx, workerCancel := context.WithCancel(ctx)
 	agentPtr = &Agent{
 		cfg:              cfg,
 		store:            store,
@@ -525,10 +578,11 @@ Subagents & Delegation:
 		adkAgent:         adkAgent,
 		userID:           "user",
 		compactorTrigger: make(chan struct{}, 1),
+		workerCancel:     workerCancel,
 	}
 
 	// Start background compactor loop if configured or for trigger events
-	go agentPtr.startCompactorWorker(ctx)
+	go agentPtr.startCompactorWorker(workerCtx)
 
 	return agentPtr, nil
 }
@@ -662,6 +716,9 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 
 // Close flushes and shuts down the store and underlying resources.
 func (a *Agent) Close() error {
+	if a.workerCancel != nil {
+		a.workerCancel()
+	}
 	if a.mcpManager != nil {
 		a.mcpManager.Close()
 	}
@@ -700,6 +757,21 @@ func (a *Agent) SwitchProfile(ctx context.Context, profileName string) (config.P
 	}
 	if prof.APIKey != "" {
 		a.cfg.APIKey = prof.APIKey
+	}
+	if prof.Compactor != nil {
+		a.cfg.FileConfig.Compactor = prof.Compactor
+		if prof.Compactor.Model != "" {
+			a.cfg.CompactorModel = prof.Compactor.Model
+		}
+		if prof.Compactor.Provider != "" {
+			a.cfg.CompactorProvider = prof.Compactor.Provider
+		}
+		if prof.Compactor.BaseURL != "" {
+			a.cfg.CompactorBaseURL = prof.Compactor.BaseURL
+		}
+		if prof.Compactor.APIKey != "" {
+			a.cfg.CompactorAPIKey = prof.Compactor.APIKey
+		}
 	}
 
 	// Mount target profile memory if configured and different from workspace storage

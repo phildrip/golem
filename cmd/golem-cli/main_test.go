@@ -29,50 +29,59 @@ func (m *mockAgent) Process(ctx context.Context, prompt string) (string, error) 
 
 func TestParseFlags(t *testing.T) {
 	tests := []struct {
-		name        string
-		args        []string
-		wantModel   string
-		wantMem     string
-		wantNoTUI   bool
-		wantTUI     bool
-		wantErr     bool
+		name          string
+		args          []string
+		wantModel     string
+		wantMem       string
+		wantNoTUI     bool
+		wantTUI       bool
+		wantCompModel string
+		wantCompProv  string
+		wantErr       bool
 	}{
 		{
-			name:        "default flags",
-			args:        []string{},
-			wantModel:   "",
-			wantMem:     "",
-			wantNoTUI:   false,
-			wantTUI:     false,
-			wantErr:     false,
+			name:      "default flags",
+			args:      []string{},
+			wantModel: "",
+			wantMem:   "",
+			wantNoTUI: false,
+			wantTUI:   false,
+			wantErr:   false,
 		},
 		{
-			name:        "custom model and memory-dir",
-			args:        []string{"-model", "gemini-test", "-memory-dir", "/custom/dir"},
-			wantModel:   "gemini-test",
-			wantMem:     "/custom/dir",
-			wantNoTUI:   false,
-			wantTUI:     false,
-			wantErr:     false,
+			name:      "custom model and memory-dir",
+			args:      []string{"-model", "gemini-test", "-memory-dir", "/custom/dir"},
+			wantModel: "gemini-test",
+			wantMem:   "/custom/dir",
+			wantNoTUI: false,
+			wantTUI:   false,
+			wantErr:   false,
 		},
 		{
-			name:        "no-tui flag",
-			args:        []string{"-no-tui"},
-			wantNoTUI:   true,
-			wantTUI:     false,
-			wantErr:     false,
+			name:      "no-tui flag",
+			args:      []string{"-no-tui"},
+			wantNoTUI: true,
+			wantTUI:   false,
+			wantErr:   false,
 		},
 		{
-			name:        "force tui flag",
-			args:        []string{"-tui"},
-			wantNoTUI:   false,
-			wantTUI:     true,
-			wantErr:     false,
+			name:      "force tui flag",
+			args:      []string{"-tui"},
+			wantNoTUI: false,
+			wantTUI:   true,
+			wantErr:   false,
 		},
 		{
-			name:        "invalid flag",
-			args:        []string{"-nonexistent-flag"},
-			wantErr:     true,
+			name:          "compactor model and provider flags",
+			args:          []string{"-compactor-model", "gemini-2.5-flash", "-compactor-provider", "gemini"},
+			wantCompModel: "gemini-2.5-flash",
+			wantCompProv:  "gemini",
+			wantErr:       false,
+		},
+		{
+			name:    "invalid flag",
+			args:    []string{"-nonexistent-flag"},
+			wantErr: true,
 		},
 	}
 
@@ -96,6 +105,12 @@ func TestParseFlags(t *testing.T) {
 			}
 			if opts.TUI != tc.wantTUI {
 				t.Errorf("TUI = %v, want %v", opts.TUI, tc.wantTUI)
+			}
+			if opts.CompactorModel != tc.wantCompModel {
+				t.Errorf("CompactorModel = %q, want %q", opts.CompactorModel, tc.wantCompModel)
+			}
+			if opts.CompactorProvider != tc.wantCompProv {
+				t.Errorf("CompactorProvider = %q, want %q", opts.CompactorProvider, tc.wantCompProv)
 			}
 		})
 	}
@@ -190,8 +205,10 @@ func TestBuildConfig(t *testing.T) {
 		{
 			name: "CLI flags override file config",
 			opts: CLIOptions{
-				Model:     "flag-model",
-				MemoryDir: "/flag/dir",
+				Model:             "flag-model",
+				MemoryDir:         "/flag/dir",
+				CompactorModel:    "gemini-2.5-flash",
+				CompactorProvider: "gemini",
 			},
 			fileCfg: config.FileConfig{
 				Model:     "file-model",
@@ -215,6 +232,12 @@ func TestBuildConfig(t *testing.T) {
 			}
 			if cfg.APIKey != tc.wantKey {
 				t.Errorf("APIKey = %q, want %q", cfg.APIKey, tc.wantKey)
+			}
+			if tc.opts.CompactorModel != "" && cfg.CompactorModel != tc.opts.CompactorModel {
+				t.Errorf("CompactorModel = %q, want %q", cfg.CompactorModel, tc.opts.CompactorModel)
+			}
+			if tc.opts.CompactorProvider != "" && cfg.CompactorProvider != tc.opts.CompactorProvider {
+				t.Errorf("CompactorProvider = %q, want %q", cfg.CompactorProvider, tc.opts.CompactorProvider)
 			}
 		})
 	}

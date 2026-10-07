@@ -267,4 +267,55 @@ func TestMergeConfigs(t *testing.T) {
 	}
 }
 
+func TestCompactorConfig(t *testing.T) {
+	userCfg := FileConfig{
+		Provider: "openai",
+		Model:    "gpt-4o",
+		Compactor: &CompactorConfig{
+			Provider:    "gemini",
+			Model:       "gemini-flash-latest",
+			TargetBytes: 512,
+		},
+	}
+
+	wsCfg := FileConfig{
+		Compactor: &CompactorConfig{
+			Provider:    "opencode",
+			Model:       "deepseek-coder",
+			TargetBytes: 256,
+		},
+	}
+
+	merged := MergeConfigs(userCfg, wsCfg)
+	if merged.Compactor == nil || merged.Compactor.Model != "deepseek-coder" {
+		t.Errorf("expected workspace compactor model deepseek-coder, got %+v", merged.Compactor)
+	}
+
+	// Profile inheritance
+	_, prof := ResolveActiveProfile("default", userCfg)
+	if prof.Compactor == nil || prof.Compactor.Model != "gemini-flash-latest" {
+		t.Errorf("expected inherited compactor config in default profile, got %+v", prof.Compactor)
+	}
+
+	// Partial merge preserves non-overridden user fields
+	partialWs := FileConfig{
+		Compactor: &CompactorConfig{
+			TargetBytes: 1024,
+		},
+	}
+	partialMerged := MergeConfigs(userCfg, partialWs)
+	if partialMerged.Compactor.Model != "gemini-flash-latest" {
+		t.Errorf("expected preserved compactor model gemini-flash-latest, got %q", partialMerged.Compactor.Model)
+	}
+	if partialMerged.Compactor.TargetBytes != 1024 {
+		t.Errorf("expected merged TargetBytes 1024, got %d", partialMerged.Compactor.TargetBytes)
+	}
+
+	// Cross-provider key isolation: generic APIKey should not poison Gemini when primary is OpenAI
+	geminiKey := ResolveProviderKey(ProviderGemini, "", userCfg)
+	if geminiKey != "" {
+		t.Errorf("expected empty Gemini key when only OpenAI key is set, got %q", geminiKey)
+	}
+}
+
 

@@ -34,8 +34,10 @@ type CLIOptions struct {
 	NoTUI      bool
 	TUI        bool
 	Serve      bool
-	WebPort    int
-	Import     string
+	WebPort           int
+	Import            string
+	CompactorModel    string
+	CompactorProvider string
 }
 
 // AgentProcessor defines the interface for executing agent turns.
@@ -59,24 +61,28 @@ func parseFlags(args []string) (CLIOptions, error) {
 	webFlag := fs.Bool("web", false, "Launch realtime Web UI multiplexer server (alias for -serve)")
 	portFlag := fs.Int("port", 8080, "Port for realtime Web UI server (default: 8080)")
 	importFlag := fs.String("import", "", "Import past chat history: 'pick' (interactive), 'latest', or path/UUID")
+	compactorModelFlag := fs.String("compactor-model", "", "Dedicated model for background fractal memory compaction (e.g. gemini-2.5-flash, gpt-4o-mini)")
+	compactorProviderFlag := fs.String("compactor-provider", "", "Dedicated provider for compactor: gemini, opencode, openai, openrouter")
 
 	if err := fs.Parse(args); err != nil {
 		return CLIOptions{}, err
 	}
 
 	return CLIOptions{
-		Profile:    *profileFlag,
-		Provider:   *providerFlag,
-		BaseURL:    *baseURLFlag,
-		Model:      *modelFlag,
-		MemoryDir:  *storageFlag,
-		APIKey:     *apiKeyFlag,
-		ConfigPath: *configPathFlag,
-		NoTUI:      *noTuiFlag,
-		TUI:        *tuiFlag,
-		Serve:      *serveFlag || *webFlag,
-		WebPort:    *portFlag,
-		Import:     *importFlag,
+		Profile:           *profileFlag,
+		Provider:          *providerFlag,
+		BaseURL:           *baseURLFlag,
+		Model:             *modelFlag,
+		MemoryDir:         *storageFlag,
+		APIKey:            *apiKeyFlag,
+		ConfigPath:        *configPathFlag,
+		NoTUI:             *noTuiFlag,
+		TUI:               *tuiFlag,
+		Serve:             *serveFlag || *webFlag,
+		WebPort:           *portFlag,
+		Import:            *importFlag,
+		CompactorModel:    *compactorModelFlag,
+		CompactorProvider: *compactorProviderFlag,
 	}, nil
 }
 
@@ -108,6 +114,8 @@ func buildConfig(opts CLIOptions, fileCfg config.FileConfig, apiKey string) gole
 	cfg.BaseURL = baseURL
 	cfg.APIKey = apiKey
 	cfg.FileConfig = fileCfg
+	cfg.CompactorModel = opts.CompactorModel
+	cfg.CompactorProvider = opts.CompactorProvider
 	return cfg
 }
 
