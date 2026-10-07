@@ -522,3 +522,51 @@ func TestProfileEndpoints(t *testing.T) {
 		t.Errorf("expected real secret key on disk to be preserved, got %q", userCfg.Profiles["secret-prof"].APIKey)
 	}
 }
+
+func TestGetModelsEndpoint(t *testing.T) {
+	srv := NewServer(ServerConfig{
+		Port: 0,
+	})
+	testServer := httptest.NewServer(srv.httpServer.Handler)
+	defer testServer.Close()
+
+	client := testServer.Client()
+
+	// 1. GET /api/models?provider=opencode
+	resp, err := client.Get(testServer.URL + "/api/models?provider=opencode")
+	if err != nil {
+		t.Fatalf("GET /api/models failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	var modResp ModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&modResp); err != nil {
+		t.Fatalf("decode models response failed: %v", err)
+	}
+
+	if modResp.Provider != "opencode" {
+		t.Errorf("expected provider opencode, got %q", modResp.Provider)
+	}
+	if len(modResp.Models) == 0 {
+		t.Fatalf("expected non-empty models list")
+	}
+
+	// 2. GET /api/models?provider=gemini
+	resp2, err := client.Get(testServer.URL + "/api/models?provider=gemini")
+	if err != nil {
+		t.Fatalf("GET /api/models gemini failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	var gemResp ModelsResponse
+	if err := json.NewDecoder(resp2.Body).Decode(&gemResp); err != nil {
+		t.Fatalf("decode gemini response failed: %v", err)
+	}
+	if len(gemResp.Models) == 0 || gemResp.Models[0] != "gemini-2.5-flash" {
+		t.Errorf("unexpected gemini models: %v", gemResp.Models)
+	}
+}

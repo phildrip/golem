@@ -18,7 +18,7 @@ import (
 )
 
 // DefaultBaseURL points to OpenCode Go OpenAI-compatible API.
-const DefaultBaseURL = "https://api.opencode.ai/v1"
+const DefaultBaseURL = "https://opencode.ai/zen/go/v1"
 
 // Client implements ADK v2 model.LLM for OpenAI-compatible providers
 // such as OpenCode Go, DeepSeek, OpenRouter, and local inference engines.

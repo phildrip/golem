@@ -396,6 +396,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
 
+	// Provider models discovery endpoint
+	mux.HandleFunc("/api/models", func(w http.ResponseWriter, r *http.Request) {
+		s.handleGetModels(w, r)
+	})
+
 	// Embedded UI SPA or placeholder static file handler
 	if s.cfg.StaticFS != nil {
 		fileServer := http.FileServer(http.FS(s.cfg.StaticFS))
@@ -525,6 +530,81 @@ func (s *Server) getProfilesResponse() (ProfilesResponse, error) {
 		UserConfigPath:      userPath,
 		WorkspaceConfigPath: wsPath,
 	}, nil
+}
+
+func (s *Server) handleGetModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	provider := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("provider")))
+	if provider == "" {
+		provider = "opencode"
+	}
+
+	switch provider {
+	case "opencode":
+		baseURL := strings.TrimSpace(r.URL.Query().Get("base_url"))
+		if baseURL == "" {
+			baseURL = config.DefaultOpenCodeBaseURL
+		}
+		baseURL = strings.TrimRight(baseURL, "/")
+
+		client := &http.Client{Timeout: 5 * time.Second}
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, baseURL+"/models", nil)
+		if err == nil {
+			if resp, err := client.Do(req); err == nil && resp.StatusCode == http.StatusOK {
+				var data struct {
+					Data []struct {
+						ID string `json:"id"`
+					} `json:"data"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&data); err == nil && len(data.Data) > 0 {
+					_ = resp.Body.Close()
+					models := make([]string, 0, len(data.Data))
+					for _, m := range data.Data {
+						if m.ID != "" {
+							models = append(models, m.ID)
+						}
+					}
+					writeJSON(w, http.StatusOK, ModelsResponse{Provider: "opencode", Models: models})
+					return
+				}
+				_ = resp.Body.Close()
+			}
+		}
+
+		// Fallback presets if offline or unreachable
+		writeJSON(w, http.StatusOK, ModelsResponse{
+			Provider: "opencode",
+			Models: []string{
+				"kimi-k3", "kimi-k2.7-code", "deepseek-v4-flash", "deepseek-v4-pro",
+				"glm-5.3-flash", "grok-4.7", "gpt-6-luna", "qwen3.8-max", "minimax-m3", "mimo-v2.6-flash",
+			},
+		})
+
+	case "gemini":
+		writeJSON(w, http.StatusOK, ModelsResponse{
+			Provider: "gemini",
+			Models:   []string{"gemini-2.5-flash", "gemini-2.5-pro", "gemini-flash-latest"},
+		})
+
+	case "openai":
+		writeJSON(w, http.StatusOK, ModelsResponse{
+			Provider: "openai",
+			Models:   []string{"gpt-4o", "gpt-4o-mini", "o3-mini", "o1"},
+		})
+
+	case "openrouter":
+		writeJSON(w, http.StatusOK, ModelsResponse{
+			Provider: "openrouter",
+			Models:   []string{"anthropic/claude-3.7-sonnet", "deepseek/deepseek-r1", "meta-llama/llama-3.3-70b-instruct"},
+		})
+
+	default:
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown provider %q", provider))
+	}
 }
 
 func (s *Server) handleGetProfiles(w http.ResponseWriter, r *http.Request) {

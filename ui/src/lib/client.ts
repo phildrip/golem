@@ -173,3 +173,16 @@ export async function deleteProfile(name: string, scope?: string): Promise<impor
 	return res.json();
 }
 
+export async function getProviderModels(provider: string, baseUrl?: string): Promise<import('./types').ModelsResponse> {
+	const params = new URLSearchParams({ provider });
+	if (baseUrl) {
+		params.set('base_url', baseUrl);
+	}
+	const res = await fetch(`/api/models?${params.toString()}`);
+	if (!res.ok) {
+		const errObj = await res.json().catch(() => null);
+		throw new Error(errObj?.error || res.statusText || 'Failed to fetch models');
+	}
+	return res.json();
+}
+

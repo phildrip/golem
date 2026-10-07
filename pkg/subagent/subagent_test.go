@@ -122,13 +122,21 @@ func TestModelFactory_MultiProvider(t *testing.T) {
 		t.Errorf("expected deepseek-chat, got %s / %s", resolved, m1.Name())
 	}
 
-	// 2. Specific opencode prefix
+	// 2. Specific opencode and opencode-go prefixes
 	m2, _, err := factory.GetModel(ctx, "opencode/deepseek-coder")
 	if err != nil {
 		t.Fatalf("GetModel opencode failed: %v", err)
 	}
 	if m2.Name() != "deepseek-coder" {
 		t.Errorf("expected deepseek-coder, got %s", m2.Name())
+	}
+
+	m2b, _, err := factory.GetModel(ctx, "opencode-go/kimi-k3")
+	if err != nil {
+		t.Fatalf("GetModel opencode-go failed: %v", err)
+	}
+	if m2b.Name() != "kimi-k3" {
+		t.Errorf("expected kimi-k3, got %s", m2b.Name())
 	}
 
 	// 3. OpenAI prefix

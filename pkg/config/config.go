@@ -22,7 +22,7 @@ const (
 
 // Default Base URLs
 const (
-	DefaultOpenCodeBaseURL   = "https://api.opencode.ai/v1"
+	DefaultOpenCodeBaseURL   = "https://opencode.ai/zen/go/v1"
 	DefaultOpenAIBaseURL     = "https://api.openai.com/v1"
 	DefaultOpenRouterBaseURL = "https://openrouter.ai/api/v1"
 )
@@ -256,7 +256,9 @@ func DeduceProviderFromModel(modelName string) string {
 		parts := strings.SplitN(lower, "/", 2)
 		prefix := strings.TrimSpace(parts[0])
 		switch prefix {
-		case ProviderOpenCode, ProviderOpenAI, ProviderOpenRouter, ProviderGemini:
+		case "opencode-go", ProviderOpenCode:
+			return ProviderOpenCode
+		case ProviderOpenAI, ProviderOpenRouter, ProviderGemini:
 			return prefix
 		}
 	}

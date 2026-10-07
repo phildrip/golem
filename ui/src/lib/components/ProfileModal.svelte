@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { X, Settings, Check, Plus, Trash2, Edit3, ArrowLeft, Loader2, Sparkles, Sliders, Cpu, Key, Database, RefreshCw } from '@lucide/svelte';
 	import type { ProfileConfig, SaveProfileRequest, ProfilesResponse } from '$lib/types';
-	import { getProfiles, saveProfile, setActiveProfile, deleteProfile } from '$lib/client';
+	import { getProfiles, saveProfile, setActiveProfile, deleteProfile, getProviderModels } from '$lib/client';
 	import { activeProfile, profilesList, userConfigPath, workspaceConfigPath } from '$lib/stores';
 	import { cn } from '$lib/utils';
 
@@ -15,6 +15,7 @@
 
 	let loading = $state<boolean>(false);
 	let saving = $state<boolean>(false);
+	let loadingModels = $state<boolean>(false);
 	let error = $state<string | null>(null);
 	let successMsg = $state<string | null>(null);
 
@@ -33,11 +34,12 @@
 	let formCompactorModel = $state<string>('gemini-2.5-flash');
 	let formCompactorProvider = $state<string>('gemini');
 	let formSetActive = $state<boolean>(true);
+	let availableModels = $state<string[]>([]);
 
 	const modelPresets: Record<string, string[]> = {
-		gemini: ['gemini-2.5-flash', 'gemini-2.5-pro'],
-		opencode: ['deepseek-chat', 'deepseek-reasoner'],
-		openai: ['gpt-4o', 'gpt-4o-mini'],
+		gemini: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-flash-latest'],
+		opencode: ['kimi-k3', 'kimi-k2.7-code', 'deepseek-v4-flash', 'deepseek-v4-pro', 'glm-5.3-flash', 'grok-4.7', 'gpt-6-luna', 'qwen3.8-max'],
+		openai: ['gpt-4o', 'gpt-4o-mini', 'o3-mini', 'o1'],
 		openrouter: ['anthropic/claude-3.7-sonnet', 'deepseek/deepseek-r1']
 	};
 
@@ -54,6 +56,20 @@
 			error = err?.message || 'Failed to fetch profiles';
 		} finally {
 			loading = false;
+		}
+	}
+
+	async function loadModelsForProvider(provider: string, baseUrl?: string) {
+		loadingModels = true;
+		try {
+			const res = await getProviderModels(provider, baseUrl);
+			if (res.models && res.models.length > 0) {
+				availableModels = res.models;
+			}
+		} catch {
+			// keep presets on error or offline
+		} finally {
+			loadingModels = false;
 		}
 	}
 
@@ -80,6 +96,7 @@
 		formSetActive = true;
 		mode = 'edit';
 		error = null;
+		loadModelsForProvider('gemini', '');
 	}
 
 	function handleEditProfile(name: string, prof: ProfileConfig) {
@@ -102,6 +119,7 @@
 		formSetActive = $activeProfile === name;
 		mode = 'edit';
 		error = null;
+		loadModelsForProvider(formProvider, formBaseUrl);
 	}
 
 	function handleProviderChange(newProvider: string) {
@@ -111,9 +129,10 @@
 			formModel = presets[0];
 		}
 		if (newProvider === 'gemini') formApiKeyEnv = 'GEMINI_API_KEY';
-		else if (newProvider === 'opencode') formApiKeyEnv = 'DEEPSEEK_API_KEY';
+		else if (newProvider === 'opencode') formApiKeyEnv = 'OPENCODE_API_KEY';
 		else if (newProvider === 'openai') formApiKeyEnv = 'OPENAI_API_KEY';
 		else if (newProvider === 'openrouter') formApiKeyEnv = 'OPENROUTER_API_KEY';
+		loadModelsForProvider(newProvider, formBaseUrl);
 	}
 
 	async function handleSave() {
@@ -429,22 +448,45 @@
 
 						<!-- Model Input & Presets -->
 						<div class="space-y-1.5">
-							<label for="prof-model" class="block text-slate-300 font-medium">Model Name</label>
+							<div class="flex items-center justify-between">
+								<label for="prof-model" class="block text-slate-300 font-medium">Model Name</label>
+								<button
+									type="button"
+									onclick={() => loadModelsForProvider(formProvider, formBaseUrl)}
+									class="text-[10px] text-purple-400 hover:text-purple-300 flex items-center gap-1 transition-colors"
+									title="Fetch live models from provider"
+								>
+									<RefreshCw class={cn("w-3 h-3", loadingModels && "animate-spin")} />
+									<span>Refresh model list</span>
+								</button>
+							</div>
 							<input
 								id="prof-model"
 								type="text"
+								list="model-suggestions"
 								bind:value={formModel}
-								placeholder="e.g. gemini-2.5-flash, deepseek-chat, gpt-4o"
+								placeholder="e.g. kimi-k3, deepseek-v4-flash, gemini-2.5-flash"
 								class="w-full bg-slate-900/90 border border-slate-800 rounded-md px-3 py-1.5 text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-purple-500 font-mono text-xs"
 							/>
+							<datalist id="model-suggestions">
+								{#each (availableModels.length > 0 ? availableModels : (modelPresets[formProvider] || [])) as opt}
+									<option value={opt}>{opt}</option>
+								{/each}
+							</datalist>
+
 							{#if modelPresets[formProvider]}
-								<div class="flex items-center gap-1.5 pt-0.5">
-									<span class="text-[10px] text-slate-500">Presets:</span>
+								<div class="flex flex-wrap items-center gap-1.5 pt-0.5">
+									<span class="text-[10px] text-slate-500">Quick pick:</span>
 									{#each modelPresets[formProvider] as preset}
 										<button
 											type="button"
 											onclick={() => (formModel = preset)}
-											class="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 hover:bg-purple-900/50 hover:text-purple-300 text-slate-400 transition-colors"
+											class={cn(
+												"text-[10px] font-mono px-2 py-0.5 rounded transition-colors",
+												formModel === preset
+													? "bg-purple-900/60 text-purple-200 border border-purple-500/40"
+													: "bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200"
+											)}
 										>
 											{preset}
 										</button>
@@ -508,6 +550,7 @@
 										<input
 											id="comp-model"
 											type="text"
+											list="model-suggestions"
 											bind:value={formCompactorModel}
 											placeholder="e.g. gemini-2.5-flash"
 											class="w-full bg-slate-900 border border-slate-800 rounded-md px-2.5 py-1 text-slate-200 font-mono text-xs"

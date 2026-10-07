@@ -145,3 +145,8 @@ export interface SaveProfileRequest {
 	set_active?: boolean;
 }
 
+export interface ModelsResponse {
+	provider: string;
+	models: string[];
+}
+

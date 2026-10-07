@@ -110,7 +110,10 @@ func (f *ModelFactory) GetModel(ctx context.Context, requested string) (model.LL
 	provider := f.defaultProvider
 	actualModel := resolved
 
-	if strings.HasPrefix(resolved, "opencode/") {
+	if strings.HasPrefix(resolved, "opencode-go/") {
+		provider = config.ProviderOpenCode
+		actualModel = strings.TrimPrefix(resolved, "opencode-go/")
+	} else if strings.HasPrefix(resolved, "opencode/") {
 		provider = config.ProviderOpenCode
 		actualModel = strings.TrimPrefix(resolved, "opencode/")
 	} else if strings.HasPrefix(resolved, "openai/") {

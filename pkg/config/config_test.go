@@ -154,6 +154,9 @@ func TestMultiProviderResolution(t *testing.T) {
 	if p := ResolveProvider("", FileConfig{}, "opencode/deepseek-chat"); p != ProviderOpenCode {
 		t.Errorf("expected opencode from model prefix, got %s", p)
 	}
+	if p := ResolveProvider("", FileConfig{}, "opencode-go/kimi-k3"); p != ProviderOpenCode {
+		t.Errorf("expected opencode from opencode-go prefix, got %s", p)
+	}
 	if p := ResolveProvider("", FileConfig{}, "gemini-flash-latest"); p != ProviderGemini {
 		t.Errorf("expected gemini default, got %s", p)
 	}

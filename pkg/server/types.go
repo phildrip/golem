@@ -107,3 +107,9 @@ type SetActiveProfileRequest struct {
 	Name  string `json:"name"`
 	Scope string `json:"scope,omitempty"` // "workspace" or "user"
 }
+
+// ModelsResponse is the payload returned by GET /api/models.
+type ModelsResponse struct {
+	Provider string   `json:"provider"`
+	Models   []string `json:"models"`
+}
