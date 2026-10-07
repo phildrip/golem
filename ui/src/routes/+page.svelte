@@ -61,6 +61,7 @@
 	let showProfileModal = $state(false);
 
 	let unsubscribeWS: (() => void) | null = null;
+	let unsubscribeConn: (() => void) | null = null;
 
 	function handleSessionImported(session: SessionInfo) {
 		$sessions = [...$sessions, session];
@@ -73,10 +74,24 @@
 
 	onMount(() => {
 		realtime.connect();
-		$serverConnected = realtime.isConnected;
+
+		unsubscribeConn = realtime.onConnectionChange((connected) => {
+			$serverConnected = connected;
+			if (connected) {
+				fetchSessions();
+				fetchProfiles();
+				if ($activeSessionId) {
+					fetchSessionMemory($activeSessionId);
+				}
+			} else {
+				// Clear stuck generation states on disconnect
+				if ($activeSessionId && $isGenerating[$activeSessionId]) {
+					$isGenerating = { ...$isGenerating, [$activeSessionId]: false };
+				}
+			}
+		});
 
 		unsubscribeWS = realtime.subscribe((event: WSEvent) => {
-			$serverConnected = true;
 			handleRealtimeEvent(event);
 		});
 
@@ -86,6 +101,7 @@
 
 	onDestroy(() => {
 		if (unsubscribeWS) unsubscribeWS();
+		if (unsubscribeConn) unsubscribeConn();
 		realtime.disconnect();
 	});
 
@@ -311,9 +327,17 @@
 	}
 
 	function handleRealtimeEvent(event: WSEvent) {
+		// Handle global events not bound to a specific session
+		if (event.type === 'profile_changed') {
+			const payload = event.payload as ProfilesResponse;
+			if (payload.active_profile) $activeProfile = payload.active_profile;
+			if (payload.profiles) $profilesList = payload.profiles;
+			return;
+		}
+
 		const sessId = event.session_id;
 		if (!sessId) {
-			// Ignore events not bound to a session to prevent state bleed across parallel sessions
+			// Ignore other events not bound to a session to prevent state bleed
 			return;
 		}
 
@@ -388,27 +412,32 @@
 			case 'tool_done': {
 				const payload = event.payload as { tool?: string; output?: string; tool_call_id?: string; exit_code?: number };
 				const list = $messages[sessId] || [];
-				const last = list[list.length - 1];
-				if (last && last.role === 'assistant' && last.toolCalls && last.toolCalls.length > 0) {
-					// Match by tool_call_id if provided, else fallback to latest running tool with matching name
-					const t = payload.tool_call_id
-						? last.toolCalls.find((x) => x.id === payload.tool_call_id)
-						: last.toolCalls.find((x) => x.toolName === payload.tool && x.status === 'running') || last.toolCalls[last.toolCalls.length - 1];
-					if (t) {
-						t.status = (payload.exit_code === 0 || payload.exit_code === undefined) ? 'done' : 'error';
-						t.output = payload.output || '';
-						$messages = { ...$messages, [sessId]: [...list] };
+				// Search backwards through assistant messages to find the running tool call
+				for (let i = list.length - 1; i >= 0; i--) {
+					const msg = list[i];
+					if (msg.role === 'assistant' && msg.toolCalls && msg.toolCalls.length > 0) {
+						const t = payload.tool_call_id
+							? msg.toolCalls.find((x) => x.id === payload.tool_call_id)
+							: msg.toolCalls.find((x) => x.toolName === payload.tool && x.status === 'running') || msg.toolCalls[msg.toolCalls.length - 1];
+						if (t) {
+							t.status = (payload.exit_code === 0 || payload.exit_code === undefined) ? 'done' : 'error';
+							t.output = payload.output || '';
+							$messages = { ...$messages, [sessId]: [...list] };
+							break;
+						}
 					}
 				}
 				break;
 			}
 
 			case 'subagent_start': {
-				const payload = event.payload as { id: string; name: string; role: string; model: string };
+				const payload = event.payload as { id?: string; name?: string; role: string; model: string };
+				const subId = payload.id || `subagent-${payload.role || 'worker'}-${Date.now()}`;
+				const subName = payload.name || payload.role || 'Subagent';
 				const newNode: SubagentNode = {
-					id: payload.id,
+					id: subId,
 					sessionId: sessId,
-					name: payload.name,
+					name: subName,
 					role: payload.role,
 					model: payload.model,
 					status: 'running',
@@ -422,9 +451,9 @@
 			}
 
 			case 'subagent_tool': {
-				const payload = event.payload as { id: string; tool: string };
+				const payload = event.payload as { id?: string; role?: string; tool: string };
 				const current = $subagents[sessId] || [];
-				const target = current.find((a) => a.id === payload.id);
+				const target = current.find((a) => (payload.id && a.id === payload.id) || (payload.role && a.role === payload.role));
 				if (target) {
 					target.toolsRun += 1;
 					target.currentAction = `Running tool ${payload.tool}`;
@@ -434,9 +463,9 @@
 			}
 
 			case 'subagent_done': {
-				const payload = event.payload as { id: string; tokens?: number };
+				const payload = event.payload as { id?: string; role?: string; tokens?: number };
 				const current = $subagents[sessId] || [];
-				const target = current.find((a) => a.id === payload.id);
+				const target = current.find((a) => (payload.id && a.id === payload.id) || (payload.role && a.role === payload.role));
 				if (target) {
 					target.status = 'done';
 					if (payload.tokens) target.tokensUsed = payload.tokens;

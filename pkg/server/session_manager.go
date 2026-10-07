@@ -22,6 +22,8 @@ type Session struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	TurnCount  int
+	isBusy     bool
+	turnWg     sync.WaitGroup
 	ctx        context.Context
 	cancel     context.CancelFunc
 	unsubSwarm func()
@@ -255,6 +257,32 @@ func (sm *SessionManager) UpdateBaseConfig(cfg golem.Config) {
 	sm.baseCfg = cfg
 }
 
+// TryAcquireTurn attempts to acquire turn execution on the session, returning true if acquired.
+func (sm *SessionManager) TryAcquireTurn(sessionID string) (*Session, bool) {
+	sess, ok := sm.GetSession(sessionID)
+	if !ok {
+		return nil, false
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.isBusy {
+		return sess, false
+	}
+	sess.isBusy = true
+	sess.turnWg.Add(1)
+	return sess, true
+}
+
+// ReleaseTurn marks the session turn execution as completed.
+func (sm *SessionManager) ReleaseTurn(sessionID string) {
+	if sess, ok := sm.GetSession(sessionID); ok {
+		sess.mu.Lock()
+		sess.isBusy = false
+		sess.mu.Unlock()
+		sess.turnWg.Done()
+	}
+}
+
 // DeleteSession closes and removes a session.
 func (sm *SessionManager) DeleteSession(id string) error {
 	sm.mu.Lock()
@@ -273,7 +301,12 @@ func (sm *SessionManager) DeleteSession(id string) error {
 	}
 	sm.mu.Unlock()
 
+	// Cancel context first so ongoing turn aborts quickly
 	sess.cancel()
+
+	// Wait for any in-flight turn execution before tearing down resources
+	sess.turnWg.Wait()
+
 	if sess.unsubSwarm != nil {
 		sess.unsubSwarm()
 	}
@@ -290,10 +323,9 @@ func (sm *SessionManager) SendPrompt(ctx context.Context, sessionID, prompt stri
 	}
 
 	sess.mu.Lock()
-	defer sess.mu.Unlock()
-
 	sess.TurnCount++
 	sess.UpdatedAt = time.Now().UTC()
+	sess.mu.Unlock()
 
 	// Broadcast user prompt start
 	_ = sm.hub.Broadcast(WSEventUserPrompt, sessionID, map[string]string{"prompt": prompt})
@@ -318,8 +350,10 @@ func (sm *SessionManager) SendPrompt(ctx context.Context, sessionID, prompt stri
 }
 
 type sessionStreamAdapter struct {
-	sessionID string
-	hub       *Hub
+	sessionID   string
+	hub         *Hub
+	subagentMu  sync.Mutex
+	subagentIDs map[string]string
 }
 
 func (a *sessionStreamAdapter) OnChunk(token string) {
@@ -346,7 +380,17 @@ func (a *sessionStreamAdapter) OnToolDone(toolName, output string, exitCode int)
 }
 
 func (a *sessionStreamAdapter) OnSubagentStart(role, model, prompt string) {
+	a.subagentMu.Lock()
+	if a.subagentIDs == nil {
+		a.subagentIDs = make(map[string]string)
+	}
+	id := fmt.Sprintf("subagent-%s-%d", role, time.Now().UnixNano())
+	a.subagentIDs[role] = id
+	a.subagentMu.Unlock()
+
 	_ = a.hub.Broadcast(WSEventSubagentStart, a.sessionID, map[string]string{
+		"id":     id,
+		"name":   role,
 		"role":   role,
 		"model":  model,
 		"prompt": prompt,
@@ -354,7 +398,12 @@ func (a *sessionStreamAdapter) OnSubagentStart(role, model, prompt string) {
 }
 
 func (a *sessionStreamAdapter) OnSubagentTool(role, model, toolName, command, output string, exitCode int, isRunning bool) {
+	a.subagentMu.Lock()
+	id := a.subagentIDs[role]
+	a.subagentMu.Unlock()
+
 	_ = a.hub.Broadcast(WSEventSubagentTool, a.sessionID, map[string]any{
+		"id":         id,
 		"role":       role,
 		"model":      model,
 		"tool":       toolName,
@@ -366,11 +415,16 @@ func (a *sessionStreamAdapter) OnSubagentTool(role, model, toolName, command, ou
 }
 
 func (a *sessionStreamAdapter) OnSubagentDone(role, model, result string, duration time.Duration, err error) {
+	a.subagentMu.Lock()
+	id := a.subagentIDs[role]
+	a.subagentMu.Unlock()
+
 	errStr := ""
 	if err != nil {
 		errStr = err.Error()
 	}
 	_ = a.hub.Broadcast(WSEventSubagentDone, a.sessionID, map[string]any{
+		"id":       id,
 		"role":     role,
 		"model":    model,
 		"result":   result,

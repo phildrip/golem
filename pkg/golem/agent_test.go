@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -311,5 +313,75 @@ func TestAgentProfileAndMountedMemory(t *testing.T) {
 		t.Errorf("expected active profile 'personal', got: %s", agent.Config().Profile)
 	}
 	_ = prof
+}
+
+type testStreamHandler struct {
+	onChunk func(token string)
+}
+
+func (h *testStreamHandler) OnChunk(token string) {
+	if h.onChunk != nil {
+		h.onChunk(token)
+	}
+}
+
+func (h *testStreamHandler) OnToolStart(toolName, command string) {}
+func (h *testStreamHandler) OnToolDone(toolName, output string, exitCode int) {}
+
+func TestAgent_ProcessStreamWithMockLLM(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("expected http.Flusher")
+		}
+
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"role":"assistant","content":"Hello"}}]}`)
+		flusher.Flush()
+
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"content":" world"}}]}`)
+		flusher.Flush()
+
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer mockServer.Close()
+
+	tempDir := t.TempDir()
+	cfg := Config{
+		Provider:        "opencode",
+		BaseURL:         mockServer.URL,
+		ModelName:       "test-model",
+		APIKey:          "test-key",
+		StorageDir:      tempDir,
+		LiveHeadCount:   4,
+		ViewBudgetBytes: 1024,
+	}
+
+	ctx := context.Background()
+	agent, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("New agent failed: %v", err)
+	}
+	defer agent.Close()
+
+	var chunks []string
+	handler := &testStreamHandler{
+		onChunk: func(token string) {
+			chunks = append(chunks, token)
+		},
+	}
+
+	resp, err := agent.ProcessStream(ctx, "hi", handler)
+	if err != nil {
+		t.Fatalf("ProcessStream failed: %v", err)
+	}
+
+	if resp != "Hello world" {
+		t.Errorf("expected 'Hello world', got %q", resp)
+	}
+	if len(chunks) == 0 {
+		t.Errorf("expected streamed chunks, got none")
+	}
 }
 

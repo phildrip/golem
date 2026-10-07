@@ -209,10 +209,10 @@ func TestClient_StreamingGenerateContent(t *testing.T) {
 	if finalResp == nil {
 		t.Fatalf("expected final response with TurnComplete")
 	}
-	if len(finalResp.Content.Parts) != 1 || finalResp.Content.Parts[0].FunctionCall == nil {
-		t.Fatalf("expected accumulated function call in finalResp, got: %+v", finalResp.Content)
+	if len(finalResp.Content.Parts) != 2 || finalResp.Content.Parts[0].Text != "Hello world" || finalResp.Content.Parts[1].FunctionCall == nil {
+		t.Fatalf("expected text and accumulated function call in finalResp, got: %+v", finalResp.Content)
 	}
-	fc := finalResp.Content.Parts[0].FunctionCall
+	fc := finalResp.Content.Parts[1].FunctionCall
 	if fc.Name != "run_cmd" || fc.ID != "call_999" {
 		t.Errorf("unexpected function call: %+v", fc)
 	}

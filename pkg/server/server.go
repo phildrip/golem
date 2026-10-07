@@ -298,14 +298,19 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 					return
 				}
 
-				sess, ok := s.sessions.GetSession(sessionID)
-				if !ok {
-					writeError(w, http.StatusNotFound, "session not found")
+				sess, acquired := s.sessions.TryAcquireTurn(sessionID)
+				if !acquired {
+					if sess == nil {
+						writeError(w, http.StatusNotFound, "session not found")
+					} else {
+						writeError(w, http.StatusConflict, "session is currently executing a turn")
+					}
 					return
 				}
 
 				// Run turn tied to the session's cancelable context
 				go func(sessCtx context.Context, p string) {
+					defer s.sessions.ReleaseTurn(sessionID)
 					turnCtx, cancel := context.WithTimeout(sessCtx, 10*time.Minute)
 					defer cancel()
 					_, _ = s.sessions.SendPrompt(turnCtx, sessionID, p)

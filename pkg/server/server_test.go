@@ -195,8 +195,8 @@ func TestHub_ClientQueueSaturation(t *testing.T) {
 	}
 	defer ws.Close()
 
-	// Rapidly broadcast messages beyond client queue buffer (256)
-	for i := 0; i < 300; i++ {
+	// Rapidly broadcast messages beyond client queue buffer (1024)
+	for i := 0; i < 1200; i++ {
 		_ = hub.Broadcast(WSEventUserPrompt, "sess", map[string]int{"idx": i})
 	}
 
@@ -570,3 +570,368 @@ func TestGetModelsEndpoint(t *testing.T) {
 		t.Errorf("unexpected gemini models: %v", gemResp.Models)
 	}
 }
+
+func TestPromptStreamingAndEventDelivery(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("expected http.Flusher")
+		}
+
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"role":"assistant","content":"Testing"}}]}`)
+		flusher.Flush()
+
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"content":" response"}}]}`)
+		flusher.Flush()
+
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer mockServer.Close()
+
+	tempDir := t.TempDir()
+	baseCfg := golem.Config{
+		Provider:        "opencode",
+		BaseURL:         mockServer.URL,
+		ModelName:       "test-model",
+		APIKey:          "test-key",
+		StorageDir:      tempDir,
+		WorkspaceDir:    tempDir,
+		LiveHeadCount:   4,
+		ViewBudgetBytes: 1024,
+	}
+
+	srv := NewServer(ServerConfig{
+		Port:         0,
+		BaseAgentCfg: baseCfg,
+	})
+	go srv.hub.Run()
+	defer srv.Shutdown(context.Background())
+	testServer := httptest.NewServer(srv.httpServer.Handler)
+	defer testServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(testServer.URL, "http") + "/ws"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer ws.Close()
+
+	client := testServer.Client()
+	createResp, err := client.Post(testServer.URL+"/api/sessions", "application/json", strings.NewReader(`{"title":"Stream Test"}`))
+	if err != nil {
+		t.Fatalf("POST /api/sessions failed: %v", err)
+	}
+	var sessInfo SessionInfo
+	if err := json.NewDecoder(createResp.Body).Decode(&sessInfo); err != nil {
+		t.Fatalf("decode session failed: %v", err)
+	}
+	createResp.Body.Close()
+
+	promptResp, err := client.Post(testServer.URL+"/api/sessions/"+sessInfo.ID+"/prompt", "application/json", strings.NewReader(`{"prompt":"hello"}`))
+	if err != nil {
+		t.Fatalf("POST /api/sessions/{id}/prompt failed: %v", err)
+	}
+	if promptResp.StatusCode != http.StatusAccepted {
+		t.Errorf("expected 202 Accepted, got %d", promptResp.StatusCode)
+	}
+	promptResp.Body.Close()
+
+	_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var receivedChunks []string
+	var receivedDeltas []string
+	var sawPrompt bool
+	var sawDone bool
+	var doneResponse string
+
+	for {
+		_, msgBytes, err := ws.ReadMessage()
+		if err != nil {
+			break
+		}
+		var ev WSEvent
+		if err := json.Unmarshal(msgBytes, &ev); err != nil {
+			continue
+		}
+		if ev.SessionID != sessInfo.ID {
+			continue
+		}
+
+		switch ev.Type {
+		case WSEventUserPrompt:
+			sawPrompt = true
+		case WSEventAgentChunk:
+			var payload struct {
+				Token string `json:"token"`
+				Delta string `json:"delta"`
+			}
+			_ = json.Unmarshal(ev.Payload, &payload)
+			if payload.Token != "" {
+				receivedChunks = append(receivedChunks, payload.Token)
+			}
+			if payload.Delta != "" {
+				receivedDeltas = append(receivedDeltas, payload.Delta)
+			}
+		case WSEventAgentDone:
+			sawDone = true
+			var payload struct {
+				Response string `json:"response"`
+			}
+			_ = json.Unmarshal(ev.Payload, &payload)
+			doneResponse = payload.Response
+		}
+
+		if sawDone {
+			break
+		}
+	}
+
+	if !sawPrompt {
+		t.Errorf("expected user_prompt event")
+	}
+	if len(receivedChunks) == 0 {
+		t.Errorf("expected agent_chunk events with token")
+	}
+	if len(receivedDeltas) == 0 {
+		t.Errorf("expected agent_chunk events with delta")
+	}
+	if len(receivedChunks) != len(receivedDeltas) {
+		t.Errorf("expected equal number of tokens and deltas, got %d vs %d", len(receivedChunks), len(receivedDeltas))
+	}
+	if !sawDone {
+		t.Errorf("expected agent_done event")
+	}
+	if doneResponse != "Testing response" {
+		t.Errorf("expected done response 'Testing response', got %q", doneResponse)
+	}
+}
+
+func TestPromptErrorSurfacingAndEventDelivery(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"message":"invalid api key"}}`, http.StatusUnauthorized)
+	}))
+	defer mockServer.Close()
+
+	tempDir := t.TempDir()
+	baseCfg := golem.Config{
+		Provider:        "opencode",
+		BaseURL:         mockServer.URL,
+		ModelName:       "test-model",
+		APIKey:          "test-key",
+		StorageDir:      tempDir,
+		WorkspaceDir:    tempDir,
+		LiveHeadCount:   4,
+		ViewBudgetBytes: 1024,
+	}
+
+	srv := NewServer(ServerConfig{
+		Port:         0,
+		BaseAgentCfg: baseCfg,
+	})
+	go srv.hub.Run()
+	defer srv.Shutdown(context.Background())
+	testServer := httptest.NewServer(srv.httpServer.Handler)
+	defer testServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(testServer.URL, "http") + "/ws"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial websocket: %v", err)
+	}
+	defer ws.Close()
+
+	client := testServer.Client()
+	createResp, err := client.Post(testServer.URL+"/api/sessions", "application/json", strings.NewReader(`{"title":"Error Test"}`))
+	if err != nil {
+		t.Fatalf("POST /api/sessions failed: %v", err)
+	}
+	var sessInfo SessionInfo
+	if err := json.NewDecoder(createResp.Body).Decode(&sessInfo); err != nil {
+		t.Fatalf("decode session failed: %v", err)
+	}
+	createResp.Body.Close()
+
+	promptResp, err := client.Post(testServer.URL+"/api/sessions/"+sessInfo.ID+"/prompt", "application/json", strings.NewReader(`{"prompt":"trigger error"}`))
+	if err != nil {
+		t.Fatalf("POST /api/sessions/{id}/prompt failed: %v", err)
+	}
+	if promptResp.StatusCode != http.StatusAccepted {
+		t.Errorf("expected 202 Accepted, got %d", promptResp.StatusCode)
+	}
+	promptResp.Body.Close()
+
+	_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var sawPrompt bool
+	var sawDone bool
+	var doneError string
+
+	for {
+		_, msgBytes, err := ws.ReadMessage()
+		if err != nil {
+			break
+		}
+		var ev WSEvent
+		if err := json.Unmarshal(msgBytes, &ev); err != nil {
+			continue
+		}
+		if ev.SessionID != sessInfo.ID {
+			continue
+		}
+
+		switch ev.Type {
+		case WSEventUserPrompt:
+			sawPrompt = true
+		case WSEventAgentDone:
+			sawDone = true
+			var payload struct {
+				Error string `json:"error"`
+			}
+			_ = json.Unmarshal(ev.Payload, &payload)
+			doneError = payload.Error
+		}
+
+		if sawDone {
+			break
+		}
+	}
+
+	if !sawPrompt {
+		t.Errorf("expected user_prompt event")
+	}
+	if !sawDone {
+		t.Errorf("expected agent_done event")
+	}
+	if doneError == "" {
+		t.Errorf("expected non-empty error in agent_done payload")
+	}
+}
+
+func TestPromptConflict409(t *testing.T) {
+	blockTurn := make(chan struct{})
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-blockTurn
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"content":"done"}}]}`)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer mockServer.Close()
+
+	tempDir := t.TempDir()
+	baseCfg := golem.Config{
+		Provider:        "opencode",
+		BaseURL:         mockServer.URL,
+		ModelName:       "test-model",
+		StorageDir:      tempDir,
+		WorkspaceDir:    tempDir,
+		LiveHeadCount:   4,
+		ViewBudgetBytes: 1024,
+	}
+
+	srv := NewServer(ServerConfig{
+		Port:         0,
+		BaseAgentCfg: baseCfg,
+	})
+	go srv.hub.Run()
+	defer srv.Shutdown(context.Background())
+	testServer := httptest.NewServer(srv.httpServer.Handler)
+	defer testServer.Close()
+
+	client := testServer.Client()
+	createResp, err := client.Post(testServer.URL+"/api/sessions", "application/json", strings.NewReader(`{"title":"Conflict Test"}`))
+	if err != nil {
+		t.Fatalf("POST /api/sessions failed: %v", err)
+	}
+	var sessInfo SessionInfo
+	_ = json.NewDecoder(createResp.Body).Decode(&sessInfo)
+	createResp.Body.Close()
+
+	// Launch first prompt
+	resp1, err := client.Post(testServer.URL+"/api/sessions/"+sessInfo.ID+"/prompt", "application/json", strings.NewReader(`{"prompt":"turn 1"}`))
+	if err != nil {
+		t.Fatalf("first prompt failed: %v", err)
+	}
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Errorf("expected 202 Accepted for first prompt, got %d", resp1.StatusCode)
+	}
+	t.Log("posted prompt 1, status:", resp1.StatusCode)
+	resp1.Body.Close()
+
+	// Immediately attempt second concurrent prompt on the same session
+	resp2, err := client.Post(testServer.URL+"/api/sessions/"+sessInfo.ID+"/prompt", "application/json", strings.NewReader(`{"prompt":"turn 2"}`))
+	if err != nil {
+		t.Fatalf("second prompt failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	t.Log("posted prompt 2, status:", resp2.StatusCode)
+
+	if resp2.StatusCode != http.StatusConflict {
+		t.Errorf("expected 409 Conflict for overlapping turn, got %d", resp2.StatusCode)
+	}
+
+	// Unblock first prompt turn so it completes before shutdown
+	t.Log("closing blockTurn")
+	close(blockTurn)
+	t.Log("test body finished")
+}
+
+func TestSessionManager_DeleteActiveTurn(t *testing.T) {
+	blockTurn := make(chan struct{})
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-blockTurn
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"content":"done"}}]}`)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer mockServer.Close()
+
+	tempDir := t.TempDir()
+	baseCfg := golem.Config{
+		Provider:        "opencode",
+		BaseURL:         mockServer.URL,
+		ModelName:       "test-model",
+		StorageDir:      tempDir,
+		WorkspaceDir:    tempDir,
+		LiveHeadCount:   4,
+		ViewBudgetBytes: 1024,
+	}
+
+	sm := NewSessionManager(baseCfg, NewHub())
+	sess, err := sm.CreateSession(context.Background(), "Delete Test")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	turnAcquired := make(chan struct{})
+	go func() {
+		close(turnAcquired)
+		_, _ = sm.SendPrompt(context.Background(), sess.ID, "in flight prompt")
+	}()
+
+	<-turnAcquired
+	time.Sleep(20 * time.Millisecond)
+
+	// Close the turn block to allow clean abort
+	close(blockTurn)
+
+	// DeleteSession while turn is executing should acquire lock and not panic or corrupt store
+	if err := sm.DeleteSession(sess.ID); err != nil {
+		t.Fatalf("DeleteSession failed: %v", err)
+	}
+}
+
+

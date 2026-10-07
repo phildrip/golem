@@ -1,10 +1,12 @@
 import type { WSEvent } from './types';
 
 export type EventCallback = (event: WSEvent) => void;
+export type ConnectionStateCallback = (connected: boolean) => void;
 
 class RealtimeClient {
 	private ws: WebSocket | null = null;
 	private listeners: Set<EventCallback> = new Set();
+	private stateListeners: Set<ConnectionStateCallback> = new Set();
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private url: string = '';
 	public isConnected: boolean = false;
@@ -13,6 +15,20 @@ class RealtimeClient {
 		if (typeof window !== 'undefined') {
 			const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 			this.url = `${proto}//${window.location.host}/ws`;
+		}
+	}
+
+	public onConnectionChange(callback: ConnectionStateCallback): () => void {
+		this.stateListeners.add(callback);
+		callback(this.isConnected);
+		return () => {
+			this.stateListeners.delete(callback);
+		};
+	}
+
+	private notifyConnectionState(connected: boolean): void {
+		for (const cb of this.stateListeners) {
+			cb(connected);
 		}
 	}
 
@@ -29,10 +45,12 @@ class RealtimeClient {
 
 			this.ws.onopen = () => {
 				this.isConnected = true;
+				this.reconnectAttempts = 0;
 				if (this.reconnectTimer) {
 					clearTimeout(this.reconnectTimer);
 					this.reconnectTimer = null;
 				}
+				this.notifyConnectionState(true);
 			};
 
 			this.ws.onmessage = (event) => {
@@ -48,16 +66,19 @@ class RealtimeClient {
 
 			this.ws.onclose = () => {
 				this.isConnected = false;
+				this.notifyConnectionState(false);
 				this.scheduleReconnect();
 			};
 
 			this.ws.onerror = () => {
 				this.isConnected = false;
+				this.notifyConnectionState(false);
 				if (this.ws) {
 					this.ws.close();
 				}
 			};
 		} catch {
+			this.notifyConnectionState(false);
 			this.scheduleReconnect();
 		}
 	}

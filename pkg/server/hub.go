@@ -153,8 +153,16 @@ func (h *Hub) Broadcast(evType WSEventType, sessionID string, payload any) error
 	select {
 	case h.broadcast <- bytes:
 		return nil
-	case <-time.After(250 * time.Millisecond):
-		return errors.Errorf("broadcast queue saturated (event dropped: %s)", evType)
+	default:
+		if evType == WSEventAgentChunk {
+			return errors.Errorf("broadcast queue saturated (chunk dropped: %s)", evType)
+		}
+		select {
+		case h.broadcast <- bytes:
+			return nil
+		case <-time.After(250 * time.Millisecond):
+			return errors.Errorf("broadcast queue saturated (event dropped: %s)", evType)
+		}
 	}
 }
 
@@ -168,7 +176,7 @@ func (h *Hub) HandleWS(w http.ResponseWriter, r *http.Request) {
 	client := &Client{
 		hub:  h,
 		conn: conn,
-		send: make(chan []byte, 256),
+		send: make(chan []byte, 1024),
 	}
 
 	h.mu.Lock()

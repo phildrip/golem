@@ -728,11 +728,22 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 			}
 
 			if ev != nil && ev.Content != nil {
-				for _, part := range ev.Content.Parts {
-					if part.Text != "" {
-						responseBuilder.WriteString(part.Text)
-						if handler != nil {
-							handler.OnChunk(part.Text)
+				if ev.Partial {
+					for _, part := range ev.Content.Parts {
+						if part.Text != "" {
+							responseBuilder.WriteString(part.Text)
+							if handler != nil {
+								handler.OnChunk(part.Text)
+							}
+						}
+					}
+				} else if responseBuilder.Len() == 0 {
+					for _, part := range ev.Content.Parts {
+						if part.Text != "" {
+							responseBuilder.WriteString(part.Text)
+							if handler != nil {
+								handler.OnChunk(part.Text)
+							}
 						}
 					}
 				}

@@ -325,6 +325,8 @@ func (c *Client) handleUnaryResponse(r io.Reader, yield func(*model.LLMResponse,
 
 func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMResponse, error) bool) {
 	scanner := bufio.NewScanner(r)
+	buf := make([]byte, 1024*1024)
+	scanner.Buffer(buf, 10*1024*1024)
 
 	type toolAccumulator struct {
 		id   string
@@ -333,6 +335,7 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 	}
 	accumulatedTools := make(map[int]*toolAccumulator)
 
+	var accumulatedText strings.Builder
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -358,6 +361,7 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 
 		// Plain text token streaming
 		if delta.Content != "" {
+			accumulatedText.WriteString(delta.Content)
 			if !yield(&model.LLMResponse{
 				Content: &genai.Content{
 					Role: "model",
@@ -392,6 +396,10 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 
 	// Finalize tool calls if model produced any
 	var finalParts []*genai.Part
+	if accumulatedText.Len() > 0 {
+		finalParts = append(finalParts, &genai.Part{Text: accumulatedText.String()})
+	}
+
 	for idx := 0; idx < len(accumulatedTools); idx++ {
 		acc := accumulatedTools[idx]
 		var args map[string]any
