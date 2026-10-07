@@ -295,11 +295,17 @@ func (s *Store) OnEvent(fn EventListener) {
 }
 
 // AppendEvent atomically logs a new event with bbolt and dispatches to reactive listeners.
-func (s *Store) AppendEvent(kind EventKind, text string) (Event, error) {
+// Optional AppendEventOpts allows setting a specific historical timestamp or metadata.
+func (s *Store) AppendEvent(kind EventKind, text string, opts ...AppendEventOpts) (Event, error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return Event{}, ErrStoreClosed
+	}
+
+	ts := time.Now().UTC()
+	if len(opts) > 0 && !opts[0].Timestamp.IsZero() {
+		ts = opts[0].Timestamp.UTC()
 	}
 
 	id := len(s.events)
@@ -310,7 +316,7 @@ func (s *Store) AppendEvent(kind EventKind, text string) (Event, error) {
 		ID:        id,
 		Kind:      kind,
 		Text:      text,
-		Timestamp: time.Now().UTC(),
+		Timestamp: ts,
 		Size:      size,
 	}
 

@@ -29,3 +29,8 @@ type Event struct {
 func (e Event) FormatLine() string {
 	return fmt.Sprintf("%s: %s", e.Kind, e.Text)
 }
+
+// AppendEventOpts specifies optional overrides and metadata when appending an event.
+type AppendEventOpts struct {
+	Timestamp time.Time `json:"timestamp,omitempty"`
+}

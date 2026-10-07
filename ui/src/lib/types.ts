@@ -30,6 +30,18 @@ export interface SessionInfo {
 	turn_count: number;
 }
 
+export interface DiscoveredSession {
+	id: string;
+	format: 'agy' | 'cursor';
+	title: string;
+	path: string;
+	workspace?: string;
+	created_at: string;
+	updated_at: string;
+	event_count: number;
+	matches_workspace: boolean;
+}
+
 export interface ChatMessage {
 	id: string;
 	role: 'user' | 'assistant' | 'system';

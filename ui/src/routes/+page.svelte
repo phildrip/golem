@@ -7,6 +7,7 @@
 	import SwarmTree from '$lib/components/SwarmTree.svelte';
 	import MemoryExplorer from '$lib/components/MemoryExplorer.svelte';
 	import PatchInspector from '$lib/components/PatchInspector.svelte';
+	import ImportModal from '$lib/components/ImportModal.svelte';
 	import { realtime } from '$lib/client';
 	import {
 		sessions,
@@ -46,8 +47,18 @@
 
 	let showMemoryExplorer = $state(false);
 	let showPatchInspector = $state(false);
+	let showImportModal = $state(false);
 
 	let unsubscribeWS: (() => void) | null = null;
+
+	function handleSessionImported(session: SessionInfo) {
+		$sessions = [...$sessions, session];
+		$activeSessionId = session.id;
+		showImportModal = false;
+		if (showMemoryExplorer) {
+			fetchSessionMemory(session.id);
+		}
+	}
 
 	onMount(() => {
 		realtime.connect();
@@ -431,6 +442,7 @@
 		}}
 		onCreate={createNewSession}
 		onClose={closeSession}
+		onOpenImport={() => (showImportModal = true)}
 	/>
 
 	<!-- Main Workspace Split View -->
@@ -473,4 +485,11 @@
 			onRejectPatch={rejectPatch}
 		/>
 	{/if}
+
+	<!-- Historical Chat Import Modal -->
+	<ImportModal
+		open={showImportModal}
+		onClose={() => (showImportModal = false)}
+		onImported={handleSessionImported}
+	/>
 </div>

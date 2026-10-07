@@ -3,11 +3,13 @@ package server
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/user/golem/pkg/golem"
+	"github.com/user/golem/pkg/importer"
 	"github.com/user/golem/pkg/memory/fractal"
 )
 
@@ -55,25 +57,15 @@ func (sm *SessionManager) CreateSession(ctx context.Context, title string) (*Ses
 
 	// Session storage directory: isolated per session or sharing project store
 	cfg := sm.baseCfg
-	if cfg.StorageDir != "" {
-		cfg.StorageDir = fmt.Sprintf("%s/%s", sm.baseCfg.StorageDir, id)
+	if cfg.StorageDir == "" {
+		cfg.StorageDir = golem.DefaultConfig().StorageDir
 	}
+	cfg.StorageDir = filepath.Join(cfg.StorageDir, id)
 
 	agentInstance, err := golem.New(ctx, cfg)
 	if err != nil {
 		return nil, errors.Wrap(err, "initializing agent for session")
 	}
-
-	// Wire reactive memory pub-sub listener to broadcast to WebSocket clients
-	sessID := id
-	agentInstance.Store().OnEvent(func(ev fractal.Event) {
-		_ = sm.hub.Broadcast(WSEventMemoryAdded, sessID, map[string]any{
-			"id":        ev.ID,
-			"kind":      ev.Kind,
-			"text":      ev.Text,
-			"timestamp": ev.Timestamp,
-		})
-	})
 
 	sessCtx, cancel := context.WithCancel(context.Background())
 	sess := &Session{
@@ -91,6 +83,17 @@ func (sm *SessionManager) CreateSession(ctx context.Context, title string) (*Ses
 		sm.activeID = id
 	}
 
+	// Wire reactive memory pub-sub listener to broadcast to WebSocket clients
+	sessID := id
+	agentInstance.Store().OnEvent(func(ev fractal.Event) {
+		_ = sm.hub.Broadcast(WSEventMemoryAdded, sessID, map[string]any{
+			"id":        ev.ID,
+			"kind":      ev.Kind,
+			"text":      ev.Text,
+			"timestamp": ev.Timestamp,
+		})
+	})
+
 	_ = sm.hub.Broadcast(WSEventSessionCreated, id, SessionInfo{
 		ID:        id,
 		Title:     title,
@@ -98,6 +101,81 @@ func (sm *SessionManager) CreateSession(ctx context.Context, title string) (*Ses
 		UpdatedAt: sess.UpdatedAt,
 		IsActive:  sm.activeID == id,
 		TurnCount: 0,
+	})
+
+	return sess, nil
+}
+
+// CreateSessionWithImport initializes a new session and imports historical events into its store.
+func (sm *SessionManager) CreateSessionWithImport(ctx context.Context, title string, importPath string, importID string) (*Session, error) {
+	sm.mu.Lock()
+	id := fmt.Sprintf("session-%d", time.Now().UnixNano())
+	if title == "" {
+		title = fmt.Sprintf("Session %d", len(sm.sessions)+1)
+	}
+
+	cfg := sm.baseCfg
+	if cfg.StorageDir == "" {
+		cfg.StorageDir = golem.DefaultConfig().StorageDir
+	}
+	cfg.StorageDir = filepath.Join(cfg.StorageDir, id)
+
+	agentInstance, err := golem.New(ctx, cfg)
+	if err != nil {
+		sm.mu.Unlock()
+		return nil, errors.Wrap(err, "initializing agent for session")
+	}
+
+	sessCtx, cancel := context.WithCancel(context.Background())
+	sess := &Session{
+		ID:        id,
+		Title:     title,
+		Agent:     agentInstance,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+		ctx:       sessCtx,
+		cancel:    cancel,
+	}
+
+	// Import history BEFORE attaching real-time WebSocket broadcast listener
+	// to avoid flooding the WebSocket hub and disconnecting clients
+	if importPath != "" {
+		count, impErr := importer.ImportFileOrDir(importPath, sess.Agent.Store(), importID)
+		if impErr != nil {
+			sm.mu.Unlock()
+			cancel()
+			_ = agentInstance.Close()
+			return nil, errors.Wrap(impErr, "importing historical events")
+		}
+		if count > 0 {
+			sess.UpdatedAt = time.Now().UTC()
+		}
+	}
+
+	// Now attach the reactive OnEvent listener for subsequent turns
+	sessID := id
+	agentInstance.Store().OnEvent(func(ev fractal.Event) {
+		_ = sm.hub.Broadcast(WSEventMemoryAdded, sessID, map[string]any{
+			"id":        ev.ID,
+			"kind":      ev.Kind,
+			"text":      ev.Text,
+			"timestamp": ev.Timestamp,
+		})
+	})
+
+	sm.sessions[id] = sess
+	if sm.activeID == "" {
+		sm.activeID = id
+	}
+	sm.mu.Unlock()
+
+	_ = sm.hub.Broadcast(WSEventSessionCreated, id, SessionInfo{
+		ID:        id,
+		Title:     title,
+		CreatedAt: sess.CreatedAt,
+		UpdatedAt: sess.UpdatedAt,
+		IsActive:  sm.activeID == id,
+		TurnCount: sess.Agent.Store().CountEvents(),
 	})
 
 	return sess, nil

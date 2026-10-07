@@ -3,14 +3,18 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/user/golem/pkg/golem"
+	"github.com/user/golem/pkg/importer"
 	"github.com/user/golem/pkg/memory/fractal"
 )
 
@@ -196,4 +200,98 @@ func TestHub_ClientQueueSaturation(t *testing.T) {
 
 	// Hub should gracefully handle saturation without crashing or hanging
 	time.Sleep(50 * time.Millisecond)
+}
+
+func TestImporterEndpoints(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "golem-test-server-import-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create dummy AGY brain session
+	t.Setenv("AGY_BRAIN_DIR", tempDir)
+	convDir := filepath.Join(tempDir, "conv-srv", ".system_generated", "logs")
+	_ = os.MkdirAll(convDir, 0755)
+	_ = os.WriteFile(filepath.Join(convDir, "transcript.jsonl"), []byte(`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-10-05T15:46:40Z","content":"<USER_REQUEST>\nServer import test\n</USER_REQUEST>"}`+"\n"), 0644)
+
+	baseCfg := golem.Config{
+		WorkspaceDir: tempDir,
+		StorageDir:   filepath.Join(tempDir, "sessions"),
+		ModelName:    "gemini-flash-latest",
+	}
+
+	srv := NewServer(ServerConfig{
+		Port:         0,
+		BaseAgentCfg: baseCfg,
+	})
+	testServer := httptest.NewServer(srv.httpServer.Handler)
+	defer testServer.Close()
+
+	client := testServer.Client()
+
+	// 1. GET /api/importer/discover
+	resp, err := client.Get(testServer.URL + "/api/importer/discover")
+	if err != nil {
+		t.Fatalf("GET /api/importer/discover failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	var discovered []importer.DiscoveredSession
+	if err := json.NewDecoder(resp.Body).Decode(&discovered); err != nil {
+		t.Fatalf("decode discover response failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if len(discovered) == 0 {
+		t.Fatalf("expected at least 1 discovered session, got 0")
+	}
+
+	// 2. POST /api/importer/import
+	importBody := fmt.Sprintf(`{"path":%q,"title":"Imported Server Test"}`, filepath.Join(tempDir, "conv-srv"))
+	resp, err = client.Post(testServer.URL+"/api/importer/import", "application/json", strings.NewReader(importBody))
+	if err != nil {
+		t.Fatalf("POST /api/importer/import failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d", resp.StatusCode)
+	}
+
+	var sess SessionInfo
+	if err := json.NewDecoder(resp.Body).Decode(&sess); err != nil {
+		t.Fatalf("decode import response failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if sess.Title != "Imported Server Test" {
+		t.Errorf("expected session title 'Imported Server Test', got %q", sess.Title)
+	}
+	if sess.TurnCount != 1 {
+		t.Errorf("expected TurnCount=1 from imported event, got %d", sess.TurnCount)
+	}
+	if !sess.IsActive {
+		t.Errorf("expected IsActive=true for newly imported session")
+	}
+
+	// 3. Security test: Forbidden path outside workspace/allowed roots
+	resp, err = client.Post(testServer.URL+"/api/importer/import", "application/json", strings.NewReader(`{"path":"/etc/passwd"}`))
+	if err != nil {
+		t.Fatalf("POST forbidden path failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for /etc/passwd, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 4. Security test: Nonexistent path
+	resp, err = client.Post(testServer.URL+"/api/importer/import", "application/json", strings.NewReader(`{"path":"/nonexistent/file/path"}`))
+	if err != nil {
+		t.Fatalf("POST nonexistent path failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for nonexistent path, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
 }

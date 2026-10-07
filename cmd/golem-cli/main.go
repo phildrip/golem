@@ -35,6 +35,7 @@ type CLIOptions struct {
 	TUI        bool
 	Serve      bool
 	WebPort    int
+	Import     string
 }
 
 // AgentProcessor defines the interface for executing agent turns.
@@ -57,6 +58,7 @@ func parseFlags(args []string) (CLIOptions, error) {
 	serveFlag := fs.Bool("serve", false, "Launch realtime Web UI multiplexer server")
 	webFlag := fs.Bool("web", false, "Launch realtime Web UI multiplexer server (alias for -serve)")
 	portFlag := fs.Int("port", 8080, "Port for realtime Web UI server (default: 8080)")
+	importFlag := fs.String("import", "", "Import past chat history: 'pick' (interactive), 'latest', or path/UUID")
 
 	if err := fs.Parse(args); err != nil {
 		return CLIOptions{}, err
@@ -74,6 +76,7 @@ func parseFlags(args []string) (CLIOptions, error) {
 		TUI:        *tuiFlag,
 		Serve:      *serveFlag || *webFlag,
 		WebPort:    *portFlag,
+		Import:     *importFlag,
 	}, nil
 }
 
@@ -276,6 +279,14 @@ func main() {
 		log.Fatalf("Failed to initialize Golem agent: %v", err)
 	}
 	defer agentInstance.Close()
+
+	if opts.Import != "" {
+		cwd, _ := os.Getwd()
+		_, err := HandleImportOption(opts.Import, agentInstance.Store(), cwd, os.Stdin, os.Stdout)
+		if err != nil {
+			log.Fatalf("Import error: %v", err)
+		}
+	}
 
 	if !useTUI {
 		mcpToolsets := agentInstance.MCPToolsets()

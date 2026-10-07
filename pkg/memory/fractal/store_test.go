@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestNodeAddress(t *testing.T) {
@@ -259,5 +260,67 @@ func TestParseAddressErrors(t *testing.T) {
 				t.Errorf("expected error for id=%d, n=%d, got nil", tc.id, tc.n)
 			}
 		})
+	}
+}
+
+func TestAppendEventOptsTimestamp(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "golem-test-opts-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	store, err := OpenStore(tempDir)
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Append with default options -> should be roughly now
+	before := time.Now().UTC().Add(-time.Second)
+	evDefault, err := store.AppendEvent(KindUser, "default time")
+	if err != nil {
+		t.Fatalf("AppendEvent failed: %v", err)
+	}
+	after := time.Now().UTC().Add(time.Second)
+	if evDefault.Timestamp.Before(before) || evDefault.Timestamp.After(after) {
+		t.Errorf("expected default timestamp around now, got %v", evDefault.Timestamp)
+	}
+
+	// 2. Append with historical timestamp in AppendEventOpts
+	historicalTime := time.Date(2025, 4, 15, 10, 30, 0, 0, time.UTC)
+	evHistorical, err := store.AppendEvent(KindTalk, "historical answer", AppendEventOpts{
+		Timestamp: historicalTime,
+	})
+	if err != nil {
+		t.Fatalf("AppendEvent with opts failed: %v", err)
+	}
+	if !evHistorical.Timestamp.Equal(historicalTime) {
+		t.Errorf("expected historical timestamp %v, got %v", historicalTime, evHistorical.Timestamp)
+	}
+
+	// 3. Verify retrieval from memory and bbolt
+	retrieved, ok := store.GetEvent(evHistorical.ID)
+	if !ok {
+		t.Fatalf("GetEvent(%d) failed", evHistorical.ID)
+	}
+	if !retrieved.Timestamp.Equal(historicalTime) {
+		t.Errorf("retrieved event timestamp mismatch: expected %v, got %v", historicalTime, retrieved.Timestamp)
+	}
+
+	// 4. Verify persistence across store re-open
+	store.Close()
+	store2, err := OpenStore(tempDir)
+	if err != nil {
+		t.Fatalf("OpenStore re-open failed: %v", err)
+	}
+	defer store2.Close()
+
+	retrieved2, ok := store2.GetEvent(evHistorical.ID)
+	if !ok {
+		t.Fatalf("GetEvent after reopen failed")
+	}
+	if !retrieved2.Timestamp.Equal(historicalTime) {
+		t.Errorf("reopened event timestamp mismatch: expected %v, got %v", historicalTime, retrieved2.Timestamp)
 	}
 }

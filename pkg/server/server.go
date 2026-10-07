@@ -7,11 +7,13 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/user/golem/pkg/golem"
+	"github.com/user/golem/pkg/importer"
 	"github.com/user/golem/pkg/tools"
 )
 
@@ -82,6 +84,97 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// WebSocket endpoint
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		s.hub.HandleWS(w, r)
+	})
+
+	// History discovery & import endpoints
+	mux.HandleFunc("/api/importer/discover", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ws := r.URL.Query().Get("workspace")
+		if ws == "" {
+			ws = s.cfg.BaseAgentCfg.WorkspaceDir
+		}
+		if ws == "" {
+			ws, _ = os.Getwd()
+		}
+		sessions, err := importer.DiscoverHistories(ws)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if sessions == nil {
+			sessions = []importer.DiscoveredSession{}
+		}
+		writeJSON(w, http.StatusOK, sessions)
+	})
+
+	mux.HandleFunc("/api/importer/import", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var req struct {
+			Path  string `json:"path"`
+			ID    string `json:"id,omitempty"`
+			Title string `json:"title,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if req.Path == "" {
+			writeError(w, http.StatusBadRequest, "path is required")
+			return
+		}
+		cleanPath := filepath.Clean(req.Path)
+		fi, err := os.Stat(cleanPath)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid import path: file not found or inaccessible")
+			return
+		}
+		if !fi.Mode().IsRegular() && !fi.IsDir() {
+			writeError(w, http.StatusBadRequest, "path must be a regular file or directory")
+			return
+		}
+
+		// Ensure cleanPath resides within permitted roots: workspace, AGY brain dir, or Cursor workspaceStorage
+		allowedRoots := []string{
+			filepath.Clean(s.cfg.BaseAgentCfg.WorkspaceDir),
+			filepath.Clean(importer.DefaultAGYBrainDir()),
+			filepath.Clean(importer.DefaultCursorWorkspaceStorageDir()),
+		}
+		allowed := false
+		for _, root := range allowedRoots {
+			if root != "" && (cleanPath == root || strings.HasPrefix(cleanPath, root+string(filepath.Separator))) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			writeError(w, http.StatusForbidden, "import path is outside permitted workspace and history directories")
+			return
+		}
+
+		sess, err := s.sessions.CreateSessionWithImport(r.Context(), req.Title, cleanPath, req.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		// Ensure the newly imported session is activated on the backend
+		s.sessions.SetActiveSession(sess.ID)
+
+		writeJSON(w, http.StatusCreated, SessionInfo{
+			ID:        sess.ID,
+			Title:     sess.Title,
+			CreatedAt: sess.CreatedAt,
+			UpdatedAt: sess.UpdatedAt,
+			IsActive:  true,
+			TurnCount: sess.Agent.Store().CountEvents(),
+		})
 	})
 
 	// REST Session endpoints

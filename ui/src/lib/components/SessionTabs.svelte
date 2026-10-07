@@ -9,9 +9,10 @@
 		onSelect: (id: string) => void;
 		onCreate: () => void;
 		onClose: (id: string) => void;
+		onOpenImport?: () => void;
 	}
 
-	let { sessions, activeId, onSelect, onCreate, onClose }: Props = $props();
+	let { sessions, activeId, onSelect, onCreate, onClose, onOpenImport }: Props = $props();
 </script>
 
 <div class="flex items-center h-10 bg-[#090d16] border-b border-slate-800/80 px-2 gap-1 overflow-x-auto select-none no-scrollbar">
@@ -59,4 +60,16 @@
 		<Plus class="w-3.5 h-3.5" />
 		<span>New</span>
 	</button>
+
+	{#if onOpenImport}
+		<button
+			type="button"
+			onclick={onOpenImport}
+			class="flex items-center gap-1.5 h-7 px-2.5 text-xs font-medium text-emerald-400 hover:text-emerald-300 hover:bg-emerald-950/30 rounded-md transition-colors border border-emerald-900/60 hover:border-emerald-800/80 ml-1"
+			title="Import chat history from AGY or Cursor"
+		>
+			<Cpu class="w-3.5 h-3.5 text-emerald-400" />
+			<span>Import</span>
+		</button>
+	{/if}
 </div>

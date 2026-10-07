@@ -102,3 +102,26 @@ class RealtimeClient {
 }
 
 export const realtime = new RealtimeClient();
+
+export async function discoverHistories(workspace?: string): Promise<import('./types').DiscoveredSession[]> {
+	const query = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
+	const res = await fetch(`/api/importer/discover${query}`);
+	if (!res.ok) {
+		const errObj = await res.json().catch(() => null);
+		throw new Error(errObj?.error || res.statusText || 'Failed to discover histories');
+	}
+	return res.json();
+}
+
+export async function importSession(path: string, id?: string, title?: string): Promise<import('./types').SessionInfo> {
+	const res = await fetch('/api/importer/import', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ path, id, title })
+	});
+	if (!res.ok) {
+		const errObj = await res.json().catch(() => null);
+		throw new Error(errObj?.error || res.statusText || 'Failed to import session');
+	}
+	return res.json();
+}
