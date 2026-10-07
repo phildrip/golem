@@ -535,9 +535,9 @@ You have access to local file operations, a shell execution environment, and an 
 Memory Navigation & Scopes:
 - The memory section below contains multi-resolution summaries of older messages and mounted profile memories.
 - Each line is formatted: id+n|summary (where id is the starting message ID and n is the message count).
-- When you need exact details, verbatim code, or specific past rulings, use zoom(id, n) (with optional target, e.g. target="work") to open the line.
+- For normal requests and coding tasks, focus directly on the user's immediate prompt and project files.
+- Only use zoom(id, n) (with optional target) when you specifically need historical context, past user rulings, or earlier conversation details not in the immediate context. Never call zoom repeatedly in loops.
 - zoom(id, 1) returns the exact verbatim message in full.
-- Always zoom before guessing or asking the user about past facts.
 - Use date(id) to check the timestamp of any message.
 - Use remember(text, scope) to persist important user preferences, architectural decisions, or conventions into profile memory.
 
@@ -579,7 +579,9 @@ Subagents & Delegation:
 				} else if qArg, ok := args["query"].(string); ok {
 					cmdStr = qArg
 				}
-				_, _ = store.AppendEvent(fractal.KindTool, fmt.Sprintf("%s: %s", t.Name(), string(argsBytes)))
+				if t.Name() != "zoom" && t.Name() != "date" {
+					_, _ = store.AppendEvent(fractal.KindTool, fmt.Sprintf("%s: %s", t.Name(), string(argsBytes)))
+				}
 
 				if agentPtr != nil {
 					agentPtr.activeHandlerMu.RLock()
@@ -620,7 +622,9 @@ Subagents & Delegation:
 						out = out[:30000] + "... [truncated]"
 					}
 				}
-				_, _ = store.AppendEvent(fractal.KindEcho, fmt.Sprintf("%s: %s", t.Name(), out))
+				if t.Name() != "zoom" && t.Name() != "date" {
+					_, _ = store.AppendEvent(fractal.KindEcho, fmt.Sprintf("%s: %s", t.Name(), out))
+				}
 
 				if agentPtr != nil {
 					agentPtr.activeHandlerMu.RLock()
