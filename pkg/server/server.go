@@ -9,9 +9,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/pkg/errors"
+	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/importer"
 	"github.com/user/golem/pkg/tools"
@@ -26,10 +30,42 @@ type ServerConfig struct {
 
 // Server provides REST APIs, WebSocket streaming, and SPA hosting.
 type Server struct {
+	cfgMu      sync.RWMutex
+	configMu   sync.Mutex
 	cfg        ServerConfig
 	hub        *Hub
 	sessions   *SessionManager
 	httpServer *http.Server
+}
+
+var profileNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]{1,64}$`)
+
+func validateProfileName(name string) error {
+	if !profileNameRegex.MatchString(name) {
+		return errors.New("profile name must be 1-64 characters (letters, numbers, underscores, dashes, periods)")
+	}
+	if name == "active" || name == "." || name == ".." {
+		return fmt.Errorf("profile name %q is reserved", name)
+	}
+	return nil
+}
+
+func (s *Server) BaseAgentCfg() golem.Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.BaseAgentCfg
+}
+
+func (s *Server) WorkspaceDir() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.BaseAgentCfg.WorkspaceDir
+}
+
+func (s *Server) SetBaseAgentCfg(cfg golem.Config) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.cfg.BaseAgentCfg = cfg
 }
 
 // NewServer initializes a new Server.
@@ -94,7 +130,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		}
 		ws := r.URL.Query().Get("workspace")
 		if ws == "" {
-			ws = s.cfg.BaseAgentCfg.WorkspaceDir
+			ws = s.WorkspaceDir()
 		}
 		if ws == "" {
 			ws, _ = os.Getwd()
@@ -142,7 +178,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 		// Ensure cleanPath resides within permitted roots: workspace, AGY brain dir, or Cursor workspaceStorage
 		allowedRoots := []string{
-			filepath.Clean(s.cfg.BaseAgentCfg.WorkspaceDir),
+			filepath.Clean(s.WorkspaceDir()),
 			filepath.Clean(importer.DefaultAGYBrainDir()),
 			filepath.Clean(importer.DefaultCursorWorkspaceStorageDir()),
 		}
@@ -316,12 +352,48 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 			return
 		}
 
-		res, err := tools.PatchFileWithHashline(s.cfg.BaseAgentCfg.WorkspaceDir, cleanTarget, req.Op, req.Anchor, req.Content, req.DryRun)
+		res, err := tools.PatchFileWithHashline(s.WorkspaceDir(), cleanTarget, req.Op, req.Anchor, req.Content, req.DryRun)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, res)
+	})
+
+	// Profile management endpoints
+	mux.HandleFunc("/api/profiles", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			s.handleGetProfiles(w, r)
+		case http.MethodPost:
+			s.handleSaveProfile(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/api/profiles/", func(w http.ResponseWriter, r *http.Request) {
+		subpath := strings.TrimPrefix(r.URL.Path, "/api/profiles/")
+		if subpath == "active" {
+			if r.Method == http.MethodPost {
+				s.handleSetActiveProfile(w, r)
+				return
+			}
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		profileName := subpath
+		if profileName == "" {
+			http.NotFound(w, r)
+			return
+		}
+
+		if r.Method == http.MethodDelete {
+			s.handleDeleteProfile(w, r, profileName)
+			return
+		}
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
 
 	// Embedded UI SPA or placeholder static file handler
@@ -383,4 +455,378 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+const maskedSecret = "••••••••"
+
+var allowedProviders = map[string]bool{
+	"gemini":     true,
+	"opencode":   true,
+	"openai":     true,
+	"openrouter": true,
+}
+
+func sanitizeProfiles(profs map[string]config.ProfileConfig) map[string]config.ProfileConfig {
+	out := make(map[string]config.ProfileConfig, len(profs))
+	for k, v := range profs {
+		copyProf := v
+		if copyProf.APIKey != "" {
+			copyProf.APIKey = maskedSecret
+		}
+		if copyProf.Compactor != nil {
+			compCopy := *copyProf.Compactor
+			if compCopy.APIKey != "" {
+				compCopy.APIKey = maskedSecret
+			}
+			copyProf.Compactor = &compCopy
+		}
+		out[k] = copyProf
+	}
+	return out
+}
+
+func (s *Server) resolveProfileConfigPaths() (userPath string, wsPath string) {
+	userPath, _ = config.DefaultPath()
+	wsDir := s.WorkspaceDir()
+	if wsDir == "" {
+		wsDir, _ = os.Getwd()
+	}
+	if wsDir != "" {
+		wsPath = filepath.Join(config.WorkspaceDir(wsDir), "config.json")
+	}
+	return userPath, wsPath
+}
+
+func (s *Server) getProfilesResponse() (ProfilesResponse, error) {
+	userPath, wsPath := s.resolveProfileConfigPaths()
+	wsDir := s.WorkspaceDir()
+	if wsDir == "" {
+		wsDir, _ = os.Getwd()
+	}
+
+	merged, err := config.LoadAll(wsDir, "")
+	if err != nil {
+		return ProfilesResponse{}, err
+	}
+
+	activeName := merged.ActiveProfile
+	if activeName == "" {
+		activeName = "default"
+	}
+
+	profs := merged.Profiles
+	if profs == nil {
+		profs = make(map[string]config.ProfileConfig)
+	}
+
+	return ProfilesResponse{
+		ActiveProfile:       activeName,
+		Profiles:            sanitizeProfiles(profs),
+		UserConfigPath:      userPath,
+		WorkspaceConfigPath: wsPath,
+	}, nil
+}
+
+func (s *Server) handleGetProfiles(w http.ResponseWriter, r *http.Request) {
+	resp, err := s.getProfilesResponse()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleSaveProfile(w http.ResponseWriter, r *http.Request) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req SaveProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	if err := validateProfileName(req.Name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if req.Provider != "" && !allowedProviders[strings.ToLower(req.Provider)] {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported provider %q (allowed: gemini, opencode, openai, openrouter)", req.Provider))
+		return
+	}
+	if req.Compactor != nil && req.Compactor.Provider != "" && !allowedProviders[strings.ToLower(req.Compactor.Provider)] {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported compactor provider %q", req.Compactor.Provider))
+		return
+	}
+
+	userPath, wsPath := s.resolveProfileConfigPaths()
+	targetPath := wsPath
+	if req.Scope == "user" || (targetPath == "" && userPath != "") {
+		targetPath = userPath
+	} else if targetPath == "" {
+		targetPath = userPath
+	}
+
+	targetCfg, err := config.Load(targetPath)
+	if err != nil {
+		targetCfg = config.FileConfig{}
+	}
+	if targetCfg.Profiles == nil {
+		targetCfg.Profiles = make(map[string]config.ProfileConfig)
+	}
+
+	wsDir := s.WorkspaceDir()
+	if wsDir == "" {
+		wsDir, _ = os.Getwd()
+	}
+	merged, _ := config.LoadAll(wsDir, "")
+
+	// Preserve existing API key if masked
+	apiKey := req.APIKey
+	if apiKey == maskedSecret {
+		if existing, exists := targetCfg.Profiles[req.Name]; exists && existing.APIKey != "" {
+			apiKey = existing.APIKey
+		} else if existing, exists := merged.Profiles[req.Name]; exists && existing.APIKey != "" {
+			apiKey = existing.APIKey
+		} else {
+			apiKey = ""
+		}
+	}
+
+	compactorCfg := req.Compactor
+	if compactorCfg != nil && compactorCfg.APIKey == maskedSecret {
+		compCopy := *compactorCfg
+		if existing, exists := targetCfg.Profiles[req.Name]; exists && existing.Compactor != nil && existing.Compactor.APIKey != "" {
+			compCopy.APIKey = existing.Compactor.APIKey
+		} else if existing, exists := merged.Profiles[req.Name]; exists && existing.Compactor != nil && existing.Compactor.APIKey != "" {
+			compCopy.APIKey = existing.Compactor.APIKey
+		} else {
+			compCopy.APIKey = ""
+		}
+		compactorCfg = &compCopy
+	}
+
+	prof := config.ProfileConfig{
+		Provider:  req.Provider,
+		Model:     req.Model,
+		BaseURL:   req.BaseURL,
+		APIKey:    apiKey,
+		APIKeyEnv: req.APIKeyEnv,
+		MemoryDir: req.MemoryDir,
+		Compactor: compactorCfg,
+	}
+
+	targetCfg.Profiles[req.Name] = prof
+	if req.SetActive {
+		targetCfg.ActiveProfile = req.Name
+	}
+
+	if err := config.Save(targetPath, targetCfg); err != nil {
+		writeError(w, http.StatusInternalServerError, errors.Wrap(err, "saving profile configuration").Error())
+		return
+	}
+
+	merged, _ = config.LoadAll(wsDir, "")
+	base := s.BaseAgentCfg()
+	base.FileConfig = merged
+	s.SetBaseAgentCfg(base)
+
+	if req.SetActive {
+		s.applyActiveProfile(r.Context(), req.Name, merged)
+	}
+
+	resp, err := s.getProfilesResponse()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	_ = s.hub.Broadcast(WSEventProfileChanged, "", resp)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleSetActiveProfile(w http.ResponseWriter, r *http.Request) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req SetActiveProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	if err := validateProfileName(req.Name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	wsDir := s.WorkspaceDir()
+	if wsDir == "" {
+		wsDir, _ = os.Getwd()
+	}
+	mergedCheck, _ := config.LoadAll(wsDir, "")
+	if req.Name != "default" {
+		if _, exists := mergedCheck.Profiles[req.Name]; !exists {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("profile %q does not exist", req.Name))
+			return
+		}
+	}
+
+	userPath, wsPath := s.resolveProfileConfigPaths()
+	targetPath := wsPath
+	if req.Scope == "user" || (targetPath == "" && userPath != "") {
+		targetPath = userPath
+	} else if targetPath == "" {
+		targetPath = userPath
+	}
+
+	targetCfg, err := config.Load(targetPath)
+	if err != nil {
+		targetCfg = config.FileConfig{}
+	}
+	targetCfg.ActiveProfile = req.Name
+
+	if err := config.Save(targetPath, targetCfg); err != nil {
+		writeError(w, http.StatusInternalServerError, errors.Wrap(err, "saving active profile").Error())
+		return
+	}
+
+	merged, _ := config.LoadAll(wsDir, "")
+	base := s.BaseAgentCfg()
+	base.FileConfig = merged
+	s.SetBaseAgentCfg(base)
+
+	s.applyActiveProfile(r.Context(), req.Name, merged)
+
+	resp, err := s.getProfilesResponse()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	_ = s.hub.Broadcast(WSEventProfileChanged, "", resp)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func deleteProfileFromPath(filePath, profileName string) bool {
+	cfg, err := config.Load(filePath)
+	if err != nil || cfg.Profiles == nil {
+		return false
+	}
+	if _, exists := cfg.Profiles[profileName]; !exists {
+		return false
+	}
+	delete(cfg.Profiles, profileName)
+	if cfg.ActiveProfile == profileName {
+		cfg.ActiveProfile = ""
+	}
+	_ = config.Save(filePath, cfg)
+	return true
+}
+
+func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request, profileName string) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	if err := validateProfileName(profileName); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	wsDir := s.WorkspaceDir()
+	if wsDir == "" {
+		wsDir, _ = os.Getwd()
+	}
+	merged, _ := config.LoadAll(wsDir, "")
+	if merged.ActiveProfile == profileName || (merged.ActiveProfile == "" && profileName == "default") {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("cannot delete currently active profile %q; switch to another profile first", profileName))
+		return
+	}
+
+	scope := r.URL.Query().Get("scope")
+	userPath, wsPath := s.resolveProfileConfigPaths()
+
+	deleted := false
+	if scope == "workspace" {
+		if wsPath != "" {
+			deleted = deleteProfileFromPath(wsPath, profileName)
+		}
+	} else if scope == "user" {
+		if userPath != "" {
+			deleted = deleteProfileFromPath(userPath, profileName)
+		}
+	} else {
+		if wsPath != "" && deleteProfileFromPath(wsPath, profileName) {
+			deleted = true
+		} else if userPath != "" && deleteProfileFromPath(userPath, profileName) {
+			deleted = true
+		}
+	}
+
+	if !deleted {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("profile %q not found", profileName))
+		return
+	}
+
+	merged, _ = config.LoadAll(wsDir, "")
+	base := s.BaseAgentCfg()
+	base.FileConfig = merged
+	s.SetBaseAgentCfg(base)
+
+	resp, err := s.getProfilesResponse()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	_ = s.hub.Broadcast(WSEventProfileChanged, "", resp)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) applyActiveProfile(ctx context.Context, profileName string, fileCfg config.FileConfig) {
+	name, prof := config.ResolveActiveProfile(profileName, fileCfg)
+	appliedFileCfg := fileCfg.ApplyProfile(name, prof)
+
+	base := s.BaseAgentCfg()
+	base.Profile = name
+	base.FileConfig = appliedFileCfg
+	if prof.Provider != "" {
+		base.Provider = prof.Provider
+	}
+	if prof.Model != "" {
+		base.ModelName = prof.Model
+	}
+	if prof.BaseURL != "" {
+		base.BaseURL = prof.BaseURL
+	}
+	if prof.APIKey != "" {
+		base.APIKey = prof.APIKey
+	}
+	if prof.Compactor != nil {
+		if prof.Compactor.Model != "" {
+			base.CompactorModel = prof.Compactor.Model
+		}
+		if prof.Compactor.Provider != "" {
+			base.CompactorProvider = prof.Compactor.Provider
+		}
+		if prof.Compactor.BaseURL != "" {
+			base.CompactorBaseURL = prof.Compactor.BaseURL
+		}
+		if prof.Compactor.APIKey != "" {
+			base.CompactorAPIKey = prof.Compactor.APIKey
+		}
+	}
+	s.SetBaseAgentCfg(base)
+	s.sessions.UpdateBaseConfig(base)
+
+	if activeSess, ok := s.sessions.ActiveSession(); ok && activeSess.Agent != nil {
+		activeSess.mu.Lock()
+		defer activeSess.mu.Unlock()
+		_, _ = activeSess.Agent.SwitchProfile(ctx, name)
+	}
 }

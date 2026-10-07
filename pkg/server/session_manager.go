@@ -236,6 +236,24 @@ func (sm *SessionManager) SetActiveSession(id string) bool {
 	return true
 }
 
+// ActiveSession returns the current active session, if any.
+func (sm *SessionManager) ActiveSession() (*Session, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if sm.activeID == "" {
+		return nil, false
+	}
+	sess, ok := sm.sessions[sm.activeID]
+	return sess, ok
+}
+
+// UpdateBaseConfig updates the base configuration for future sessions.
+func (sm *SessionManager) UpdateBaseConfig(cfg golem.Config) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.baseCfg = cfg
+}
+
 // DeleteSession closes and removes a session.
 func (sm *SessionManager) DeleteSession(id string) error {
 	sm.mu.Lock()

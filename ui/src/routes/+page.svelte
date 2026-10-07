@@ -8,7 +8,8 @@
 	import MemoryExplorer from '$lib/components/MemoryExplorer.svelte';
 	import PatchInspector from '$lib/components/PatchInspector.svelte';
 	import ImportModal from '$lib/components/ImportModal.svelte';
-	import { realtime } from '$lib/client';
+	import ProfileModal from '$lib/components/ProfileModal.svelte';
+	import { realtime, getProfiles } from '$lib/client';
 	import {
 		sessions,
 		activeSessionId,
@@ -18,9 +19,13 @@
 		patches,
 		swarmMessages,
 		isGenerating,
-		serverConnected
+		serverConnected,
+		activeProfile,
+		profilesList,
+		userConfigPath,
+		workspaceConfigPath
 	} from '$lib/stores';
-	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal, SwarmMessage } from '$lib/types';
+	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal, SwarmMessage, ProfilesResponse } from '$lib/types';
 
 	let activeSession = $derived(
 		$sessions.find((s) => s.id === $activeSessionId) || null
@@ -53,6 +58,7 @@
 	let showMemoryExplorer = $state(false);
 	let showPatchInspector = $state(false);
 	let showImportModal = $state(false);
+	let showProfileModal = $state(false);
 
 	let unsubscribeWS: (() => void) | null = null;
 
@@ -75,12 +81,25 @@
 		});
 
 		fetchSessions();
+		fetchProfiles();
 	});
 
 	onDestroy(() => {
 		if (unsubscribeWS) unsubscribeWS();
 		realtime.disconnect();
 	});
+
+	async function fetchProfiles() {
+		try {
+			const res = await getProfiles();
+			$activeProfile = res.active_profile || 'default';
+			$profilesList = res.profiles || {};
+			$userConfigPath = res.user_config_path || '';
+			$workspaceConfigPath = res.workspace_config_path || '';
+		} catch {
+			// ignore
+		}
+	}
 
 	async function fetchSessions() {
 		try {
@@ -376,6 +395,13 @@
 				$swarmMessages = { ...$swarmMessages, [sessId]: [...current, payload] };
 				break;
 			}
+
+			case 'profile_changed': {
+				const payload = event.payload as ProfilesResponse;
+				if (payload.active_profile) $activeProfile = payload.active_profile;
+				if (payload.profiles) $profilesList = payload.profiles;
+				break;
+			}
 		}
 	}
 </script>
@@ -395,6 +421,17 @@
 
 		<!-- Status & Indicators -->
 		<div class="flex items-center gap-2">
+			<!-- Profile Settings Button -->
+			<button
+				type="button"
+				onclick={() => (showProfileModal = true)}
+				class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-purple-300 font-medium transition-colors"
+				title="Manage models, providers, and profiles"
+			>
+				<Settings class="w-3.5 h-3.5 text-purple-400" />
+				<span class="font-mono text-[11px]">{$activeProfile || 'default'}</span>
+			</button>
+
 			<!-- Fractal Memory Toggle -->
 			<button
 				type="button"
@@ -504,5 +541,11 @@
 		open={showImportModal}
 		onClose={() => (showImportModal = false)}
 		onImported={handleSessionImported}
+	/>
+
+	<!-- Profile Settings Modal -->
+	<ProfileModal
+		open={showProfileModal}
+		onClose={() => (showProfileModal = false)}
 	/>
 </div>

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/importer"
 	"github.com/user/golem/pkg/memory/fractal"
@@ -294,4 +296,229 @@ func TestImporterEndpoints(t *testing.T) {
 		t.Errorf("expected 400 Bad Request for nonexistent path, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
+}
+
+func TestProfileEndpoints(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "golem-test-server-profiles-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	t.Setenv("GOLEM_CONFIG_DIR", filepath.Join(tempDir, "user_golem"))
+
+	baseCfg := golem.Config{
+		WorkspaceDir: tempDir,
+		StorageDir:   filepath.Join(tempDir, "sessions"),
+		ModelName:    "gemini-flash-latest",
+	}
+
+	srv := NewServer(ServerConfig{
+		Port:         0,
+		BaseAgentCfg: baseCfg,
+	})
+	testServer := httptest.NewServer(srv.httpServer.Handler)
+	defer testServer.Close()
+
+	client := testServer.Client()
+
+	// 1. GET /api/profiles
+	resp, err := client.Get(testServer.URL + "/api/profiles")
+	if err != nil {
+		t.Fatalf("GET /api/profiles failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+	var getResp ProfilesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&getResp); err != nil {
+		t.Fatalf("decode GET /api/profiles failed: %v", err)
+	}
+	resp.Body.Close()
+
+	// 2. POST /api/profiles (create 'fast' profile, set active)
+	saveReq := SaveProfileRequest{
+		Name:      "fast",
+		Scope:     "workspace",
+		Provider:  "gemini",
+		Model:     "gemini-2.5-flash",
+		SetActive: true,
+		Compactor: &config.CompactorConfig{
+			Provider: "gemini",
+			Model:    "gemini-2.5-flash",
+		},
+	}
+	reqBytes, _ := json.Marshal(saveReq)
+	resp, err = client.Post(testServer.URL+"/api/profiles", "application/json", bytes.NewReader(reqBytes))
+	if err != nil {
+		t.Fatalf("POST /api/profiles failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+	var postResp ProfilesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&postResp); err != nil {
+		t.Fatalf("decode POST /api/profiles failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if postResp.ActiveProfile != "fast" {
+		t.Errorf("expected active profile 'fast', got %q", postResp.ActiveProfile)
+	}
+	if _, ok := postResp.Profiles["fast"]; !ok {
+		t.Fatalf("expected 'fast' in profiles map")
+	}
+
+	// 3. POST /api/profiles (create 'coding' profile)
+	saveReq2 := SaveProfileRequest{
+		Name:      "coding",
+		Scope:     "workspace",
+		Provider:  "opencode",
+		Model:     "deepseek-chat",
+		SetActive: false,
+	}
+	reqBytes2, _ := json.Marshal(saveReq2)
+	resp, err = client.Post(testServer.URL+"/api/profiles", "application/json", bytes.NewReader(reqBytes2))
+	if err != nil {
+		t.Fatalf("POST /api/profiles (2) failed: %v", err)
+	}
+	resp.Body.Close()
+
+	// 4. POST /api/profiles/active (switch to 'coding')
+	switchReq := SetActiveProfileRequest{
+		Name:  "coding",
+		Scope: "workspace",
+	}
+	switchBytes, _ := json.Marshal(switchReq)
+	resp, err = client.Post(testServer.URL+"/api/profiles/active", "application/json", bytes.NewReader(switchBytes))
+	if err != nil {
+		t.Fatalf("POST /api/profiles/active failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+	var switchResp ProfilesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&switchResp); err != nil {
+		t.Fatalf("decode switch active failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if switchResp.ActiveProfile != "coding" {
+		t.Errorf("expected active profile 'coding', got %q", switchResp.ActiveProfile)
+	}
+
+	// 5. DELETE /api/profiles/fast
+	delReq, _ := http.NewRequest(http.MethodDelete, testServer.URL+"/api/profiles/fast", nil)
+	resp, err = client.Do(delReq)
+	if err != nil {
+		t.Fatalf("DELETE /api/profiles/fast failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+	var delResp ProfilesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&delResp); err != nil {
+		t.Fatalf("decode delete response failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if _, ok := delResp.Profiles["fast"]; ok {
+		t.Errorf("expected 'fast' to be removed from profiles")
+	}
+
+	// 6. DELETE active profile -> 400 Bad Request
+	badDelActive, _ := http.NewRequest(http.MethodDelete, testServer.URL+"/api/profiles/coding", nil)
+	resp, err = client.Do(badDelActive)
+	if err != nil {
+		t.Fatalf("DELETE active failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for deleting active profile, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 7. DELETE nonexistent profile -> 404
+	badDelReq, _ := http.NewRequest(http.MethodDelete, testServer.URL+"/api/profiles/does-not-exist", nil)
+	resp, err = client.Do(badDelReq)
+	if err != nil {
+		t.Fatalf("DELETE nonexistent failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 Not Found, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 8. POST with invalid profile name -> 400
+	invalidNameReq := SaveProfileRequest{
+		Name:     "../../evil",
+		Provider: "gemini",
+		Model:    "gemini-flash-latest",
+	}
+	b, _ := json.Marshal(invalidNameReq)
+	resp, err = client.Post(testServer.URL+"/api/profiles", "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("POST invalid name failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for invalid profile name, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 9. POST with unsupported provider -> 400
+	invalidProvReq := SaveProfileRequest{
+		Name:     "unsupported",
+		Provider: "fake-provider",
+		Model:    "test-model",
+	}
+	b, _ = json.Marshal(invalidProvReq)
+	resp, err = client.Post(testServer.URL+"/api/profiles", "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("POST unsupported provider failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for unsupported provider, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 10. API Key Masking & Unmasking roundtrip
+	secretReq := SaveProfileRequest{
+		Name:     "secret-prof",
+		Provider: "gemini",
+		Model:    "gemini-flash-latest",
+		APIKey:   "sk-real-super-secret-12345",
+	}
+	b, _ = json.Marshal(secretReq)
+	resp, err = client.Post(testServer.URL+"/api/profiles", "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("POST secret profile failed: %v", err)
+	}
+	var secretResp ProfilesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&secretResp); err != nil {
+		t.Fatalf("decode secret resp failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if secretResp.Profiles["secret-prof"].APIKey != "••••••••" {
+		t.Errorf("expected masked API key '••••••••', got %q", secretResp.Profiles["secret-prof"].APIKey)
+	}
+
+	// Update secret-prof with masked placeholder preserved
+	secretUpdateReq := SaveProfileRequest{
+		Name:     "secret-prof",
+		Provider: "gemini",
+		Model:    "gemini-2.5-pro",
+		APIKey:   "••••••••", // Send back placeholder
+	}
+	b, _ = json.Marshal(secretUpdateReq)
+	resp, err = client.Post(testServer.URL+"/api/profiles", "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("POST update secret profile failed: %v", err)
+	}
+	resp.Body.Close()
+
+	// Verify disk config actually kept the real key!
+	userCfg, _ := config.Load(filepath.Join(tempDir, ".golem", "config.json"))
+	if userCfg.Profiles["secret-prof"].APIKey != "sk-real-super-secret-12345" {
+		t.Errorf("expected real secret key on disk to be preserved, got %q", userCfg.Profiles["secret-prof"].APIKey)
+	}
 }

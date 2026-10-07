@@ -3,6 +3,8 @@ package server
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/user/golem/pkg/config"
 )
 
 // WSEventType distinguishes realtime WebSocket events streamed to UI clients.
@@ -36,6 +38,9 @@ const (
 	// Patch proposals
 	WSEventPatchProposed  WSEventType = "patch_proposed"
 	WSEventPatchApplied   WSEventType = "patch_applied"
+
+	// Profile configuration
+	WSEventProfileChanged WSEventType = "profile_changed"
 )
 
 // WSEvent is the standard JSON envelope transmitted over WebSockets.
@@ -73,4 +78,32 @@ type PatchRequest struct {
 	Anchor   string `json:"anchor"`
 	Content  string `json:"content,omitempty"`
 	DryRun   bool   `json:"dry_run,omitempty"`
+}
+
+// ProfilesResponse is the payload returned by GET /api/profiles.
+type ProfilesResponse struct {
+	ActiveProfile       string                          `json:"active_profile"`
+	Profiles            map[string]config.ProfileConfig `json:"profiles"`
+	UserConfigPath      string                          `json:"user_config_path,omitempty"`
+	WorkspaceConfigPath string                          `json:"workspace_config_path,omitempty"`
+}
+
+// SaveProfileRequest is the payload for creating or updating a profile.
+type SaveProfileRequest struct {
+	Name      string                  `json:"name"`
+	Scope     string                  `json:"scope,omitempty"` // "workspace" or "user"
+	Provider  string                  `json:"provider,omitempty"`
+	Model     string                  `json:"model,omitempty"`
+	BaseURL   string                  `json:"base_url,omitempty"`
+	APIKey    string                  `json:"api_key,omitempty"`
+	APIKeyEnv string                  `json:"api_key_env,omitempty"`
+	MemoryDir string                  `json:"memory_dir,omitempty"`
+	Compactor *config.CompactorConfig `json:"compactor,omitempty"`
+	SetActive bool                    `json:"set_active,omitempty"`
+}
+
+// SetActiveProfileRequest is the payload for switching the active profile.
+type SetActiveProfileRequest struct {
+	Name  string `json:"name"`
+	Scope string `json:"scope,omitempty"` // "workspace" or "user"
 }

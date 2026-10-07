@@ -106,3 +106,42 @@ export interface PatchProposal {
 	newLines?: string[];
 	status: 'pending' | 'applied' | 'rejected';
 }
+
+export interface CompactorConfig {
+	model?: string;
+	provider?: string;
+	base_url?: string;
+	api_key?: string;
+	api_key_env?: string;
+	target_bytes?: number;
+}
+
+export interface ProfileConfig {
+	provider?: string;
+	model?: string;
+	base_url?: string;
+	api_key?: string;
+	api_key_env?: string;
+	memory_dir?: string;
+	compactor?: CompactorConfig;
+}
+
+export interface ProfilesResponse {
+	active_profile: string;
+	profiles: Record<string, ProfileConfig>;
+	user_config_path?: string;
+	workspace_config_path?: string;
+}
+
+export interface SaveProfileRequest {
+	name: string;
+	scope?: 'workspace' | 'user';
+	provider?: string;
+	model?: string;
+	base_url?: string;
+	api_key?: string;
+	api_key_env?: string;
+	compactor?: CompactorConfig;
+	set_active?: boolean;
+}
+

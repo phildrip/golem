@@ -125,3 +125,51 @@ export async function importSession(path: string, id?: string, title?: string): 
 	}
 	return res.json();
 }
+
+export async function getProfiles(): Promise<import('./types').ProfilesResponse> {
+	const res = await fetch('/api/profiles');
+	if (!res.ok) {
+		const errObj = await res.json().catch(() => null);
+		throw new Error(errObj?.error || res.statusText || 'Failed to fetch profiles');
+	}
+	return res.json();
+}
+
+export async function saveProfile(req: import('./types').SaveProfileRequest): Promise<import('./types').ProfilesResponse> {
+	const res = await fetch('/api/profiles', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(req)
+	});
+	if (!res.ok) {
+		const errObj = await res.json().catch(() => null);
+		throw new Error(errObj?.error || res.statusText || 'Failed to save profile');
+	}
+	return res.json();
+}
+
+export async function setActiveProfile(name: string, scope?: string): Promise<import('./types').ProfilesResponse> {
+	const res = await fetch('/api/profiles/active', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ name, scope })
+	});
+	if (!res.ok) {
+		const errObj = await res.json().catch(() => null);
+		throw new Error(errObj?.error || res.statusText || 'Failed to activate profile');
+	}
+	return res.json();
+}
+
+export async function deleteProfile(name: string, scope?: string): Promise<import('./types').ProfilesResponse> {
+	const query = scope ? `?scope=${encodeURIComponent(scope)}` : '';
+	const res = await fetch(`/api/profiles/${encodeURIComponent(name)}${query}`, {
+		method: 'DELETE'
+	});
+	if (!res.ok) {
+		const errObj = await res.json().catch(() => null);
+		throw new Error(errObj?.error || res.statusText || 'Failed to delete profile');
+	}
+	return res.json();
+}
+

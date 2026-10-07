@@ -68,6 +68,25 @@ func NewModelFactoryWithConfig(cfg FactoryConfig) *ModelFactory {
 	}
 }
 
+// UpdateDefaults updates default model credentials when profiles switch.
+func (f *ModelFactory) UpdateDefaults(defaultModel, defaultProvider, defaultBaseURL, defaultAPIKey string, fileCfg config.FileConfig) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if defaultModel != "" {
+		f.defaultModel = defaultModel
+	}
+	if defaultProvider != "" {
+		f.defaultProvider = defaultProvider
+	}
+	if defaultBaseURL != "" {
+		f.defaultBaseURL = defaultBaseURL
+	}
+	if defaultAPIKey != "" {
+		f.defaultAPIKey = defaultAPIKey
+	}
+	f.fileCfg = fileCfg
+}
+
 // ResolveModelName normalizes requested model names and resolves aliases.
 func (f *ModelFactory) ResolveModelName(requested string) string {
 	clean := strings.ToLower(strings.TrimSpace(requested))

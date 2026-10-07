@@ -89,6 +89,32 @@ func (m *MemoryManager) Mount(name string, store *Store, view *View, readOnly bo
 	}
 }
 
+// Unmount removes and closes a mounted secondary store.
+func (m *MemoryManager) Unmount(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cleanName := strings.ToLower(strings.TrimSpace(name))
+	ms, ok := m.mounted[cleanName]
+	if !ok {
+		return nil
+	}
+	delete(m.mounted, cleanName)
+
+	newOrder := make([]string, 0, len(m.order))
+	for _, n := range m.order {
+		if n != cleanName {
+			newOrder = append(newOrder, n)
+		}
+	}
+	m.order = newOrder
+
+	if ms.Store != nil {
+		return ms.Store.Close()
+	}
+	return nil
+}
+
 // PrimaryStore returns the active primary store.
 func (m *MemoryManager) PrimaryStore() *Store {
 	m.mu.RLock()

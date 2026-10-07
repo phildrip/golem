@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 )
@@ -177,8 +178,13 @@ func Save(path string, cfg FileConfig) error {
 	}
 
 	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return errors.Wrapf(err, "writing config file %s", path)
+	tmpPath := fmt.Sprintf("%s.%d.tmp", path, time.Now().UnixNano())
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return errors.Wrapf(err, "writing temp config file %s", tmpPath)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return errors.Wrapf(err, "renaming temp config to %s", path)
 	}
 	return nil
 }
@@ -410,11 +416,15 @@ func ProfileMemoryDir(profileName string) (string, error) {
 	if profileName == "" {
 		profileName = "default"
 	}
+	cleanName := filepath.Clean(profileName)
+	if cleanName == "." || cleanName == ".." || strings.Contains(cleanName, "/") || strings.Contains(cleanName, "\\") {
+		return "", errors.Errorf("invalid profile name %q for memory directory", profileName)
+	}
 	userDir, err := UserDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(userDir, "profiles", profileName, "memory"), nil
+	return filepath.Join(userDir, "profiles", cleanName, "memory"), nil
 }
 
 // MergeConfigs merges workspace config over user config.

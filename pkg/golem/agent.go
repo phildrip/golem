@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,10 +104,51 @@ type Agent struct {
 	adkAgent         agent.Agent
 	userID           string
 	swarmBus         *swarm.Bus
-	activeHandlerMu  sync.RWMutex
-	activeHandler    StreamHandler
-	compactorTrigger chan struct{}
-	workerCancel     context.CancelFunc
+	activeHandlerMu     sync.RWMutex
+	activeHandler       StreamHandler
+	compactorTrigger    chan struct{}
+	workerCancel        context.CancelFunc
+	dynModel            *dynamicModel
+	modelFactory        *subagent.ModelFactory
+	currentProfileMount string
+}
+
+// dynamicModel is a thread-safe proxy implementing model.LLM that allows hot-swapping the active LLM client.
+type dynamicModel struct {
+	mu      sync.RWMutex
+	current model.LLM
+}
+
+func newDynamicModel(initial model.LLM) *dynamicModel {
+	return &dynamicModel{current: initial}
+}
+
+func (d *dynamicModel) Switch(newModel model.LLM) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.current = newModel
+}
+
+func (d *dynamicModel) Current() model.LLM {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.current
+}
+
+func (d *dynamicModel) Name() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.current != nil {
+		return d.current.Name()
+	}
+	return "dynamic"
+}
+
+func (d *dynamicModel) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
+	d.mu.RLock()
+	m := d.current
+	d.mu.RUnlock()
+	return m.GenerateContent(ctx, req, stream)
 }
 
 // New constructs an operational Golem agent.
@@ -463,10 +505,11 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	allTools = append(allTools, invokeSubagentTool)
 
 	// 8. Build LLM Agent with dynamic fractal memory injection & logging callbacks
+	dynModel := newDynamicModel(modelInstance)
 	adkAgent, err := llmagent.New(llmagent.Config{
 		Name:        "golem",
 		Description: "An autonomous agent equipped with shell and file tools, and infinite fractal memory.",
-		Model:       modelInstance,
+		Model:       dynModel,
 		Tools:       allTools,
 		Toolsets:    adkToolsets,
 		IncludeContents: llmagent.IncludeContentsNone,
@@ -594,6 +637,8 @@ Subagents & Delegation:
 		swarmBus:         swarmBus,
 		compactorTrigger: make(chan struct{}, 1),
 		workerCancel:     workerCancel,
+		dynModel:         dynModel,
+		modelFactory:     modelFactory,
 	}
 
 	// Start background compactor loop if configured or for trigger events
@@ -792,13 +837,81 @@ func (a *Agent) SwitchProfile(ctx context.Context, profileName string) (config.P
 		}
 	}
 
-	// Mount target profile memory if configured and different from workspace storage
+	// 1. Re-instantiate LLM client and hot-swap active model on dynModel
+	var newModel model.LLM
+	if a.cfg.Provider == config.ProviderGemini {
+		attempts := int32(5)
+		initialDelay := 1.0
+		maxDelay := 30.0
+		expBase := 2.0
+		jitter := 0.5
+
+		clientCfg := &genai.ClientConfig{
+			APIKey: a.cfg.APIKey,
+			HTTPOptions: genai.HTTPOptions{
+				RetryOptions: &genai.HTTPRetryOptions{
+					Attempts:        &attempts,
+					InitialDelay:    &initialDelay,
+					MaxDelay:        &maxDelay,
+					ExpBase:         &expBase,
+					Jitter:          &jitter,
+					HTTPStatusCodes: []int32{408, 429, 500, 502, 503, 504},
+				},
+			},
+		}
+
+		if a.cfg.APIKey == "" {
+			if os.Getenv("GOOGLE_GENAI_USE_VERTEXAI") == "" && os.Getenv("GOOGLE_CLOUD_PROJECT") == "" {
+				home, _ := os.UserHomeDir()
+				if home != "" {
+					settingsPath := filepath.Join(home, ".gemini/antigravity-cli/settings.json")
+					if data, err := os.ReadFile(settingsPath); err == nil {
+						var s struct {
+							GCP struct {
+								Project  string `json:"project"`
+								Location string `json:"location"`
+							} `json:"gcp"`
+						}
+						if err := json.Unmarshal(data, &s); err == nil && s.GCP.Project != "" {
+							clientCfg.Backend = genai.BackendVertexAI
+							clientCfg.Project = s.GCP.Project
+							clientCfg.Location = s.GCP.Location
+							if clientCfg.Location == "" {
+								clientCfg.Location = "global"
+							}
+						}
+					}
+				}
+			}
+		}
+
+		gm, err := gemini.NewModel(ctx, a.cfg.ModelName, clientCfg)
+		if err != nil {
+			return prof, errors.Wrapf(err, "initializing gemini model %s for profile switch", a.cfg.ModelName)
+		}
+		newModel = gm
+	} else {
+		newModel = openai.NewClient(a.cfg.ModelName, a.cfg.BaseURL, a.cfg.APIKey, nil)
+	}
+
+	if a.dynModel != nil && newModel != nil {
+		a.dynModel.Switch(newModel)
+	}
+	if a.modelFactory != nil {
+		a.modelFactory.UpdateDefaults(a.cfg.ModelName, a.cfg.Provider, a.cfg.BaseURL, a.cfg.APIKey, a.cfg.FileConfig)
+	}
+
+	// 2. Mount target profile memory if configured and unmount previous dynamic profile memory
 	if name != "" && name != "default" && a.memoryMgr != nil {
 		profDir := prof.MemoryDir
 		if profDir == "" {
 			profDir, _ = config.ProfileMemoryDir(name)
 		}
 		if profDir != "" && profDir != a.cfg.StorageDir {
+			if a.currentProfileMount != "" && a.currentProfileMount != name {
+				_ = a.memoryMgr.Unmount(a.currentProfileMount)
+				a.currentProfileMount = ""
+			}
 			if _, exists := a.memoryMgr.GetStore(name); !exists {
 				if profStore, err := fractal.OpenStore(profDir); err == nil {
 					viewCfg := fractal.ViewConfig{
@@ -807,9 +920,15 @@ func (a *Agent) SwitchProfile(ctx context.Context, profileName string) (config.P
 					}
 					profView := fractal.NewView(profStore, viewCfg)
 					a.memoryMgr.Mount(name, profStore, profView, true)
+					a.currentProfileMount = name
 				}
+			} else {
+				a.currentProfileMount = name
 			}
 		}
+	} else if a.memoryMgr != nil && a.currentProfileMount != "" {
+		_ = a.memoryMgr.Unmount(a.currentProfileMount)
+		a.currentProfileMount = ""
 	}
 
 	return prof, nil
