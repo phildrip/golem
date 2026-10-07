@@ -100,6 +100,114 @@ var (
 				Bold(true)
 )
 
+// RenderCollapsedToolSummary formats a collapsed group of tool calls into a single compact line.
+func RenderCollapsedToolSummary(tools []ChatEntry) string {
+	if len(tools) == 0 {
+		return ""
+	}
+
+	expandHint := lipgloss.NewStyle().Foreground(ColorMuted).Render("• Ctrl+O to expand")
+
+	if len(tools) == 1 {
+		t := tools[0]
+		cleanName := strings.TrimSpace(t.ToolName)
+		if cleanName == "" {
+			cleanName = "tool"
+		}
+
+		cmdStr := ""
+		if t.Command != "" && t.Command != "null" && t.Command != "{}" {
+			cmd := t.Command
+			if len(cmd) > 50 {
+				cmd = cmd[:47] + "..."
+			}
+			cmdStr = lipgloss.NewStyle().Foreground(ColorMuted).Render(fmt.Sprintf(" ($ %s)", cmd))
+		}
+
+		if t.IsRunning {
+			return fmt.Sprintf("  ⚡ Running tool: %s%s %s",
+				lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render(cleanName),
+				cmdStr,
+				ToolRunningBadge.Render("RUNNING"),
+			)
+		}
+
+		var statusBadge string
+		if t.ExitCode == 0 {
+			statusBadge = ToolSuccessBadge.Render("EXIT 0")
+		} else {
+			statusBadge = ToolErrorBadge.Render(fmt.Sprintf("EXIT %d", t.ExitCode))
+		}
+
+		return fmt.Sprintf("  ⚡ Tool: %s%s %s %s",
+			lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render(cleanName),
+			cmdStr,
+			statusBadge,
+			expandHint,
+		)
+	}
+
+	// Multiple tools in contiguous group
+	errCount := 0
+	isRunning := false
+	var runningTool string
+	var runningCmd string
+	toolNamesMap := make(map[string]bool)
+	var toolNames []string
+
+	for _, t := range tools {
+		if t.IsRunning {
+			isRunning = true
+			runningTool = t.ToolName
+			runningCmd = t.Command
+		}
+		if t.ExitCode != 0 {
+			errCount++
+		}
+		name := strings.TrimSpace(t.ToolName)
+		if name == "" {
+			name = "tool"
+		}
+		if !toolNamesMap[name] {
+			toolNamesMap[name] = true
+			toolNames = append(toolNames, name)
+		}
+	}
+
+	if isRunning {
+		cmdStr := ""
+		if runningCmd != "" && runningCmd != "null" && runningCmd != "{}" {
+			cmd := runningCmd
+			if len(cmd) > 40 {
+				cmd = cmd[:37] + "..."
+			}
+			cmdStr = lipgloss.NewStyle().Foreground(ColorMuted).Render(fmt.Sprintf(" ($ %s)", cmd))
+		}
+		return fmt.Sprintf("  ⚡ Running tool (%d/%d): %s%s %s %s",
+			len(tools), len(tools),
+			lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render(runningTool),
+			cmdStr,
+			ToolRunningBadge.Render("RUNNING"),
+			expandHint,
+		)
+	}
+
+	var statusBadge string
+	if errCount > 0 {
+		statusBadge = ToolErrorBadge.Render(fmt.Sprintf("%d ERRORS", errCount))
+	} else {
+		statusBadge = ToolSuccessBadge.Render(fmt.Sprintf("%d DONE", len(tools)))
+	}
+
+	namesList := strings.Join(toolNames, ", ")
+	return fmt.Sprintf("  ⚡ %d tool calls (%s) %s %s",
+		len(tools),
+		namesList,
+		statusBadge,
+		expandHint,
+	)
+}
+
 // RenderToolCard formats a tool invocation and its result as a styled card.
 func RenderToolCard(toolName string, commandOrArgs string, output string, exitCode int, isRunning bool, width int) string {
 	var statusBadge string

@@ -1190,4 +1190,112 @@ func TestModel_TypingDoesNotScroll(t *testing.T) {
 	}
 }
 
+func TestModel_RenderCollapsedToolSummary(t *testing.T) {
+	// 1. Single running tool
+	running := RenderCollapsedToolSummary([]ChatEntry{
+		{ToolName: "shell", Command: "ls -la", IsRunning: true},
+	})
+	if !strings.Contains(running, "Running tool") || !strings.Contains(running, "shell") || !strings.Contains(running, "RUNNING") {
+		t.Errorf("expected running tool summary, got: %s", running)
+	}
+
+	// 2. Single finished tool (success)
+	doneOk := RenderCollapsedToolSummary([]ChatEntry{
+		{ToolName: "shell", Command: "pwd", ExitCode: 0, IsRunning: false},
+	})
+	if !strings.Contains(doneOk, "Tool:") || !strings.Contains(doneOk, "shell") || !strings.Contains(doneOk, "EXIT 0") || !strings.Contains(doneOk, "Ctrl+O to expand") {
+		t.Errorf("expected finished ok tool summary, got: %s", doneOk)
+	}
+
+	// 3. Single finished tool (error)
+	doneErr := RenderCollapsedToolSummary([]ChatEntry{
+		{ToolName: "shell", Command: "exit 1", ExitCode: 1, IsRunning: false},
+	})
+	if !strings.Contains(doneErr, "Tool:") || !strings.Contains(doneErr, "shell") || !strings.Contains(doneErr, "EXIT 1") || !strings.Contains(doneErr, "Ctrl+O to expand") {
+		t.Errorf("expected finished error tool summary, got: %s", doneErr)
+	}
+
+	// 4. Multiple tools
+	multi := RenderCollapsedToolSummary([]ChatEntry{
+		{ToolName: "shell", Command: "git status", ExitCode: 0},
+		{ToolName: "read_file", Command: "main.go", ExitCode: 0},
+	})
+	if !strings.Contains(multi, "2 tool calls") || !strings.Contains(multi, "shell, read_file") || !strings.Contains(multi, "2 DONE") || !strings.Contains(multi, "Ctrl+O to expand") {
+		t.Errorf("expected multiple tools summary, got: %s", multi)
+	}
+
+	// 5. Multiple tools with error
+	multiErr := RenderCollapsedToolSummary([]ChatEntry{
+		{ToolName: "shell", Command: "git status", ExitCode: 0},
+		{ToolName: "shell", Command: "bad command", ExitCode: 127},
+	})
+	if !strings.Contains(multiErr, "2 tool calls") || !strings.Contains(multiErr, "1 ERRORS") || !strings.Contains(multiErr, "Ctrl+O to expand") {
+		t.Errorf("expected multiple tools with error summary, got: %s", multiErr)
+	}
+}
+
+func TestModel_ExpandToolsToggle(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := fractal.OpenStore(tmpDir)
+	defer store.Close()
+	view := fractal.NewView(store, fractal.DefaultViewConfig())
+	m := NewModel(nil, store, view)
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = newM.(Model)
+
+	// Verify default is collapsed (expandTools == false)
+	if m.expandTools {
+		t.Errorf("expected expandTools to be false by default")
+	}
+
+	// Add a tool entry and user entry
+	m.entries = append(m.entries,
+		ChatEntry{Type: TypeUser, Content: "inspect repo"},
+		ChatEntry{Type: TypeTool, ToolName: "shell", Command: "git status", Content: "On branch main", ExitCode: 0},
+	)
+	m.renderConversationToViewport()
+
+	// In collapsed mode: viewport has "Ctrl+O to expand" and NOT the full box border "╭"
+	collapsedView := m.viewport.View()
+	if !strings.Contains(collapsedView, "Ctrl+O to expand") {
+		t.Errorf("expected collapsed view to contain 'Ctrl+O to expand', got:\n%s", collapsedView)
+	}
+	if strings.Contains(collapsedView, "╭") {
+		t.Errorf("expected collapsed view NOT to have full box border '╭', got:\n%s", collapsedView)
+	}
+
+	// Press Ctrl+O to expand
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	m = newM.(Model)
+	if !m.expandTools {
+		t.Errorf("expected expandTools to be true after Ctrl+O")
+	}
+
+	// In expanded mode: viewport contains the full ToolCard with "╭"
+	expandedView := m.viewport.View()
+	if !strings.Contains(expandedView, "╭") {
+		t.Errorf("expected expanded view to contain ToolCardBox '╭', got:\n%s", expandedView)
+	}
+	if !strings.Contains(expandedView, "On branch main") {
+		t.Errorf("expected expanded view to contain output 'On branch main', got:\n%s", expandedView)
+	}
+
+	// Press Ctrl+O again to collapse back
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}}) // standard key without ctrl
+	// with "ctrl+o" string message:
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	m = newM.(Model)
+	if m.expandTools {
+		t.Errorf("expected expandTools to be false after second Ctrl+O")
+	}
+
+	// Toggle via /tools slash command
+	newM, _ = m.handleSlashCommand("/tools")
+	m = newM.(Model)
+	if !m.expandTools {
+		t.Errorf("expected expandTools to be true after /tools command")
+	}
+}
+
+
 

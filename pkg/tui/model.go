@@ -121,6 +121,7 @@ type Model struct {
 	cancelTurn      context.CancelFunc
 	streamChan      <-chan tea.Msg
 	isBlurred       bool
+	expandTools     bool
 }
 
 // NewModel constructs a new Bubbletea TUI model for Golem.
@@ -496,6 +497,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.HalfViewDown()
 			return m, nil
 		}
+		if msg.String() == "ctrl+o" {
+			wasAtBottom := m.viewport.AtBottom()
+			m.expandTools = !m.expandTools
+			if m.expandTools {
+				m.statusMessage = "Expanded tool calls"
+			} else {
+				m.statusMessage = "Collapsed tool calls"
+			}
+			m.statusMessageAt = time.Now()
+			m.renderConversationToViewport()
+			if wasAtBottom {
+				m.viewport.GotoBottom()
+			}
+			return m, nil
+		}
 
 		switch msg.Type {
 		case tea.KeyCtrlD:
@@ -571,6 +587,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showShortcutsModal = true
 			m.shortcutsViewport.SetContent(m.generateShortcutsVisual())
 			m.shortcutsViewport.GotoTop()
+			return m, nil
+
+		case tea.KeyCtrlO:
+			// Toggle tool execution cards expanded vs collapsed
+			wasAtBottom := m.viewport.AtBottom()
+			m.expandTools = !m.expandTools
+			if m.expandTools {
+				m.statusMessage = "Expanded tool calls"
+			} else {
+				m.statusMessage = "Collapsed tool calls"
+			}
+			m.statusMessageAt = time.Now()
+			m.renderConversationToViewport()
+			if wasAtBottom {
+				m.viewport.GotoBottom()
+			}
 			return m, nil
 
 		case tea.KeyPgUp:
@@ -835,7 +867,7 @@ func (m Model) View() string {
 
 	var statusLine string
 	if m.isLoading {
-		statusLine = fmt.Sprintf("%s Golem is thinking... %s", m.spinner.View(), lipgloss.NewStyle().Foreground(ColorMuted).Render("[Ctrl+C: Interrupt]"))
+		statusLine = fmt.Sprintf("%s Golem is thinking... %s", m.spinner.View(), lipgloss.NewStyle().Foreground(ColorMuted).Render("[Ctrl+C: Interrupt • Ctrl+O: Tools]"))
 	} else if m.statusMessage != "" && time.Since(m.statusMessageAt) < 5*time.Second {
 		statusLine = lipgloss.NewStyle().Foreground(ColorSuccess).Render(m.statusMessage)
 	} else {
@@ -843,7 +875,7 @@ func (m Model) View() string {
 		if strings.HasPrefix(val, "/") {
 			statusLine = m.renderSlashCommandHelp(val)
 		} else {
-			statusLine = StatusBarKeyHintStyle.Render("[Enter: Send • ↑/↓: History • Ctrl+K: Shortcuts • Ctrl+C: Clear/Exit • Ctrl+D: Exit (empty) • /: Commands]")
+			statusLine = StatusBarKeyHintStyle.Render("[Enter: Send • ↑/↓: History • Ctrl+O: Tools • Ctrl+K: Shortcuts • Ctrl+C: Clear • Ctrl+D: Exit]")
 		}
 	}
 
@@ -865,7 +897,8 @@ func (m Model) View() string {
 func (m *Model) renderConversationToViewport() {
 	var sb strings.Builder
 
-	for _, entry := range m.entries {
+	for i := 0; i < len(m.entries); i++ {
+		entry := m.entries[i]
 		switch entry.Type {
 		case TypeUser:
 			sb.WriteString(UserBadgeStyle.Render("YOU") + "\n")
@@ -886,8 +919,21 @@ func (m *Model) renderConversationToViewport() {
 			sb.WriteString("\n")
 
 		case TypeTool:
-			card := RenderToolCard(entry.ToolName, entry.Command, entry.Content, entry.ExitCode, entry.IsRunning, m.viewport.Width)
-			sb.WriteString(card + "\n")
+			if m.expandTools {
+				card := RenderToolCard(entry.ToolName, entry.Command, entry.Content, entry.ExitCode, entry.IsRunning, m.viewport.Width)
+				sb.WriteString(card + "\n")
+			} else {
+				// Group contiguous tool calls into a single compact line
+				toolGroup := []ChatEntry{entry}
+				for i+1 < len(m.entries) && m.entries[i+1].Type == TypeTool {
+					i++
+					toolGroup = append(toolGroup, m.entries[i])
+				}
+				summary := RenderCollapsedToolSummary(toolGroup)
+				if summary != "" {
+					sb.WriteString(summary + "\n\n")
+				}
+			}
 
 		case TypeSubagent:
 			card := RenderSubagentCard(entry.SubagentRole, entry.SubagentModel, entry.SubagentPrompt, entry.Content, entry.IsRunning, m.viewport.Width)
@@ -1152,6 +1198,7 @@ func (m Model) renderSlashCommandHelp(input string) string {
 		{"/zoom", "Inspect memory node (/zoom [target] <id> <n>)"},
 		{"/compact", "Trigger memory compaction fold"},
 		{"/clear", "Clear chat viewport (disk memory preserved)"},
+		{"/tools", "Toggle expanded/collapsed tool call cards (Ctrl+O)"},
 		{"/mcp", "Inspect active MCP servers, tools & configs"},
 		{"/shortcuts", "Show keyboard shortcuts & controls cheat sheet"},
 		{"/help", "Show full command reference"},
@@ -1262,6 +1309,7 @@ func (m Model) generateShortcutsVisual() string {
 				{"↓ (Down)", "Next prompt", "Cycle forward through prompt history / draft"},
 				{"Ctrl+C", "Clear line / Interrupt", "Interrupts running turn; if idle, clears line; if line empty, exits"},
 				{"Ctrl+D", "Exit / Forward Delete", "Exits when prompt is empty & idle; forward-deletes char when typing"},
+				{"Ctrl+O", "Toggle tool cards", "Expand / collapse tool call cards in chat (collapsed by default)"},
 			},
 		},
 		{
@@ -1686,6 +1734,21 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.renderConversationToViewport()
 		return m, nil
 
+	case "/tools", "/expand":
+		wasAtBottom := m.viewport.AtBottom()
+		m.expandTools = !m.expandTools
+		if m.expandTools {
+			m.statusMessage = "Expanded tool calls"
+		} else {
+			m.statusMessage = "Collapsed tool calls"
+		}
+		m.statusMessageAt = time.Now()
+		m.renderConversationToViewport()
+		if wasAtBottom {
+			m.viewport.GotoBottom()
+		}
+		return m, nil
+
 	case "/shortcuts", "/keys":
 		m.textarea.Blur()
 		m.showShortcutsModal = true
@@ -1701,6 +1764,7 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 /zoom [t] id n  - Inspect memory node or raw message (n=1 for verbatim)
 /compact        - Trigger an immediate background compaction pass
 /clear          - Clear viewport chat history (disk storage untouched)
+/tools          - Toggle expanded/collapsed tool call cards (or Ctrl+O)
 /mcp            - Inspect active MCP servers, tools count, and configs
 /shortcuts      - Display interactive keyboard shortcuts cheat sheet
 /help           - Display this help message
