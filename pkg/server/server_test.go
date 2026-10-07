@@ -144,6 +144,16 @@ func TestServer_RESTEndpoints(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("expected 400 Bad Request for path traversal, got %d", resp.StatusCode)
 	}
+
+	// Test exact ".." traversal rejection
+	badPatchDotDot := `{"file_path": "..", "op": "SWAP", "anchor": "1:ff", "content": "bad"}`
+	resp, err = client.Post(testServer.URL+"/api/patch", "application/json", strings.NewReader(badPatchDotDot))
+	if err != nil {
+		t.Fatalf("POST /api/patch failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for '..' path traversal, got %d", resp.StatusCode)
+	}
 }
 
 func TestHub_ClientQueueSaturation(t *testing.T) {

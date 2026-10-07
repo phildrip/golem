@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"path/filepath"
@@ -205,7 +206,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 		// Prevent path traversal
 		cleanTarget := filepath.Clean(req.FilePath)
-		if strings.HasPrefix(cleanTarget, "../") || filepath.IsAbs(cleanTarget) {
+		if cleanTarget == ".." || strings.HasPrefix(cleanTarget, ".."+string(filepath.Separator)) || filepath.IsAbs(cleanTarget) {
 			writeError(w, http.StatusBadRequest, "invalid relative file path for workspace")
 			return
 		}
@@ -226,7 +227,35 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 				http.NotFound(w, r)
 				return
 			}
-			fileServer.ServeHTTP(w, r)
+
+			// Clean request path relative to root
+			trimmedPath := strings.TrimPrefix(filepath.Clean(r.URL.Path), "/")
+			if trimmedPath == "" || trimmedPath == "." {
+				trimmedPath = "index.html"
+			}
+
+			// Check if static asset exists
+			f, err := s.cfg.StaticFS.Open(trimmedPath)
+			if err == nil {
+				_ = f.Close()
+				fileServer.ServeHTTP(w, r)
+				return
+			}
+
+			// SPA client-side routing fallback: serve index.html
+			indexFile, err := s.cfg.StaticFS.Open("index.html")
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			defer indexFile.Close()
+
+			stat, err := indexFile.Stat()
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			http.ServeContent(w, r, "index.html", stat.ModTime(), indexFile.(io.ReadSeeker))
 		})
 	} else {
 		// Fallback landing page when UI is not yet embedded
