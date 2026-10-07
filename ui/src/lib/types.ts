@@ -12,7 +12,21 @@ export type WSEventType =
 	| 'subagent_done'
 	| 'memory_added'
 	| 'patch_proposed'
-	| 'patch_applied';
+	| 'patch_applied'
+	| 'swarm_message'
+	| 'swarm_lock';
+
+export interface SwarmMessage {
+	id: string;
+	session_id?: string;
+	sender: string;
+	recipient?: string;
+	channel?: string;
+	subject?: string;
+	body: string;
+	priority?: 'normal' | 'urgent';
+	timestamp: string;
+}
 
 export interface WSEvent<T = unknown> {
 	type: WSEventType;

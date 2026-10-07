@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/user/golem/pkg/swarm"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/runner"
@@ -25,6 +26,7 @@ type RunnerConfig struct {
 	MCPToolsets    []tool.Toolset
 	EventHandler   EventHandler
 	MemoryContext  func() string
+	SwarmBus       *swarm.Bus
 }
 
 // Runner manages spawning and running isolated subagent instances.
@@ -144,12 +146,22 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 	}
 
 	tools := r.SelectTools(role)
+	subagentID := fmt.Sprintf("subagent-%s-%d", role, time.Now().UnixNano())
+	if r.cfg.SwarmBus != nil {
+		swarmTS := swarm.NewToolset(r.cfg.SwarmBus, subagentID)
+		if swarmTools, err := swarmTS.BuildTools(); err == nil {
+			tools = append(tools, swarmTools...)
+		}
+	}
 	systemPrompt := r.BuildSystemPrompt(role)
+	if r.cfg.SwarmBus != nil {
+		systemPrompt += fmt.Sprintf("\n\nYour Swarm Agent ID is %q. Use this ID when communicating with peer agents or orchestrator.", subagentID)
+	}
 
 	var toolCallsCount int32
 
 	subAgent, err := llmagent.New(llmagent.Config{
-		Name:        "subagent-" + role,
+		Name:        subagentID,
 		Description: fmt.Sprintf("Autonomous %s subagent using %s", role, resolvedModel),
 		Model:       modelInstance,
 		Tools:       tools,

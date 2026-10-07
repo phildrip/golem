@@ -27,6 +27,8 @@ const (
 	WSEventSubagentStart  WSEventType = "subagent_start"
 	WSEventSubagentTool   WSEventType = "subagent_tool"
 	WSEventSubagentDone   WSEventType = "subagent_done"
+	WSEventSwarmMessage   WSEventType = "swarm_message"
+	WSEventSwarmLock      WSEventType = "swarm_lock"
 
 	// Memory synchronization
 	WSEventMemoryAdded    WSEventType = "memory_added"

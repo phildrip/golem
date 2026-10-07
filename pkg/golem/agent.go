@@ -16,6 +16,7 @@ import (
 	"github.com/user/golem/pkg/memory/fractal"
 	"github.com/user/golem/pkg/provider/openai"
 	"github.com/user/golem/pkg/subagent"
+	"github.com/user/golem/pkg/swarm"
 	"github.com/user/golem/pkg/tools"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
@@ -68,6 +69,7 @@ type Config struct {
 	MCPConfig         *mcp.Config
 	MCPConfigPaths    []string
 	FileConfig        config.FileConfig
+	SwarmBus          *swarm.Bus
 }
 
 // DefaultConfig provides recommended settings.
@@ -100,6 +102,7 @@ type Agent struct {
 	runner           *runner.Runner
 	adkAgent         agent.Agent
 	userID           string
+	swarmBus         *swarm.Bus
 	activeHandlerMu  sync.RWMutex
 	activeHandler    StreamHandler
 	compactorTrigger chan struct{}
@@ -398,7 +401,17 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 
 	var agentPtr *Agent
 
-	// 6. Initialize Subagent Runner & Delegation Tool
+	// 6. Initialize Swarm Bus & Tools
+	swarmBus := cfg.SwarmBus
+	if swarmBus == nil {
+		swarmBus = swarm.NewBus()
+	}
+	orchestratorSwarmTS := swarm.NewToolset(swarmBus, "orchestrator")
+	if swarmTools, err := orchestratorSwarmTS.BuildTools(); err == nil {
+		allTools = append(allTools, swarmTools...)
+	}
+
+	// 7. Initialize Subagent Runner & Delegation Tool
 	modelFactory := subagent.NewModelFactoryWithConfig(subagent.FactoryConfig{
 		ClientConfig:    clientCfg,
 		DefaultModel:    cfg.ModelName,
@@ -413,6 +426,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		ReadOnlyTools:  []tool.Tool{readFileTool, findFilesTool, grepFilesTool, hashlineReadTool, hashlineFindBlockTool, zoomTool, dateTool},
 		ReadWriteTools: []tool.Tool{writeFileTool, replaceRegexTool, hashlinePatchTool, shellTool, rememberTool},
 		MCPToolsets:    adkToolsets,
+		SwarmBus:       swarmBus,
 		EventHandler: func(ev subagent.Event) {
 			if agentPtr != nil {
 				agentPtr.dispatchSubagentEvent(ev)
@@ -448,7 +462,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 	allTools = append(allTools, invokeSubagentTool)
 
-	// 7. Build LLM Agent with dynamic fractal memory injection & logging callbacks
+	// 8. Build LLM Agent with dynamic fractal memory injection & logging callbacks
 	adkAgent, err := llmagent.New(llmagent.Config{
 		Name:        "golem",
 		Description: "An autonomous agent equipped with shell and file tools, and infinite fractal memory.",
@@ -577,6 +591,7 @@ Subagents & Delegation:
 		runner:           adkRunner,
 		adkAgent:         adkAgent,
 		userID:           "user",
+		swarmBus:         swarmBus,
 		compactorTrigger: make(chan struct{}, 1),
 		workerCancel:     workerCancel,
 	}
@@ -719,6 +734,9 @@ func (a *Agent) Close() error {
 	if a.workerCancel != nil {
 		a.workerCancel()
 	}
+	if a.swarmBus != nil {
+		_ = a.swarmBus.Close()
+	}
 	if a.mcpManager != nil {
 		a.mcpManager.Close()
 	}
@@ -830,6 +848,11 @@ func (a *Agent) MCPConfigPaths() []string {
 // SubagentRunner returns the subagent delegation runner.
 func (a *Agent) SubagentRunner() *subagent.Runner {
 	return a.subagentRunner
+}
+
+// SwarmBus returns the swarm communication bus.
+func (a *Agent) SwarmBus() *swarm.Bus {
+	return a.swarmBus
 }
 
 func (a *Agent) dispatchSubagentEvent(ev subagent.Event) {

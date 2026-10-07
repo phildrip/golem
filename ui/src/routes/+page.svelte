@@ -16,10 +16,11 @@
 		subagents,
 		memory,
 		patches,
+		swarmMessages,
 		isGenerating,
 		serverConnected
 	} from '$lib/stores';
-	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal } from '$lib/types';
+	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal, SwarmMessage } from '$lib/types';
 
 	let activeSession = $derived(
 		$sessions.find((s) => s.id === $activeSessionId) || null
@@ -31,6 +32,10 @@
 
 	let currentSubagents = $derived(
 		$activeSessionId && $subagents[$activeSessionId] ? $subagents[$activeSessionId] : []
+	);
+
+	let currentSwarmMessages = $derived(
+		$activeSessionId && $swarmMessages[$activeSessionId] ? $swarmMessages[$activeSessionId] : []
 	);
 
 	let currentMemory = $derived(
@@ -364,6 +369,13 @@
 				$patches = { ...$patches, [sessId]: [...current, payload] };
 				break;
 			}
+
+			case 'swarm_message': {
+				const payload = event.payload as SwarmMessage;
+				const current = $swarmMessages[sessId] || [];
+				$swarmMessages = { ...$swarmMessages, [sessId]: [...current, payload] };
+				break;
+			}
 		}
 	}
 </script>
@@ -459,10 +471,11 @@
 			/>
 		</main>
 
-		<!-- Right Drawer: Swarm Hierarchy -->
+		<!-- Right Drawer: Swarm Hierarchy & Comms -->
 		<aside class="flex-shrink-0">
 			<SwarmTree
 				subagents={currentSubagents}
+				swarmMessages={currentSwarmMessages}
 			/>
 		</aside>
 	</div>

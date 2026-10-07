@@ -11,6 +11,7 @@ import (
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/importer"
 	"github.com/user/golem/pkg/memory/fractal"
+	"github.com/user/golem/pkg/swarm"
 )
 
 // Session represents an independent orchestrator agent session.
@@ -20,10 +21,11 @@ type Session struct {
 	Agent     *golem.Agent
 	CreatedAt time.Time
 	UpdatedAt time.Time
-	TurnCount int
-	ctx       context.Context
-	cancel    context.CancelFunc
-	mu        sync.Mutex
+	TurnCount  int
+	ctx        context.Context
+	cancel     context.CancelFunc
+	unsubSwarm func()
+	mu         sync.Mutex
 }
 
 // SessionManager manages active agent sessions and dispatches turns.
@@ -92,6 +94,13 @@ func (sm *SessionManager) CreateSession(ctx context.Context, title string) (*Ses
 			"timestamp": ev.Timestamp,
 		})
 	})
+
+	// Wire reactive swarm message pub-sub listener to broadcast to WebSocket clients
+	if sb := agentInstance.SwarmBus(); sb != nil {
+		sess.unsubSwarm = sb.OnMessage(func(msg swarm.Message) {
+			_ = sm.hub.Broadcast(WSEventSwarmMessage, sessID, msg)
+		})
+	}
 
 	_ = sm.hub.Broadcast(WSEventSessionCreated, id, SessionInfo{
 		ID:        id,
@@ -162,6 +171,12 @@ func (sm *SessionManager) CreateSessionWithImport(ctx context.Context, title str
 			"timestamp": ev.Timestamp,
 		})
 	})
+
+	if sb := agentInstance.SwarmBus(); sb != nil {
+		sess.unsubSwarm = sb.OnMessage(func(msg swarm.Message) {
+			_ = sm.hub.Broadcast(WSEventSwarmMessage, sessID, msg)
+		})
+	}
 
 	sm.sessions[id] = sess
 	if sm.activeID == "" {
@@ -240,6 +255,9 @@ func (sm *SessionManager) DeleteSession(id string) error {
 	sm.mu.Unlock()
 
 	sess.cancel()
+	if sess.unsubSwarm != nil {
+		sess.unsubSwarm()
+	}
 	_ = sess.Agent.Close()
 	_ = sm.hub.Broadcast(WSEventSessionDeleted, id, map[string]string{"id": id})
 	return nil
@@ -345,6 +363,9 @@ func (sm *SessionManager) Close() {
 
 	for id, s := range sm.sessions {
 		s.cancel()
+		if s.unsubSwarm != nil {
+			s.unsubSwarm()
+		}
 		_ = s.Agent.Close()
 		delete(sm.sessions, id)
 	}
