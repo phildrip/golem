@@ -298,9 +298,27 @@ func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChat
 		if len(toolResponses) > 0 {
 			for _, tr := range toolResponses {
 				respJSON, _ := json.Marshal(tr.Response)
+				toolCallID := tr.ID
+				if toolCallID == "" {
+					// Match against preceding assistant messages' tool calls by function name
+					for i := len(chatReq.Messages) - 1; i >= 0; i-- {
+						for _, tc := range chatReq.Messages[i].ToolCalls {
+							if tc.Function.Name == tr.Name {
+								toolCallID = tc.ID
+								break
+							}
+						}
+						if toolCallID != "" {
+							break
+						}
+					}
+				}
+				if toolCallID == "" {
+					toolCallID = fmt.Sprintf("call_%s_default", tr.Name)
+				}
 				chatReq.Messages = append(chatReq.Messages, openAIChatMessage{
 					Role:       "tool",
-					ToolCallID: tr.ID,
+					ToolCallID: toolCallID,
 					Content:    string(respJSON),
 				})
 			}
@@ -462,11 +480,12 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 	var accumulatedText strings.Builder
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
 
-		data := strings.TrimPrefix(line, "data: ")
+		data := strings.TrimPrefix(line, "data:")
+		data = strings.TrimPrefix(data, " ")
 		if strings.TrimSpace(data) == "[DONE]" {
 			break
 		}
@@ -474,6 +493,11 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 		var chunk openAIChatResponse
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
+		}
+
+		if chunk.Error != nil && chunk.Error.Message != "" {
+			yield(nil, errors.New(chunk.Error.Message))
+			return
 		}
 
 		if len(chunk.Choices) == 0 {
@@ -524,6 +548,11 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 			if tc.Function.Arguments != "" {
 				acc.args.WriteString(tc.Function.Arguments)
 			}
+		}
+
+		if choice.FinishReason != "" && choice.FinishReason != "null" {
+			// Model has finished generating this turn
+			break
 		}
 	}
 

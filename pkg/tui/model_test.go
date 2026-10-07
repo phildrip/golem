@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/user/golem/pkg/memory/fractal"
@@ -1049,3 +1051,84 @@ func TestModel_ProfileModalAndCommands(t *testing.T) {
 		t.Errorf("expected usage info for /remember, got: %s", lastEntry.Content)
 	}
 }
+
+func TestModel_StreamBridgeNonBlockingAndCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	msgChan := make(chan tea.Msg, 4) // small buffer to test non-blocking/cancellation
+	bridge := &tuiStreamBridge{
+		ctx:     ctx,
+		msgChan: msgChan,
+	}
+
+	// 1. Fill the buffer
+	bridge.OnChunk("1")
+	bridge.OnChunk("2")
+	bridge.OnChunk("3")
+	bridge.OnChunk("4")
+
+	// 2. Cancel the context
+	cancel()
+
+	// 3. Subsequent sends should not hang or block even when channel is full
+	done := make(chan struct{})
+	go func() {
+		bridge.OnChunk("5")
+		bridge.OnToolStart("tool", "cmd")
+		bridge.OnToolDone("tool", "out", 0)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success: send did not block
+	case <-time.After(1 * time.Second):
+		t.Fatal("bridge.send blocked on cancelled context")
+	}
+}
+
+func TestModel_StreamMsgHandlingLifecycle(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := fractal.OpenStore(tmpDir)
+	defer store.Close()
+	view := fractal.NewView(store, fractal.DefaultViewConfig())
+	m := NewModel(nil, store, view)
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = newM.(Model)
+
+	// Simulate turn submission
+	m.isLoading = true
+	testChan := make(chan tea.Msg, 10)
+	m.streamChan = testChan
+
+	// 1. Process agentChunkMsg wrapped in streamMsg
+	newM, nextCmd := m.Update(streamMsg{Payload: agentChunkMsg("chunk 1")})
+	m = newM.(Model)
+	if m.streamingReply != "chunk 1" {
+		t.Errorf("expected streaming reply 'chunk 1', got %q", m.streamingReply)
+	}
+	if nextCmd == nil {
+		t.Errorf("expected nextListenCmd to be scheduled while isLoading is true")
+	}
+
+	// 2. Process toolStartMsg wrapped in streamMsg
+	newM, nextCmd = m.Update(streamMsg{Payload: toolStartMsg{toolName: "shell", command: "pwd"}})
+	m = newM.(Model)
+	if len(m.entries) != 1 || !m.entries[0].IsRunning {
+		t.Errorf("expected running tool entry")
+	}
+	if nextCmd == nil {
+		t.Errorf("expected nextListenCmd to be scheduled while isLoading is true")
+	}
+
+	// 3. Process agentDoneMsg wrapped in streamMsg
+	newM, nextCmd = m.Update(streamMsg{Payload: agentDoneMsg{reply: "All done."}})
+	m = newM.(Model)
+	if m.isLoading {
+		t.Errorf("expected isLoading to be false after agentDoneMsg")
+	}
+	if m.streamChan != nil {
+		t.Errorf("expected streamChan to be nil after agentDoneMsg")
+	}
+	_ = nextCmd
+}
+

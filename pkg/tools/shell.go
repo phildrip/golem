@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os/exec"
+	"time"
 
 	"github.com/pkg/errors"
 	"google.golang.org/adk/v2/agent"
@@ -24,7 +25,11 @@ type ShellResult struct {
 
 // ExecuteShellCommand runs a command with bash and returns its combined output and exit code.
 func ExecuteShellCommand(ctx context.Context, command string) (ShellResult, error) {
-	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	cmdCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, "bash", "-c", command)
+	cmd.Stdin = bytes.NewReader(nil)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out

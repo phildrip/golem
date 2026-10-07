@@ -618,8 +618,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ctx, cancel := context.WithCancel(context.Background())
 			m.cancelTurn = cancel
 
+			turnCmd := m.runAgentTurnCmd(ctx, input)
+
 			return m, tea.Batch(
-				m.runAgentTurnCmd(ctx, input),
+				turnCmd,
 				m.spinner.Tick,
 			)
 		}
@@ -714,7 +716,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// into the standard Update message handler, and keep listening on streamChan if open.
 		innerModel, innerCmd := m.Update(msg.Payload)
 		var nextListenCmd tea.Cmd
-		if m.streamChan != nil && m.isLoading {
+		if innerM, ok := innerModel.(Model); ok {
+			if innerM.streamChan != nil && innerM.isLoading {
+				nextListenCmd = listenStreamCmd(innerM.streamChan)
+			}
+		} else if m.streamChan != nil && m.isLoading {
 			nextListenCmd = listenStreamCmd(m.streamChan)
 		}
 		return innerModel, tea.Batch(innerCmd, nextListenCmd)
@@ -871,59 +877,78 @@ func (m *Model) renderConversationToViewport() {
 
 // tuiStreamBridge adapts golem.StreamHandler into a channel of Bubbletea messages.
 type tuiStreamBridge struct {
+	ctx     context.Context
 	msgChan chan tea.Msg
 }
 
+func (b *tuiStreamBridge) send(msg tea.Msg) {
+	if b.msgChan == nil {
+		return
+	}
+	if b.ctx != nil {
+		select {
+		case <-b.ctx.Done():
+			return
+		case b.msgChan <- msg:
+		}
+	} else {
+		select {
+		case b.msgChan <- msg:
+		default:
+		}
+	}
+}
+
 func (b *tuiStreamBridge) OnChunk(token string) {
-	b.msgChan <- agentChunkMsg(token)
+	b.send(agentChunkMsg(token))
 }
 
 func (b *tuiStreamBridge) OnToolStart(toolName, command string) {
-	b.msgChan <- toolStartMsg{
+	b.send(toolStartMsg{
 		toolName: toolName,
 		command:  command,
-	}
+	})
 }
 
 func (b *tuiStreamBridge) OnToolDone(toolName, output string, exitCode int) {
-	b.msgChan <- toolDoneMsg{
+	b.send(toolDoneMsg{
 		toolName: toolName,
 		output:   output,
 		exitCode: exitCode,
-	}
+	})
 }
 
 func (b *tuiStreamBridge) OnSubagentStart(role, model, prompt string) {
-	b.msgChan <- subagentStartMsg{
+	b.send(subagentStartMsg{
 		role:   role,
 		model:  model,
 		prompt: prompt,
-	}
+	})
 }
 
 func (b *tuiStreamBridge) OnSubagentTool(role, model, toolName, command, output string, exitCode int, isRunning bool) {
 	if isRunning {
-		b.msgChan <- toolStartMsg{
+		b.send(toolStartMsg{
 			toolName: fmt.Sprintf("[%s] %s", role, toolName),
 			command:  command,
-		}
+		})
 	} else {
-		b.msgChan <- toolDoneMsg{
+		b.send(toolDoneMsg{
 			toolName: fmt.Sprintf("[%s] %s", role, toolName),
 			output:   output,
 			exitCode: exitCode,
-		}
+		})
 	}
 }
 
 func (b *tuiStreamBridge) OnSubagentDone(role, model, result string, duration time.Duration, err error) {
-	b.msgChan <- subagentDoneMsg{
+	b.send(subagentDoneMsg{
 		role:     role,
 		model:    model,
 		result:   result,
 		duration: duration,
 		err:      err,
-	}
+	})
 }
 
 // listenStreamCmd continuously reads from the stream message channel and returns streamMsg.
@@ -939,17 +964,34 @@ func listenStreamCmd(msgChan <-chan tea.Msg) tea.Cmd {
 
 // runAgentTurnCmd launches an agent turn in a background goroutine with streaming.
 func (m *Model) runAgentTurnCmd(ctx context.Context, input string) tea.Cmd {
-	msgChan := make(chan tea.Msg, 64)
+	msgChan := make(chan tea.Msg, 2048)
 	m.streamChan = msgChan
-	bridge := &tuiStreamBridge{msgChan: msgChan}
+	bridge := &tuiStreamBridge{
+		ctx:     ctx,
+		msgChan: msgChan,
+	}
 
 	// Launch agent stream processing in background goroutine
 	go func() {
 		defer close(msgChan)
+		defer func() {
+			if r := recover(); r != nil {
+				select {
+				case <-ctx.Done():
+				case msgChan <- agentDoneMsg{
+					err: fmt.Errorf("agent internal error: %v", r),
+				}:
+				}
+			}
+		}()
+
 		reply, err := m.agent.ProcessStream(ctx, input, bridge)
-		msgChan <- agentDoneMsg{
+		select {
+		case <-ctx.Done():
+		case msgChan <- agentDoneMsg{
 			reply: reply,
 			err:   err,
+		}:
 		}
 	}()
 

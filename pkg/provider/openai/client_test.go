@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
@@ -456,3 +457,187 @@ func TestClient_StreamingMultiToolCallsWithIndexAndSchema(t *testing.T) {
 		t.Errorf("expected file_path 'README.md', got %+v", fc1.Args)
 	}
 }
+
+func TestClient_StreamingSSEErrorHandling(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("expected http.Flusher")
+		}
+
+		// SSE chunk with error payload from API (e.g. OpenCode error)
+		fmt.Fprintf(w, "data: %s\n\n", `{"error":{"message":"Request is missing parameter","type":"invalid_request"}}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	client := NewClient("test-model", server.URL, "key", server.Client())
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "hello"}}},
+		},
+	}
+
+	var streamErr error
+	for _, err := range client.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			streamErr = err
+			break
+		}
+	}
+
+	if streamErr == nil {
+		t.Fatalf("expected stream error for SSE error chunk, got nil")
+	}
+	if !strings.Contains(streamErr.Error(), "Request is missing parameter") {
+		t.Errorf("expected error message to contain 'Request is missing parameter', got %v", streamErr)
+	}
+}
+
+func TestClient_StreamingFinishReasonWithoutDone(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("expected http.Flusher")
+		}
+
+		// SSE chunk with text
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"content":"Hi there"}}]}`)
+		flusher.Flush()
+
+		// SSE chunk with finish_reason and NO subsequent [DONE], connection kept open
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{},"finish_reason":"stop"}]}`)
+		flusher.Flush()
+
+		// Keep connection open without closing or writing [DONE] for 200ms
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	client := NewClient("test-model", server.URL, "key", server.Client())
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var chunks []string
+	var finalResp *model.LLMResponse
+	for resp, err := range client.GenerateContent(ctx, req, true) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.Partial && len(resp.Content.Parts) > 0 {
+			chunks = append(chunks, resp.Content.Parts[0].Text)
+		}
+		if resp.TurnComplete {
+			finalResp = resp
+		}
+	}
+
+	if strings.Join(chunks, "") != "Hi there" {
+		t.Errorf("expected chunks 'Hi there', got %q", strings.Join(chunks, ""))
+	}
+	if finalResp == nil || !finalResp.TurnComplete {
+		t.Errorf("expected TurnComplete response before timeout")
+	}
+}
+
+func TestClient_StreamingDataPrefixNoSpace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("expected http.Flusher")
+		}
+
+		// data: without space
+		fmt.Fprintf(w, "data:%s\n\n", `{"choices":[{"delta":{"content":"NoSpace"}}]}`)
+		flusher.Flush()
+		fmt.Fprintf(w, "data:[DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	client := NewClient("test-model", server.URL, "key", server.Client())
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+		},
+	}
+
+	var chunks []string
+	for resp, err := range client.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.Partial && len(resp.Content.Parts) > 0 {
+			chunks = append(chunks, resp.Content.Parts[0].Text)
+		}
+	}
+
+	if strings.Join(chunks, "") != "NoSpace" {
+		t.Errorf("expected 'NoSpace', got %q", strings.Join(chunks, ""))
+	}
+}
+
+func TestClient_ToolCallIDFallbackMatching(t *testing.T) {
+	client := NewClient("test-model", "http://localhost", "key", nil)
+
+	// Simulate conversation with preceding tool call and subsequent FunctionResponse with empty ID
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{
+				Role: "user",
+				Parts: []*genai.Part{{Text: "do something"}},
+			},
+			{
+				Role: "model",
+				Parts: []*genai.Part{
+					{
+						FunctionCall: &genai.FunctionCall{
+							ID:   "call_calc_42",
+							Name: "calculate",
+							Args: map[string]any{"x": 1},
+						},
+					},
+				},
+			},
+			{
+				Role: "user",
+				Parts: []*genai.Part{
+					{
+						FunctionResponse: &genai.FunctionResponse{
+							Name:     "calculate",
+							ID:       "", // Empty ID from ADK runner
+							Response: map[string]any{"result": 2},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	chatReq, err := client.convertRequest(req, false)
+	if err != nil {
+		t.Fatalf("convertRequest failed: %v", err)
+	}
+
+	if len(chatReq.Messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(chatReq.Messages))
+	}
+
+	toolMsg := chatReq.Messages[2]
+	if toolMsg.Role != "tool" {
+		t.Errorf("expected role 'tool', got %s", toolMsg.Role)
+	}
+	if toolMsg.ToolCallID != "call_calc_42" {
+		t.Errorf("expected ToolCallID to be matched to 'call_calc_42', got %q", toolMsg.ToolCallID)
+	}
+}
+
