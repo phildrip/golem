@@ -65,10 +65,10 @@ export interface SubagentNode {
 
 export interface MemoryItem {
 	id: number;
+	kind: 'user' | 'talk' | 'tool' | 'echo' | 'work';
+	text: string;
 	timestamp: string;
-	role: string;
-	content: string;
-	level: number;
+	size: number;
 }
 
 export interface PatchProposal {

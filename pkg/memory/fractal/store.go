@@ -417,6 +417,47 @@ func (s *Store) EventsSlice(start, end int) []Event {
 	return res
 }
 
+// GetAllEvents atomically acquires a read lock and returns a safe copy of all logged events.
+func (s *Store) GetAllEvents() []Event {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed || len(s.events) == 0 {
+		return []Event{}
+	}
+
+	res := make([]Event, len(s.events))
+	copy(res, s.events)
+	return res
+}
+
+// GetEventsPaginated atomically returns events for the given offset and limit.
+func (s *Store) GetEventsPaginated(offset, limit int) ([]Event, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return []Event{}, 0
+	}
+
+	total := len(s.events)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= total {
+		return []Event{}, total
+	}
+
+	end := offset + limit
+	if limit <= 0 || end > total {
+		end = total
+	}
+
+	res := make([]Event, end-offset)
+	copy(res, s.events[offset:end])
+	return res, total
+}
+
 // GetNode retrieves a node by coordinate (level, index).
 func (s *Store) GetNode(level, index int) (Node, bool) {
 	s.mu.RLock()

@@ -186,6 +186,18 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 			} else {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			}
+		case "memory":
+			if r.Method == http.MethodGet {
+				sess, ok := s.sessions.GetSession(sessionID)
+				if !ok {
+					writeError(w, http.StatusNotFound, "session not found")
+					return
+				}
+				events := sess.Agent.Store().GetAllEvents()
+				writeJSON(w, http.StatusOK, events)
+			} else {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			}
 		default:
 			http.NotFound(w, r)
 		}

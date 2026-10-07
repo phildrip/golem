@@ -11,6 +11,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/user/golem/pkg/golem"
+	"github.com/user/golem/pkg/memory/fractal"
 )
 
 func TestHub_BroadcastAndClientReceive(t *testing.T) {
@@ -125,7 +126,21 @@ func TestServer_RESTEndpoints(t *testing.T) {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
 	}
 
-	// 5. DELETE /api/sessions/{id}
+	// 5. Test GET /api/sessions/{id}/memory
+	memResp, err := client.Get(testServer.URL + "/api/sessions/" + sessInfo.ID + "/memory")
+	if err != nil {
+		t.Fatalf("GET /api/sessions/{id}/memory failed: %v", err)
+	}
+	if memResp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK for memory endpoint, got %d", memResp.StatusCode)
+	}
+	var memEvents []fractal.Event
+	if err := json.NewDecoder(memResp.Body).Decode(&memEvents); err != nil {
+		t.Fatalf("failed decoding memory events: %v", err)
+	}
+	memResp.Body.Close()
+
+	// 6. DELETE /api/sessions/{id}
 	req, _ := http.NewRequest(http.MethodDelete, testServer.URL+"/api/sessions/"+sessInfo.ID, nil)
 	resp, err = client.Do(req)
 	if err != nil {

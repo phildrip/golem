@@ -5,16 +5,20 @@
 	import ChatArea from '$lib/components/ChatArea.svelte';
 	import PromptInput from '$lib/components/PromptInput.svelte';
 	import SwarmTree from '$lib/components/SwarmTree.svelte';
+	import MemoryExplorer from '$lib/components/MemoryExplorer.svelte';
+	import PatchInspector from '$lib/components/PatchInspector.svelte';
 	import { realtime } from '$lib/client';
 	import {
 		sessions,
 		activeSessionId,
 		messages,
 		subagents,
+		memory,
+		patches,
 		isGenerating,
 		serverConnected
 	} from '$lib/stores';
-	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode } from '$lib/types';
+	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal } from '$lib/types';
 
 	let activeSession = $derived(
 		$sessions.find((s) => s.id === $activeSessionId) || null
@@ -28,9 +32,20 @@
 		$activeSessionId && $subagents[$activeSessionId] ? $subagents[$activeSessionId] : []
 	);
 
+	let currentMemory = $derived(
+		$activeSessionId && $memory[$activeSessionId] ? $memory[$activeSessionId] : []
+	);
+
+	let currentPatches = $derived(
+		$activeSessionId && $patches[$activeSessionId] ? $patches[$activeSessionId] : []
+	);
+
 	let currentGenerating = $derived(
 		$activeSessionId ? Boolean($isGenerating[$activeSessionId]) : false
 	);
+
+	let showMemoryExplorer = $state(false);
+	let showPatchInspector = $state(false);
 
 	let unsubscribeWS: (() => void) | null = null;
 
@@ -80,6 +95,63 @@
 			}
 		} catch (err) {
 			console.error('Failed to create session:', err);
+		}
+	}
+
+	async function fetchSessionMemory(id: string) {
+		try {
+			const res = await fetch(`/api/sessions/${id}/memory`);
+			if (res.ok) {
+				const events = (await res.json()) as MemoryItem[];
+				$memory = { ...$memory, [id]: events };
+			}
+		} catch (err) {
+			console.error('Failed to load session memory:', err);
+		}
+	}
+
+	const ALLOWED_OPS = new Set(['SWAP', 'DEL', 'INS_PRE', 'INS_POST', 'SWAP.BLK', 'DEL.BLK', 'INS.BLK.PRE', 'INS.BLK.POST']);
+
+	async function applyPatch(patch: PatchProposal) {
+		if (!ALLOWED_OPS.has(patch.op)) {
+			throw new Error(`Invalid patch operation: ${patch.op}`);
+		}
+		if (!patch.filePath || !patch.anchor) {
+			throw new Error('Patch must contain both filePath and anchor');
+		}
+
+		const res = await fetch('/api/patch', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				file_path: patch.filePath,
+				op: patch.op,
+				anchor: patch.anchor,
+				content: patch.content,
+				dry_run: false
+			})
+		});
+		if (!res.ok) {
+			const errData = await res.json().catch(() => ({ error: 'Failed to apply patch' }));
+			throw new Error(errData.error || res.statusText);
+		}
+		// Remove applied patch from list
+		if ($activeSessionId) {
+			const list = $patches[$activeSessionId] || [];
+			$patches = {
+				...$patches,
+				[$activeSessionId]: list.filter((p) => p !== patch)
+			};
+		}
+	}
+
+	function rejectPatch(patch: PatchProposal) {
+		if ($activeSessionId) {
+			const list = $patches[$activeSessionId] || [];
+			$patches = {
+				...$patches,
+				[$activeSessionId]: list.filter((p) => p !== patch)
+			};
 		}
 	}
 
@@ -267,6 +339,20 @@
 				}
 				break;
 			}
+
+			case 'memory_added': {
+				const payload = event.payload as MemoryItem;
+				const current = $memory[sessId] || [];
+				$memory = { ...$memory, [sessId]: [...current, payload] };
+				break;
+			}
+
+			case 'patch_proposed': {
+				const payload = event.payload as PatchProposal;
+				const current = $patches[sessId] || [];
+				$patches = { ...$patches, [sessId]: [...current, payload] };
+				break;
+			}
 		}
 	}
 </script>
@@ -285,7 +371,44 @@
 		</div>
 
 		<!-- Status & Indicators -->
-		<div class="flex items-center gap-3">
+		<div class="flex items-center gap-2">
+			<!-- Fractal Memory Toggle -->
+			<button
+				type="button"
+				onclick={() => {
+					showMemoryExplorer = !showMemoryExplorer;
+					if (showMemoryExplorer && $activeSessionId) {
+						fetchSessionMemory($activeSessionId);
+					}
+				}}
+				class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-slate-300 font-medium transition-colors"
+				title="Explore bbolt fractal memory"
+			>
+				<Database class="w-3.5 h-3.5 text-emerald-400" />
+				<span>Memory</span>
+				{#if currentMemory.length > 0}
+					<span class="px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-400 text-[10px] font-mono">
+						{currentMemory.length}
+					</span>
+				{/if}
+			</button>
+
+			<!-- Hashline Patch Inspector Toggle -->
+			<button
+				type="button"
+				onclick={() => (showPatchInspector = !showPatchInspector)}
+				class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-slate-300 font-medium transition-colors"
+				title="Inspect hashline patches"
+			>
+				<GitPullRequest class="w-3.5 h-3.5 text-blue-400" />
+				<span>Patches</span>
+				{#if currentPatches.length > 0}
+					<span class="px-1.5 py-0.2 rounded-full bg-blue-500 text-white text-[10px] font-mono font-bold animate-pulse">
+						{currentPatches.length}
+					</span>
+				{/if}
+			</button>
+
 			<div class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 border border-slate-800 text-[11px] font-mono">
 				{#if $serverConnected}
 					<Wifi class="w-3.5 h-3.5 text-emerald-400" />
@@ -302,7 +425,10 @@
 	<SessionTabs
 		sessions={$sessions}
 		activeId={$activeSessionId}
-		onSelect={(id) => ($activeSessionId = id)}
+		onSelect={(id) => {
+			$activeSessionId = id;
+			if (showMemoryExplorer) fetchSessionMemory(id);
+		}}
 		onCreate={createNewSession}
 		onClose={closeSession}
 	/>
@@ -328,4 +454,23 @@
 			/>
 		</aside>
 	</div>
+
+	<!-- Fractal Memory Drawer -->
+	{#if showMemoryExplorer}
+		<MemoryExplorer
+			memoryItems={currentMemory}
+			onClose={() => (showMemoryExplorer = false)}
+			onRefresh={() => $activeSessionId && fetchSessionMemory($activeSessionId)}
+		/>
+	{/if}
+
+	<!-- Hashline Patch Inspector Drawer -->
+	{#if showPatchInspector}
+		<PatchInspector
+			patches={currentPatches}
+			onClose={() => (showPatchInspector = false)}
+			onApplyPatch={applyPatch}
+			onRejectPatch={rejectPatch}
+		/>
+	{/if}
 </div>
