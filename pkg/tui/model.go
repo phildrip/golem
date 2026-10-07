@@ -241,8 +241,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if m.showProfileModal {
 			switch msg.Type {
-			case tea.KeyCtrlC, tea.KeyCtrlD:
+			case tea.KeyCtrlC:
 				return m, tea.Quit
+			case tea.KeyCtrlD:
+				m.profileViewport.HalfViewDown()
+				return m, nil
+			case tea.KeyCtrlU:
+				m.profileViewport.HalfViewUp()
+				return m, nil
 			case tea.KeyEsc:
 				m.showProfileModal = false
 				if !m.isBlurred {
@@ -289,8 +295,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.showMCPModal {
 			switch msg.Type {
-			case tea.KeyCtrlC, tea.KeyCtrlD:
+			case tea.KeyCtrlC:
 				return m, tea.Quit
+			case tea.KeyCtrlD:
+				m.mcpViewport.HalfViewDown()
+				return m, nil
+			case tea.KeyCtrlU:
+				m.mcpViewport.HalfViewUp()
+				return m, nil
 			case tea.KeyEsc:
 				m.showMCPModal = false
 				if !m.isBlurred {
@@ -337,8 +349,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.showShortcutsModal {
 			switch msg.Type {
-			case tea.KeyCtrlC, tea.KeyCtrlD:
+			case tea.KeyCtrlC:
 				return m, tea.Quit
+			case tea.KeyCtrlD:
+				m.shortcutsViewport.HalfViewDown()
+				return m, nil
+			case tea.KeyCtrlU:
+				m.shortcutsViewport.HalfViewUp()
+				return m, nil
 			case tea.KeyEsc, tea.KeyCtrlK:
 				m.showShortcutsModal = false
 				if !m.isBlurred {
@@ -385,8 +403,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.showTreeModal {
 			switch msg.Type {
-			case tea.KeyCtrlC, tea.KeyCtrlD:
+			case tea.KeyCtrlC:
 				return m, tea.Quit
+			case tea.KeyCtrlD:
+				m.treeViewport.HalfViewDown()
+				return m, nil
+			case tea.KeyCtrlU:
+				m.treeViewport.HalfViewUp()
+				return m, nil
 			case tea.KeyEsc, tea.KeyCtrlT:
 				m.showTreeModal = false
 				if !m.isBlurred {
@@ -443,11 +467,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.Type {
 		case tea.KeyCtrlD:
-			if m.cancelTurn != nil {
-				m.cancelTurn()
-				m.cancelTurn = nil
+			// 1. If LLM turn is running: do not exit on Ctrl+D (turn interruption is reserved for Ctrl+C)
+			if m.isLoading {
+				return m, nil
 			}
+
+			// 2. If textarea is blurred (navigation mode), scroll conversation viewport down half a page
+			if m.isBlurred {
+				m.viewport.HalfViewDown()
+				return m, nil
+			}
+
+			// 3. If textarea has text: forward to textarea to perform standard forward-delete
+			if len(m.textarea.Value()) > 0 {
+				var tiCmd tea.Cmd
+				m.textarea, tiCmd = m.textarea.Update(msg)
+				return m, tiCmd
+			}
+
+			// 4. Prompt is empty and idle: exit with EOF
 			return m, tea.Quit
+
+		case tea.KeyCtrlU:
+			// If textarea is blurred (navigation mode), scroll conversation viewport up half a page
+			if m.isBlurred {
+				m.viewport.HalfViewUp()
+				return m, nil
+			}
 
 		case tea.KeyCtrlC:
 			// 1. If LLM turn is running: interrupt it
@@ -759,7 +805,7 @@ func (m Model) View() string {
 		if strings.HasPrefix(val, "/") {
 			statusLine = m.renderSlashCommandHelp(val)
 		} else {
-			statusLine = StatusBarKeyHintStyle.Render("[Enter: Send • ↑/↓: History • Ctrl+K: Shortcuts • Ctrl+C: Clear/Exit • Ctrl+D: Exit • /: Commands]")
+			statusLine = StatusBarKeyHintStyle.Render("[Enter: Send • ↑/↓: History • Ctrl+K: Shortcuts • Ctrl+C: Clear/Exit • Ctrl+D: Exit (empty) • /: Commands]")
 		}
 	}
 
@@ -1141,7 +1187,7 @@ func (m Model) generateShortcutsVisual() string {
 				{"↑ (Up)", "Previous prompt", "Cycle backwards through prompt history"},
 				{"↓ (Down)", "Next prompt", "Cycle forward through prompt history / draft"},
 				{"Ctrl+C", "Clear line / Interrupt", "Interrupts running turn; if idle, clears line; if line empty, exits"},
-				{"Ctrl+D", "Exit Golem", "Terminates the application immediately"},
+				{"Ctrl+D", "Exit / Forward Delete", "Exits when prompt is empty & idle; forward-deletes char when typing"},
 			},
 		},
 		{
@@ -1149,8 +1195,8 @@ func (m Model) generateShortcutsVisual() string {
 			items: []shortcutItem{
 				{"Ctrl+↑ / Shift+↑", "Scroll up", "Scrolls conversation viewport up by 2 lines"},
 				{"Ctrl+↓ / Shift+↓", "Scroll down", "Scrolls conversation viewport down by 2 lines"},
-				{"PgUp", "Half page up", "Scrolls conversation viewport up by half a page"},
-				{"PgDn", "Half page down", "Scrolls conversation viewport down by half a page"},
+				{"PgUp / Ctrl+U", "Half page up", "Scrolls conversation viewport up by half a page (when blurred)"},
+				{"PgDn / Ctrl+D", "Half page down", "Scrolls conversation viewport down by half a page (when blurred)"},
 			},
 		},
 		{
@@ -1167,7 +1213,7 @@ func (m Model) generateShortcutsVisual() string {
 			items: []shortcutItem{
 				{"↑ / k", "Scroll up 1 line", "Navigate modal contents"},
 				{"↓ / j", "Scroll down 1 line", "Navigate modal contents"},
-				{"PgUp / PgDn", "Half page scroll", "Page through modal contents"},
+				{"PgUp / PgDn / Ctrl+D / Ctrl+U", "Half page scroll", "Page through modal contents (Vim / pager)"},
 				{"Home / End", "Jump top / bottom", "Go directly to top or bottom of modal"},
 				{"Esc / q", "Close modal", "Return to main chat interface"},
 			},

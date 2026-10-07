@@ -518,16 +518,57 @@ func TestModel_CtrlCAndCtrlD(t *testing.T) {
 	defer store.Close()
 	view := fractal.NewView(store, fractal.DefaultViewConfig())
 
-	t.Run("Ctrl+D exits unconditionally", func(t *testing.T) {
+	t.Run("Ctrl+D on empty line when idle exits", func(t *testing.T) {
 		m := NewModel(nil, store, view)
-		m.textarea.SetValue("some draft text")
+		m.textarea.SetValue("")
 		_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
 		if cmd == nil {
-			t.Fatalf("expected tea.Quit cmd on Ctrl+D")
+			t.Fatalf("expected tea.Quit cmd on Ctrl+D when line is empty")
 		}
 		msg := cmd()
 		if _, ok := msg.(tea.QuitMsg); !ok {
 			t.Errorf("expected tea.QuitMsg, got %T", msg)
+		}
+	})
+
+	t.Run("Ctrl+D on non-empty line performs forward delete and does not exit", func(t *testing.T) {
+		m := NewModel(nil, store, view)
+		m.textarea.SetValue("draft")
+		m.textarea.CursorStart()
+		newM, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		res := newM.(Model)
+		if cmd != nil {
+			msg := cmd()
+			if _, isQuit := msg.(tea.QuitMsg); isQuit {
+				t.Fatalf("expected no quit cmd when Ctrl+D has text in buffer")
+			}
+		}
+		// Expect 'd' to be forward deleted
+		if res.textarea.Value() != "raft" {
+			t.Errorf("expected forward delete 'raft', got %q", res.textarea.Value())
+		}
+	})
+
+	t.Run("Ctrl+D while loading turn is ignored and does not quit", func(t *testing.T) {
+		m := NewModel(nil, store, view)
+		cancelled := false
+		m.isLoading = true
+		m.cancelTurn = func() {
+			cancelled = true
+		}
+		newM, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		res := newM.(Model)
+		if cmd != nil {
+			msg := cmd()
+			if _, isQuit := msg.(tea.QuitMsg); isQuit {
+				t.Fatalf("expected no quit cmd when Ctrl+D pressed while loading")
+			}
+		}
+		if cancelled {
+			t.Errorf("expected cancelTurn not to be invoked on Ctrl+D")
+		}
+		if !res.isLoading {
+			t.Errorf("expected isLoading to remain true")
 		}
 	})
 
@@ -583,16 +624,30 @@ func TestModel_CtrlCAndCtrlD(t *testing.T) {
 		}
 	})
 
-	t.Run("Ctrl+D and Ctrl+C in tree modal exits", func(t *testing.T) {
+	t.Run("Ctrl+D and Ctrl+U in tree modal scrolls half page and does not exit", func(t *testing.T) {
 		m := NewModel(nil, store, view)
 		m.showTreeModal = true
 
-		_, cmdD := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
-		if cmdD == nil {
-			t.Fatalf("expected quit cmd on Ctrl+D in modal")
+		newM, cmdD := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		if cmdD != nil {
+			if _, isQuit := cmdD().(tea.QuitMsg); isQuit {
+				t.Errorf("expected no quit on Ctrl+D in tree modal")
+			}
 		}
-		if _, ok := cmdD().(tea.QuitMsg); !ok {
-			t.Errorf("expected tea.QuitMsg on Ctrl+D in modal")
+		res := newM.(Model)
+		if !res.showTreeModal {
+			t.Errorf("expected tree modal to remain open on Ctrl+D")
+		}
+
+		newM2, cmdU := res.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+		if cmdU != nil {
+			if _, isQuit := cmdU().(tea.QuitMsg); isQuit {
+				t.Errorf("expected no quit on Ctrl+U in tree modal")
+			}
+		}
+		res2 := newM2.(Model)
+		if !res2.showTreeModal {
+			t.Errorf("expected tree modal to remain open on Ctrl+U")
 		}
 
 		_, cmdC := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
@@ -604,16 +659,19 @@ func TestModel_CtrlCAndCtrlD(t *testing.T) {
 		}
 	})
 
-	t.Run("Ctrl+D and Ctrl+C in shortcuts modal exits", func(t *testing.T) {
+	t.Run("Ctrl+D and Ctrl+U in shortcuts modal scrolls half page and does not exit", func(t *testing.T) {
 		m := NewModel(nil, store, view)
 		m.showShortcutsModal = true
 
-		_, cmdD := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
-		if cmdD == nil {
-			t.Fatalf("expected quit cmd on Ctrl+D in shortcuts modal")
+		newM, cmdD := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		if cmdD != nil {
+			if _, isQuit := cmdD().(tea.QuitMsg); isQuit {
+				t.Errorf("expected no quit on Ctrl+D in shortcuts modal")
+			}
 		}
-		if _, ok := cmdD().(tea.QuitMsg); !ok {
-			t.Errorf("expected tea.QuitMsg on Ctrl+D in shortcuts modal")
+		res := newM.(Model)
+		if !res.showShortcutsModal {
+			t.Errorf("expected shortcuts modal to remain open on Ctrl+D")
 		}
 
 		_, cmdC := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
@@ -623,6 +681,50 @@ func TestModel_CtrlCAndCtrlD(t *testing.T) {
 		if _, ok := cmdC().(tea.QuitMsg); !ok {
 			t.Errorf("expected tea.QuitMsg on Ctrl+C in shortcuts modal")
 		}
+	})
+
+	t.Run("Ctrl+D in profile and MCP modals scrolls and does not exit", func(t *testing.T) {
+		m := NewModel(nil, store, view)
+		m.showProfileModal = true
+		newM, cmdD := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		if cmdD != nil {
+			if _, isQuit := cmdD().(tea.QuitMsg); isQuit {
+				t.Errorf("expected no quit on Ctrl+D in profile modal")
+			}
+		}
+		if !newM.(Model).showProfileModal {
+			t.Errorf("expected profile modal to remain open")
+		}
+
+		m2 := NewModel(nil, store, view)
+		m2.showMCPModal = true
+		newM2, cmdD2 := m2.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		if cmdD2 != nil {
+			if _, isQuit := cmdD2().(tea.QuitMsg); isQuit {
+				t.Errorf("expected no quit on Ctrl+D in MCP modal")
+			}
+		}
+		if !newM2.(Model).showMCPModal {
+			t.Errorf("expected MCP modal to remain open")
+		}
+	})
+
+	t.Run("Ctrl+D and Ctrl+U when blurred scrolls conversation viewport", func(t *testing.T) {
+		m := NewModel(nil, store, view)
+		m.isBlurred = true
+		newM, cmdD := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		if cmdD != nil {
+			if _, isQuit := cmdD().(tea.QuitMsg); isQuit {
+				t.Errorf("expected no quit on Ctrl+D when blurred")
+			}
+		}
+		newM2, cmdU := newM.(Model).Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+		if cmdU != nil {
+			if _, isQuit := cmdU().(tea.QuitMsg); isQuit {
+				t.Errorf("expected no quit on Ctrl+U when blurred")
+			}
+		}
+		_ = newM2
 	})
 }
 
