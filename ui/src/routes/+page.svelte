@@ -107,8 +107,13 @@
 			if (res.ok) {
 				const list = (await res.json()) as SessionInfo[];
 				$sessions = list;
-				if (list.length > 0 && !$activeSessionId) {
-					$activeSessionId = list[0].id;
+				if (list.length > 0) {
+					if (!$activeSessionId || !list.some((s) => s.id === $activeSessionId)) {
+						$activeSessionId = list[0].id;
+					}
+					fetchSessionMemory($activeSessionId);
+				} else {
+					createNewSession();
 				}
 			}
 		} catch {
@@ -127,6 +132,7 @@
 				const created = (await res.json()) as SessionInfo;
 				$sessions = [...$sessions, created];
 				$activeSessionId = created.id;
+				fetchSessionMemory(created.id);
 			}
 		} catch (err) {
 			console.error('Failed to create session:', err);
@@ -139,6 +145,31 @@
 			if (res.ok) {
 				const events = (await res.json()) as MemoryItem[];
 				$memory = { ...$memory, [id]: events };
+
+				// Reconstruct messages from fractal memory events if chat messages list is empty
+				if (!$messages[id] || $messages[id].length === 0) {
+					const reconstructed: ChatMessage[] = [];
+					for (const ev of events) {
+						if (ev.kind === 'user') {
+							reconstructed.push({
+								id: `user-${ev.id}`,
+								role: 'user',
+								content: ev.text,
+								timestamp: ev.timestamp
+							});
+						} else if (ev.kind === 'talk') {
+							reconstructed.push({
+								id: `asst-${ev.id}`,
+								role: 'assistant',
+								content: ev.text,
+								timestamp: ev.timestamp
+							});
+						}
+					}
+					if (reconstructed.length > 0) {
+						$messages = { ...$messages, [id]: reconstructed };
+					}
+				}
 			}
 		} catch (err) {
 			console.error('Failed to load session memory:', err);
@@ -262,6 +293,23 @@
 		}
 	}
 
+	function getOrCreateAssistantMessage(sessId: string, timestamp?: string): ChatMessage {
+		const list = $messages[sessId] || [];
+		const last = list[list.length - 1];
+		if (last && last.role === 'assistant') {
+			return last;
+		}
+		const newMsg: ChatMessage = {
+			id: `asst-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+			role: 'assistant',
+			content: '',
+			toolCalls: [],
+			timestamp: timestamp || new Date().toISOString()
+		};
+		$messages = { ...$messages, [sessId]: [...list, newMsg] };
+		return newMsg;
+	}
+
 	function handleRealtimeEvent(event: WSEvent) {
 		const sessId = event.session_id;
 		if (!sessId) {
@@ -270,62 +318,85 @@
 		}
 
 		switch (event.type) {
-			case 'agent_chunk': {
-				const payload = event.payload as { delta?: string };
-				if (!payload.delta) break;
-
-				const list = $messages[sessId] || [];
-				const last = list[list.length - 1];
-				if (last && last.role === 'assistant') {
-					last.content += payload.delta;
-					$messages = { ...$messages, [sessId]: [...list] };
-				} else {
-					const newMsg: ChatMessage = {
-						id: `asst-${Date.now()}`,
-						role: 'assistant',
-						content: payload.delta,
-						timestamp: event.timestamp
-					};
-					$messages = { ...$messages, [sessId]: [...list, newMsg] };
+			case 'user_prompt': {
+				const payload = event.payload as { prompt?: string };
+				if (payload.prompt) {
+					const list = $messages[sessId] || [];
+					const last = list[list.length - 1];
+					if (!last || last.role !== 'user' || last.content !== payload.prompt) {
+						const newMsg: ChatMessage = {
+							id: `user-${Date.now()}`,
+							role: 'user',
+							content: payload.prompt,
+							timestamp: event.timestamp || new Date().toISOString()
+						};
+						$messages = { ...$messages, [sessId]: [...list, newMsg] };
+					}
+					$isGenerating = { ...$isGenerating, [sessId]: true };
 				}
+				break;
+			}
+
+			case 'agent_chunk': {
+				const payload = event.payload as { delta?: string; token?: string };
+				const text = payload.delta || payload.token || '';
+				if (!text) break;
+
+				const msg = getOrCreateAssistantMessage(sessId, event.timestamp);
+				msg.content += text;
+				$messages = { ...$messages, [sessId]: [...($messages[sessId] || [])] };
 				break;
 			}
 
 			case 'agent_done': {
 				$isGenerating = { ...$isGenerating, [sessId]: false };
+				const payload = event.payload as { response?: string; error?: string };
+				if (payload.error) {
+					const msg = getOrCreateAssistantMessage(sessId, event.timestamp);
+					if (msg.content) {
+						msg.content += `\n\n⚠️ **Error:** ${payload.error}`;
+					} else {
+						msg.content = `⚠️ **Error:** ${payload.error}`;
+					}
+					$messages = { ...$messages, [sessId]: [...($messages[sessId] || [])] };
+				} else if (payload.response) {
+					const msg = getOrCreateAssistantMessage(sessId, event.timestamp);
+					if (!msg.content) {
+						msg.content = payload.response;
+						$messages = { ...$messages, [sessId]: [...($messages[sessId] || [])] };
+					}
+				}
+				fetchSessionMemory(sessId);
 				break;
 			}
 
 			case 'tool_start': {
-				const payload = event.payload as { tool: string; args: Record<string, unknown>; tool_call_id?: string };
-				const list = $messages[sessId] || [];
-				const last = list[list.length - 1];
+				const payload = event.payload as { tool?: string; command?: string; args?: Record<string, unknown>; tool_call_id?: string };
 				const toolCall = {
 					id: payload.tool_call_id || `tool-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-					toolName: payload.tool,
-					args: payload.args,
+					toolName: payload.tool || 'tool',
+					args: payload.args || (payload.command ? { command: payload.command } : {}),
 					status: 'running' as const
 				};
 
-				if (last && last.role === 'assistant') {
-					last.toolCalls = [...(last.toolCalls || []), toolCall];
-					$messages = { ...$messages, [sessId]: [...list] };
-				}
+				const msg = getOrCreateAssistantMessage(sessId, event.timestamp);
+				msg.toolCalls = [...(msg.toolCalls || []), toolCall];
+				$messages = { ...$messages, [sessId]: [...($messages[sessId] || [])] };
 				break;
 			}
 
 			case 'tool_done': {
-				const payload = event.payload as { tool: string; output: string; tool_call_id?: string };
+				const payload = event.payload as { tool?: string; output?: string; tool_call_id?: string; exit_code?: number };
 				const list = $messages[sessId] || [];
 				const last = list[list.length - 1];
-				if (last && last.role === 'assistant' && last.toolCalls) {
+				if (last && last.role === 'assistant' && last.toolCalls && last.toolCalls.length > 0) {
 					// Match by tool_call_id if provided, else fallback to latest running tool with matching name
 					const t = payload.tool_call_id
 						? last.toolCalls.find((x) => x.id === payload.tool_call_id)
-						: last.toolCalls.find((x) => x.toolName === payload.tool && x.status === 'running');
+						: last.toolCalls.find((x) => x.toolName === payload.tool && x.status === 'running') || last.toolCalls[last.toolCalls.length - 1];
 					if (t) {
-						t.status = 'done';
-						t.output = payload.output;
+						t.status = (payload.exit_code === 0 || payload.exit_code === undefined) ? 'done' : 'error';
+						t.output = payload.output || '';
 						$messages = { ...$messages, [sessId]: [...list] };
 					}
 				}

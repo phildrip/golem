@@ -57,11 +57,12 @@ func (sm *SessionManager) CreateSession(ctx context.Context, title string) (*Ses
 		title = fmt.Sprintf("Session %d", len(sm.sessions)+1)
 	}
 
-	// Session storage directory: isolated per session or sharing project store
+	// Session storage directory: isolated per session
 	cfg := sm.baseCfg
 	if cfg.StorageDir == "" {
 		cfg.StorageDir = golem.DefaultConfig().StorageDir
 	}
+	cfg.StorageDir = filepath.Join(cfg.StorageDir, id)
 	sessCtx, cancel := context.WithCancel(context.Background())
 	agentInstance, err := golem.New(sessCtx, cfg)
 	if err != nil {
@@ -322,13 +323,17 @@ type sessionStreamAdapter struct {
 }
 
 func (a *sessionStreamAdapter) OnChunk(token string) {
-	_ = a.hub.Broadcast(WSEventAgentChunk, a.sessionID, map[string]string{"token": token})
+	_ = a.hub.Broadcast(WSEventAgentChunk, a.sessionID, map[string]string{
+		"token": token,
+		"delta": token,
+	})
 }
 
 func (a *sessionStreamAdapter) OnToolStart(toolName, command string) {
-	_ = a.hub.Broadcast(WSEventToolStart, a.sessionID, map[string]string{
+	_ = a.hub.Broadcast(WSEventToolStart, a.sessionID, map[string]any{
 		"tool":    toolName,
 		"command": command,
+		"args":    map[string]any{"command": command},
 	})
 }
 
