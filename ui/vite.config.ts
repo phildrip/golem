@@ -13,7 +13,10 @@ export default defineConfig({
 				fallback: 'index.html',
 				precompress: false,
 				strict: true
-			})
+			}),
+			alias: {
+				$lib: 'src/lib'
+			}
 		})
 	],
 	server: {

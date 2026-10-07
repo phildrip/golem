@@ -4,6 +4,10 @@
   "description": "",
   "main": "index.js",
   "type": "module",
+  "imports": {
+    "#lib": "./src/lib/index.js",
+    "#lib/*": "./src/lib/*"
+  },
   "scripts": {
     "dev": "vite dev",
     "prebuild": "mkdir -p .svelte-kit && touch .svelte-kit/tsconfig.json && echo '{}' > .svelte-kit/tsconfig.json",
