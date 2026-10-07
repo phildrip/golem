@@ -18,6 +18,7 @@ import (
 	"github.com/mattn/go-isatty"
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
+	"github.com/user/golem/pkg/importer"
 	"github.com/user/golem/pkg/server"
 	"github.com/user/golem/pkg/tui"
 )
@@ -290,7 +291,7 @@ func main() {
 
 	if opts.Import != "" {
 		cwd, _ := os.Getwd()
-		_, err := HandleImportOption(opts.Import, agentInstance.Store(), cwd, os.Stdin, os.Stdout)
+		_, err := importer.HandleImportOption(opts.Import, agentInstance.Store(), cwd, os.Stdin, os.Stdout)
 		if err != nil {
 			log.Fatalf("Import error: %v", err)
 		}

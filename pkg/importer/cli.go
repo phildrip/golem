@@ -1,4 +1,4 @@
-package main
+package importer
 
 import (
 	"bufio"
@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/user/golem/pkg/importer"
 	"github.com/user/golem/pkg/memory/fractal"
 )
 
@@ -22,12 +21,12 @@ func HandleImportOption(importArg string, store *fractal.Store, workspaceDir str
 	}
 
 	cleanArg := strings.TrimSpace(importArg)
-	sessions, err := importer.DiscoverHistories(workspaceDir)
+	sessions, err := DiscoverHistories(workspaceDir)
 	if err != nil {
 		return false, errors.Wrap(err, "discovering local agent histories")
 	}
 
-	var targetSession *importer.DiscoveredSession
+	var targetSession *DiscoveredSession
 
 	switch cleanArg {
 	case "pick", "true", "interactive", "?":
@@ -49,7 +48,7 @@ func HandleImportOption(importArg string, store *fractal.Store, workspaceDir str
 	default:
 		// Check if argument is an existing path
 		if _, statErr := os.Stat(cleanArg); statErr == nil {
-			count, impErr := importer.ImportFileOrDir(cleanArg, store)
+			count, impErr := ImportFileOrDir(cleanArg, store)
 			if impErr != nil {
 				return false, errors.Wrapf(impErr, "importing from path %q", cleanArg)
 			}
@@ -70,7 +69,7 @@ func HandleImportOption(importArg string, store *fractal.Store, workspaceDir str
 	}
 
 	if targetSession != nil {
-		count, impErr := importer.ImportSession(*targetSession, store)
+		count, impErr := ImportSession(*targetSession, store)
 		if impErr != nil {
 			return false, errors.Wrapf(impErr, "importing session %s", targetSession.ID)
 		}
@@ -82,7 +81,7 @@ func HandleImportOption(importArg string, store *fractal.Store, workspaceDir str
 	return false, nil
 }
 
-func promptUserSessionPicker(sessions []importer.DiscoveredSession, in io.Reader, out io.Writer) (*importer.DiscoveredSession, error) {
+func promptUserSessionPicker(sessions []DiscoveredSession, in io.Reader, out io.Writer) (*DiscoveredSession, error) {
 	if len(sessions) == 0 {
 		return nil, errors.New("no importable histories found in local environment (checked Antigravity & Cursor)")
 	}
@@ -118,25 +117,28 @@ func promptUserSessionPicker(sessions []importer.DiscoveredSession, in io.Reader
 	}
 
 	if len(sessions) > limit {
-		fmt.Fprintf(out, "... and %d more sessions\n", len(sessions)-limit)
+		fmt.Fprintf(out, "\n... and %d older session(s) truncated\n", len(sessions)-limit)
 	}
-
-	fmt.Fprintln(out)
-	fmt.Fprintf(out, "Select session [1-%d] or 'q' to cancel: ", limit)
+	fmt.Fprintln(out, strings.Repeat("-", 80))
 
 	scanner := bufio.NewScanner(in)
-	if !scanner.Scan() {
-		return nil, nil
-	}
-	input := strings.TrimSpace(scanner.Text())
-	if strings.EqualFold(input, "q") || strings.EqualFold(input, "cancel") || input == "" {
-		return nil, nil
-	}
+	for {
+		fmt.Fprintf(out, "\nEnter session number to import (1-%d, or 'q' to cancel): ", limit)
+		if !scanner.Scan() {
+			return nil, errors.New("input stream closed")
+		}
+		text := strings.TrimSpace(scanner.Text())
+		if text == "q" || text == "exit" || text == "quit" {
+			return nil, nil
+		}
 
-	idx, err := strconv.Atoi(input)
-	if err != nil || idx < 1 || idx > limit {
-		return nil, errors.Errorf("invalid selection %q; please enter a number between 1 and %d", input, limit)
-	}
+		choice, err := strconv.Atoi(text)
+		if err != nil || choice < 1 || choice > limit {
+			fmt.Fprintf(out, "Invalid selection %q. Please enter a number between 1 and %d.\n", text, limit)
+			continue
+		}
 
-	return &sessions[idx-1], nil
+		selected := sessions[choice-1]
+		return &selected, nil
+	}
 }
