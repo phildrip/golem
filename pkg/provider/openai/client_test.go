@@ -346,3 +346,113 @@ func TestClient_OpenCodeSessionAndUserAgentHeaders(t *testing.T) {
 		t.Errorf("expected context override session 'session-ctx-override-888', got %q", receivedSession)
 	}
 }
+
+func TestClient_StreamingMultiToolCallsWithIndexAndSchema(t *testing.T) {
+	var receivedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("expected http.Flusher")
+		}
+
+		// SSE chunk 1: tool 0 start (shell)
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_shell_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}`)
+		flusher.Flush()
+
+		// SSE chunk 2: tool 0 args chunk 1
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]}}]}`)
+		flusher.Flush()
+
+		// SSE chunk 3: tool 0 args chunk 2
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"echo hello\"}"}}]}}]}`)
+		flusher.Flush()
+
+		// SSE chunk 4: tool 1 start (read_file)
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_read_2","type":"function","function":{"name":"read_file","arguments":"{\"file_path\":\"README.md\"}"}}]}}]}`)
+		flusher.Flush()
+
+		// SSE chunk 5: [DONE]
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	client := NewClient("deepseek-chat", server.URL, "key", server.Client())
+	req := &model.LLMRequest{
+		Config: &genai.GenerateContentConfig{
+			Tools: []*genai.Tool{
+				{
+					FunctionDeclarations: []*genai.FunctionDeclaration{
+						{
+							Name:        "shell",
+							Description: "Execute shell",
+							Parameters: &genai.Schema{
+								Type: genai.TypeObject,
+								Properties: map[string]*genai.Schema{
+									"command": {Type: genai.TypeString},
+								},
+								Required: []string{"command"},
+							},
+						},
+					},
+				},
+			},
+		},
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "run shell and read file"}}},
+		},
+	}
+
+	var finalResp *model.LLMResponse
+	for resp, err := range client.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.TurnComplete {
+			finalResp = resp
+		}
+	}
+
+	// Verify schema was lowercased in outgoing request
+	var chatReq openAIChatRequest
+	if err := json.Unmarshal(receivedBody, &chatReq); err != nil {
+		t.Fatalf("failed to unmarshal request: %v", err)
+	}
+	if len(chatReq.Tools) == 0 {
+		t.Fatalf("expected tools in request, got 0")
+	}
+	toolsJSON, _ := json.Marshal(chatReq.Tools)
+	if strings.Contains(string(toolsJSON), `"OBJECT"`) || strings.Contains(string(toolsJSON), `"STRING"`) {
+		t.Errorf("expected lowercased types in tools schema, got: %s", string(toolsJSON))
+	}
+	if !strings.Contains(string(toolsJSON), `"object"`) || !strings.Contains(string(toolsJSON), `"string"`) {
+		t.Errorf("expected lowercase object/string in tools schema, got: %s", string(toolsJSON))
+	}
+
+	// Verify tool calls
+	if finalResp == nil || finalResp.Content == nil {
+		t.Fatalf("expected final response with content")
+	}
+	if len(finalResp.Content.Parts) != 2 {
+		t.Fatalf("expected 2 tool calls in final parts, got %d", len(finalResp.Content.Parts))
+	}
+
+	fc0 := finalResp.Content.Parts[0].FunctionCall
+	if fc0 == nil || fc0.Name != "shell" || fc0.ID != "call_shell_1" {
+		t.Errorf("unexpected tool 0: %+v", fc0)
+	}
+	if cmd, ok := fc0.Args["command"].(string); !ok || cmd != "echo hello" {
+		t.Errorf("expected command 'echo hello', got %+v", fc0.Args)
+	}
+
+	fc1 := finalResp.Content.Parts[1].FunctionCall
+	if fc1 == nil || fc1.Name != "read_file" || fc1.ID != "call_read_2" {
+		t.Errorf("unexpected tool 1: %+v", fc1)
+	}
+	if path, ok := fc1.Args["file_path"].(string); !ok || path != "README.md" {
+		t.Errorf("expected file_path 'README.md', got %+v", fc1.Args)
+	}
+}

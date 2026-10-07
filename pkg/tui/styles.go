@@ -66,7 +66,7 @@ var (
 			BorderForeground(ColorBorder).
 			Padding(0, 1).
 			MarginTop(0).
-			MarginBottom(1)
+			MarginBottom(0)
 
 	ToolRunningBadge = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#000000")).
@@ -114,11 +114,12 @@ func RenderToolCard(toolName string, commandOrArgs string, output string, exitCo
 	header := fmt.Sprintf("⚡ Tool: %s %s", lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render(toolName), statusBadge)
 
 	contentLines := []string{header}
-	if commandOrArgs != "" {
+	if commandOrArgs != "" && commandOrArgs != "null" && commandOrArgs != "{}" {
 		contentLines = append(contentLines, lipgloss.NewStyle().Foreground(ColorMuted).Render("$ "+commandOrArgs))
 	}
 
-	if output != "" {
+	if output != "" && output != "null" && output != "{}" {
+		output = strings.TrimRight(output, "\r\n")
 		// Truncate output lines if excessive for display
 		lines := strings.Split(output, "\n")
 		if len(lines) > 8 {
@@ -129,8 +130,8 @@ func RenderToolCard(toolName string, commandOrArgs string, output string, exitCo
 
 	cardContent := strings.Join(contentLines, "\n")
 	cardStyle := ToolCardBox
-	if width > 4 {
-		cardStyle = cardStyle.Width(width - 4)
+	if width > 6 {
+		cardStyle = cardStyle.Width(width - 6)
 	}
 
 	return cardStyle.Render(cardContent)
@@ -178,8 +179,8 @@ func RenderSubagentCard(role, model, prompt, output string, isRunning bool, widt
 
 	cardContent := strings.Join(contentLines, "\n")
 	cardStyle := ToolCardBox
-	if width > 4 {
-		cardStyle = cardStyle.Width(width - 4)
+	if width > 6 {
+		cardStyle = cardStyle.Width(width - 6)
 	}
 
 	return cardStyle.Render(cardContent)

@@ -181,6 +181,10 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 						cmd = p
 					} else if fp, ok := toolArgs["file_path"].(string); ok {
 						cmd = fp
+					} else if pat, ok := toolArgs["pattern"].(string); ok {
+						cmd = pat
+					} else if q, ok := toolArgs["query"].(string); ok {
+						cmd = q
 					}
 					r.cfg.EventHandler(Event{
 						Type:      EventSubagentTool,
@@ -191,7 +195,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 						IsRunning: true,
 					})
 				}
-				return toolArgs, nil
+				return nil, nil
 			},
 		},
 		AfterToolCallbacks: []llmagent.AfterToolCallback{
@@ -203,8 +207,16 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 						out = toolErr.Error()
 						exitCode = 1
 					} else {
-						resBytes, _ := json.Marshal(result)
-						out = string(resBytes)
+						if o, ok := result["output"].(string); ok {
+							out = o
+						} else if c, ok := result["content"].(string); ok {
+							out = c
+						} else if res, ok := result["result"].(string); ok {
+							out = res
+						} else {
+							resBytes, _ := json.Marshal(result)
+							out = string(resBytes)
+						}
 						if ec, ok := result["exit_code"].(float64); ok {
 							exitCode = int(ec)
 						} else if ec, ok := result["exit_code"].(int); ok {
@@ -224,7 +236,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 						IsRunning:  false,
 					})
 				}
-				return result, toolErr
+				return nil, nil
 			},
 		},
 	})

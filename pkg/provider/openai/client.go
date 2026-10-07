@@ -9,6 +9,7 @@ import (
 	"io"
 	"iter"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -110,6 +111,7 @@ type openAIChatMessage struct {
 }
 
 type openAIToolCall struct {
+	Index    *int                   `json:"index,omitempty"`
 	ID       string                 `json:"id"`
 	Type     string                 `json:"type"`
 	Function openAIFunctionCallDesc `json:"function"`
@@ -276,6 +278,7 @@ func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChat
 				callID := part.FunctionCall.ID
 				if callID == "" {
 					callID = fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, time.Now().UnixNano())
+					part.FunctionCall.ID = callID
 				}
 				toolCalls = append(toolCalls, openAIToolCall{
 					ID:   callID,
@@ -323,12 +326,13 @@ func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChat
 				if decl == nil {
 					continue
 				}
+				paramsMap, _ := convertSchemaToOpenAI(decl.Parameters)
 				chatReq.Tools = append(chatReq.Tools, openAITool{
 					Type: "function",
 					Function: openAIFunctionSpec{
 						Name:        decl.Name,
 						Description: decl.Description,
-						Parameters:  decl.Parameters,
+						Parameters:  paramsMap,
 					},
 				})
 			}
@@ -336,6 +340,56 @@ func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChat
 	}
 
 	return chatReq, nil
+}
+
+func convertSchemaToOpenAI(schema *genai.Schema) (map[string]any, error) {
+	if schema == nil {
+		return map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		}, nil
+	}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	lowercaseSchemaTypes(result)
+	if _, ok := result["type"]; !ok {
+		result["type"] = "object"
+	}
+	if _, ok := result["properties"]; !ok && result["type"] == "object" {
+		result["properties"] = map[string]any{}
+	}
+	return result, nil
+}
+
+func lowercaseSchemaTypes(val any) {
+	switch v := val.(type) {
+	case map[string]any:
+		if t, ok := v["type"]; ok {
+			switch tVal := t.(type) {
+			case string:
+				v["type"] = strings.ToLower(tVal)
+			case []any:
+				for i, item := range tVal {
+					if str, ok := item.(string); ok {
+						tVal[i] = strings.ToLower(str)
+					}
+				}
+			}
+		}
+		for _, child := range v {
+			lowercaseSchemaTypes(child)
+		}
+	case []any:
+		for _, child := range v {
+			lowercaseSchemaTypes(child)
+		}
+	}
 }
 
 func (c *Client) handleUnaryResponse(r io.Reader, yield func(*model.LLMResponse, error) bool) {
@@ -364,11 +418,18 @@ func (c *Client) handleUnaryResponse(r io.Reader, yield func(*model.LLMResponse,
 	}
 
 	for _, tc := range msg.ToolCalls {
-		var args map[string]any
-		_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+		rawArgs := strings.TrimSpace(tc.Function.Arguments)
+		args := make(map[string]any)
+		if rawArgs != "" && rawArgs != "null" {
+			_ = json.Unmarshal([]byte(rawArgs), &args)
+		}
+		callID := tc.ID
+		if callID == "" {
+			callID = fmt.Sprintf("call_%s_%d", tc.Function.Name, time.Now().UnixNano())
+		}
 		parts = append(parts, &genai.Part{
 			FunctionCall: &genai.FunctionCall{
-				ID:   tc.ID,
+				ID:   callID,
 				Name: tc.Function.Name,
 				Args: args,
 			},
@@ -438,12 +499,21 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 			}
 		}
 
-		// Tool calls streaming
-		for idx, tc := range delta.ToolCalls {
-			acc, ok := accumulatedTools[idx]
+		// Tool calls streaming: check both delta and message tool calls
+		toolCalls := delta.ToolCalls
+		if len(toolCalls) == 0 && len(choice.Message.ToolCalls) > 0 {
+			toolCalls = choice.Message.ToolCalls
+		}
+
+		for idx, tc := range toolCalls {
+			toolIdx := idx
+			if tc.Index != nil {
+				toolIdx = *tc.Index
+			}
+			acc, ok := accumulatedTools[toolIdx]
 			if !ok {
 				acc = &toolAccumulator{}
-				accumulatedTools[idx] = acc
+				accumulatedTools[toolIdx] = acc
 			}
 			if tc.ID != "" {
 				acc.id = tc.ID
@@ -463,13 +533,31 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 		finalParts = append(finalParts, &genai.Part{Text: accumulatedText.String()})
 	}
 
-	for idx := 0; idx < len(accumulatedTools); idx++ {
-		acc := accumulatedTools[idx]
-		var args map[string]any
-		_ = json.Unmarshal([]byte(acc.args.String()), &args)
+	keys := make([]int, 0, len(accumulatedTools))
+	for k := range accumulatedTools {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+
+	for _, k := range keys {
+		acc := accumulatedTools[k]
+		if acc == nil || acc.name == "" {
+			continue
+		}
+		rawArgs := strings.TrimSpace(acc.args.String())
+		args := make(map[string]any)
+		if rawArgs != "" && rawArgs != "null" {
+			if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
+				// Failed to unmarshal
+			}
+		}
+		callID := acc.id
+		if callID == "" {
+			callID = fmt.Sprintf("call_%s_%d", acc.name, time.Now().UnixNano())
+		}
 		finalParts = append(finalParts, &genai.Part{
 			FunctionCall: &genai.FunctionCall{
-				ID:   acc.id,
+				ID:   callID,
 				Name: acc.name,
 				Args: args,
 			},

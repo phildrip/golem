@@ -572,6 +572,12 @@ Subagents & Delegation:
 					cmdStr = cmdArg
 				} else if pathArg, ok := args["path"].(string); ok {
 					cmdStr = pathArg
+				} else if fpArg, ok := args["file_path"].(string); ok {
+					cmdStr = fpArg
+				} else if patArg, ok := args["pattern"].(string); ok {
+					cmdStr = patArg
+				} else if qArg, ok := args["query"].(string); ok {
+					cmdStr = qArg
 				}
 				_, _ = store.AppendEvent(fractal.KindTool, fmt.Sprintf("%s: %s", t.Name(), string(argsBytes)))
 
@@ -583,7 +589,7 @@ Subagents & Delegation:
 						h.OnToolStart(t.Name(), cmdStr)
 					}
 				}
-				return args, nil
+				return nil, nil
 			},
 		},
 		AfterToolCallbacks: []llmagent.AfterToolCallback{
@@ -594,8 +600,16 @@ Subagents & Delegation:
 					out = fmt.Sprintf("error: %v", toolErr)
 					exitCode = 1
 				} else {
-					resBytes, _ := json.Marshal(result)
-					out = string(resBytes)
+					if o, ok := result["output"].(string); ok {
+						out = o
+					} else if c, ok := result["content"].(string); ok {
+						out = c
+					} else if res, ok := result["result"].(string); ok {
+						out = res
+					} else {
+						resBytes, _ := json.Marshal(result)
+						out = string(resBytes)
+					}
 					if ec, ok := result["exit_code"].(float64); ok {
 						exitCode = int(ec)
 					} else if ec, ok := result["exit_code"].(int); ok {
@@ -616,7 +630,7 @@ Subagents & Delegation:
 						h.OnToolDone(t.Name(), out, exitCode)
 					}
 				}
-				return result, toolErr
+				return nil, nil
 			},
 		},
 	})
