@@ -108,7 +108,7 @@ func (sm *SessionManager) ListSessions() []SessionInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
-	var list []SessionInfo
+	list := make([]SessionInfo, 0, len(sm.sessions))
 	for id, s := range sm.sessions {
 		list = append(list, SessionInfo{
 			ID:        id,

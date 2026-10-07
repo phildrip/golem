@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/mattn/go-isatty"
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
+	"github.com/user/golem/pkg/server"
 	"github.com/user/golem/pkg/tui"
 )
 
@@ -31,6 +33,8 @@ type CLIOptions struct {
 	ConfigPath string
 	NoTUI      bool
 	TUI        bool
+	Serve      bool
+	WebPort    int
 }
 
 // AgentProcessor defines the interface for executing agent turns.
@@ -50,6 +54,9 @@ func parseFlags(args []string) (CLIOptions, error) {
 	configPathFlag := fs.String("config", "", "Path to config file")
 	noTuiFlag := fs.Bool("no-tui", false, "Disable rich TUI and fall back to standard readline CLI")
 	tuiFlag := fs.Bool("tui", false, "Force enable rich TUI even if terminal detection is ambiguous")
+	serveFlag := fs.Bool("serve", false, "Launch realtime Web UI multiplexer server")
+	webFlag := fs.Bool("web", false, "Launch realtime Web UI multiplexer server (alias for -serve)")
+	portFlag := fs.Int("port", 8080, "Port for realtime Web UI server (default: 8080)")
 
 	if err := fs.Parse(args); err != nil {
 		return CLIOptions{}, err
@@ -65,6 +72,8 @@ func parseFlags(args []string) (CLIOptions, error) {
 		ConfigPath: *configPathFlag,
 		NoTUI:      *noTuiFlag,
 		TUI:        *tuiFlag,
+		Serve:      *serveFlag || *webFlag,
+		WebPort:    *portFlag,
 	}, nil
 }
 
@@ -229,6 +238,30 @@ func main() {
 	} else {
 		fmt.Println("Auth: Vertex AI / Application Default Credentials")
 	}
+
+	if opts.Serve {
+		fmt.Printf("\n🚀 Launching Golem Realtime Multiplexer Server on http://localhost:%d\n", opts.WebPort)
+		fmt.Printf("Web UI Cockpit active with parallel session tabs, swarm hierarchy, and fractal memory explorer.\n\n")
+
+		srv := server.NewServer(server.ServerConfig{
+			Port:         opts.WebPort,
+			BaseAgentCfg: cfg,
+			StaticFS:     server.GetEmbeddedUIFS(),
+		})
+
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
+
+		if err := srv.Start(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+		return
+	}
+
 	isTTY := isatty.IsTerminal(os.Stdout.Fd()) && isatty.IsTerminal(os.Stdin.Fd())
 	useTUI := determineUseTUI(isTTY, opts.TUI, opts.NoTUI)
 
