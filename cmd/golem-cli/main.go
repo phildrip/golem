@@ -243,13 +243,18 @@ func main() {
 		cancel()
 	}()
 
-	fmt.Println("Golem AI Agent (ADK v2 + Gemini Flash + Fractal Memory)")
-	fmt.Printf("Model: %s | Memory: %s\n", cfg.ModelName, cfg.StorageDir)
-	if cfg.APIKey != "" {
-		fmt.Println("Auth: Google AI Studio API Key")
-	} else {
-		fmt.Println("Auth: Vertex AI / Application Default Credentials")
+	providerLabel := cfg.Provider
+	if providerLabel == "" {
+		providerLabel = "gemini"
 	}
+	modelLabel := cfg.ModelName
+	if modelLabel == "" {
+		modelLabel = "gemini-flash-latest"
+	}
+
+	fmt.Printf("Golem AI Agent (ADK v2 + %s:%s + Fractal Memory)\n", providerLabel, modelLabel)
+	fmt.Printf("Model: %s | Memory: %s\n", cfg.ModelName, cfg.StorageDir)
+	fmt.Println(formatAuthStatus(cfg.Provider, cfg.APIKey))
 
 	if opts.Serve {
 		fmt.Printf("\n🚀 Launching Golem Realtime Multiplexer Server on http://localhost:%d\n", opts.WebPort)
@@ -324,3 +329,39 @@ func main() {
 		log.Printf("Readline error: %v", err)
 	}
 }
+
+// formatAuthStatus produces a user-facing authentication summary string based on the active provider.
+func formatAuthStatus(provider, apiKey string) string {
+	cleanProvider := strings.ToLower(strings.TrimSpace(provider))
+	switch cleanProvider {
+	case config.ProviderOpenCode:
+		if apiKey != "" {
+			return "Auth: OpenCode API Key"
+		}
+		return "Auth: OpenCode (no API key configured)"
+	case config.ProviderOpenAI:
+		if apiKey != "" {
+			return "Auth: OpenAI API Key"
+		}
+		return "Auth: OpenAI (no API key configured)"
+	case config.ProviderOpenRouter:
+		if apiKey != "" {
+			return "Auth: OpenRouter API Key"
+		}
+		return "Auth: OpenRouter (no API key configured)"
+	case config.ProviderGemini:
+		if apiKey != "" {
+			return "Auth: Google AI Studio API Key"
+		}
+		return "Auth: Vertex AI / Application Default Credentials"
+	default:
+		if apiKey != "" {
+			if len(cleanProvider) > 0 {
+				return fmt.Sprintf("Auth: %s API Key", strings.ToUpper(cleanProvider[:1])+cleanProvider[1:])
+			}
+			return "Auth: API Key"
+		}
+		return fmt.Sprintf("Auth: %s (no API key configured)", cleanProvider)
+	}
+}
+

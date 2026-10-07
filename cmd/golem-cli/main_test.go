@@ -307,3 +307,29 @@ func TestRunReadlineLoop(t *testing.T) {
 		})
 	}
 }
+
+func TestFormatAuthStatus(t *testing.T) {
+	tests := []struct {
+		provider string
+		apiKey   string
+		want     string
+	}{
+		{"opencode", "test-key", "Auth: OpenCode API Key"},
+		{"opencode", "", "Auth: OpenCode (no API key configured)"},
+		{"openai", "sk-123", "Auth: OpenAI API Key"},
+		{"openrouter", "sk-or-123", "Auth: OpenRouter API Key"},
+		{"gemini", "aistudio-key", "Auth: Google AI Studio API Key"},
+		{"gemini", "", "Auth: Vertex AI / Application Default Credentials"},
+		{"custom", "custom-key", "Auth: Custom API Key"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.provider+"_"+tc.apiKey, func(t *testing.T) {
+			got := formatAuthStatus(tc.provider, tc.apiKey)
+			if got != tc.want {
+				t.Errorf("formatAuthStatus(%q, %q) = %q, want %q", tc.provider, tc.apiKey, got, tc.want)
+			}
+		})
+	}
+}
+
