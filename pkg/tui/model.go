@@ -195,7 +195,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		spCmd tea.Cmd
 	)
 
-	m.viewport, vpCmd = m.viewport.Update(msg)
+	// Only forward non-key events (e.g. mouse wheel, window events) to viewports so typing in
+	// the textarea never triggers viewport pager scrolling (space, d, u, j, k, etc.).
+	if _, isKey := msg.(tea.KeyMsg); !isKey {
+		if m.showProfileModal {
+			m.profileViewport, vpCmd = m.profileViewport.Update(msg)
+		} else if m.showTreeModal {
+			m.treeViewport, vpCmd = m.treeViewport.Update(msg)
+		} else if m.showShortcutsModal {
+			m.shortcutsViewport, vpCmd = m.shortcutsViewport.Update(msg)
+		} else if m.showMCPModal {
+			m.mcpViewport, vpCmd = m.mcpViewport.Update(msg)
+		} else {
+			m.viewport, vpCmd = m.viewport.Update(msg)
+		}
+	}
 	m.spinner, spCmd = m.spinner.Update(msg)
 
 	switch msg := msg.(type) {
@@ -208,23 +222,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if !m.ready {
 			m.viewport = viewport.New(msg.Width, msg.Height-verticalMarginHeight)
+			m.viewport.KeyMap = viewport.KeyMap{}
 			m.viewport.YPosition = headerHeight
 			m.treeViewport = viewport.New(msg.Width-10, msg.Height-8)
+			m.treeViewport.KeyMap = viewport.KeyMap{}
 			m.shortcutsViewport = viewport.New(msg.Width-10, msg.Height-8)
+			m.shortcutsViewport.KeyMap = viewport.KeyMap{}
 			m.mcpViewport = viewport.New(msg.Width-10, msg.Height-8)
+			m.mcpViewport.KeyMap = viewport.KeyMap{}
 			m.profileViewport = viewport.New(msg.Width-10, msg.Height-8)
+			m.profileViewport.KeyMap = viewport.KeyMap{}
 			m.ready = true
 		} else {
 			m.viewport.Width = msg.Width
 			m.viewport.Height = msg.Height - verticalMarginHeight
+			m.viewport.KeyMap = viewport.KeyMap{}
 			m.treeViewport.Width = msg.Width - 10
 			m.treeViewport.Height = msg.Height - 8
+			m.treeViewport.KeyMap = viewport.KeyMap{}
 			m.shortcutsViewport.Width = msg.Width - 10
 			m.shortcutsViewport.Height = msg.Height - 8
+			m.shortcutsViewport.KeyMap = viewport.KeyMap{}
 			m.mcpViewport.Width = msg.Width - 10
 			m.mcpViewport.Height = msg.Height - 8
+			m.mcpViewport.KeyMap = viewport.KeyMap{}
 			m.profileViewport.Width = msg.Width - 10
 			m.profileViewport.Height = msg.Height - 8
+			m.profileViewport.KeyMap = viewport.KeyMap{}
 		}
 
 		m.textarea.SetWidth(msg.Width - 4)
@@ -462,6 +486,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.String() == "ctrl+down" || msg.String() == "shift+down" {
 			m.viewport.LineDown(2)
+			return m, nil
+		}
+		if msg.Type == tea.KeyPgUp {
+			m.viewport.HalfViewUp()
+			return m, nil
+		}
+		if msg.Type == tea.KeyPgDown {
+			m.viewport.HalfViewDown()
 			return m, nil
 		}
 

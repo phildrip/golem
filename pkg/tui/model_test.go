@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1131,4 +1132,62 @@ func TestModel_StreamMsgHandlingLifecycle(t *testing.T) {
 	}
 	_ = nextCmd
 }
+
+func TestModel_TypingDoesNotScroll(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := fractal.OpenStore(tmpDir)
+	defer store.Close()
+	view := fractal.NewView(store, fractal.DefaultViewConfig())
+	m := NewModel(nil, store, view)
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = newM.(Model)
+
+	// Populate entries so viewport has content to scroll
+	for i := 0; i < 60; i++ {
+		m.entries = append(m.entries, ChatEntry{
+			Type:    TypeAgent,
+			Content: fmt.Sprintf("Line of history %d", i),
+		})
+	}
+	m.renderConversationToViewport()
+
+	// Scroll viewport to line 20
+	m.viewport.SetYOffset(20)
+	initialOffset := m.viewport.YOffset
+	if initialOffset != 20 {
+		t.Fatalf("expected initial offset 20, got %d", initialOffset)
+	}
+
+	// Type characters that previously matched viewport pager keybindings:
+	// space (PageDown), d (HalfPageDown), u (HalfPageUp), j (LineDown), k (LineUp), f (PageDown), b (PageUp)
+	troublesomeRunes := []rune{'d', 'e', 'b', 'u', 'g', ' ', 'j', 'o', 'b', ' ', 'f', 'a', 's', 't'}
+	for _, r := range troublesomeRunes {
+		newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = newM.(Model)
+
+		if m.viewport.YOffset != initialOffset {
+			t.Errorf("viewport offset moved when typing rune %q: was %d, now %d", string(r), initialOffset, m.viewport.YOffset)
+		}
+	}
+
+	expectedText := "debug job fast"
+	if m.textarea.Value() != expectedText {
+		t.Errorf("expected textarea to contain %q, got %q", expectedText, m.textarea.Value())
+	}
+
+	// Verify PgUp and PgDown DO scroll the conversation viewport
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	m = newM.(Model)
+	if m.viewport.YOffset >= initialOffset {
+		t.Errorf("expected PgUp to scroll viewport up, was %d now %d", initialOffset, m.viewport.YOffset)
+	}
+
+	offsetAfterPgUp := m.viewport.YOffset
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m = newM.(Model)
+	if m.viewport.YOffset <= offsetAfterPgUp {
+		t.Errorf("expected PgDown to scroll viewport down, was %d now %d", offsetAfterPgUp, m.viewport.YOffset)
+	}
+}
+
 
