@@ -25,6 +25,12 @@ func TestClient_UnaryGenerateContent(t *testing.T) {
 		if r.Header.Get("Content-Type") != "application/json" {
 			t.Errorf("unexpected Content-Type header: %s", r.Header.Get("Content-Type"))
 		}
+		if r.Header.Get("User-Agent") != "golem/1.0" {
+			t.Errorf("expected User-Agent golem/1.0, got %s", r.Header.Get("User-Agent"))
+		}
+		if r.Header.Get("x-opencode-session") == "" {
+			t.Errorf("expected x-opencode-session header to be non-empty")
+		}
 
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -242,5 +248,101 @@ func TestClient_ErrorHandling(t *testing.T) {
 
 	if !hasError {
 		t.Errorf("expected error from 429 response, but got none")
+	}
+}
+
+func TestClient_OpenCodeSessionAndUserAgentHeaders(t *testing.T) {
+	var receivedUA, receivedSession string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedUA = r.Header.Get("User-Agent")
+		receivedSession = r.Header.Get("x-opencode-session")
+		resp := openAIChatResponse{
+			Choices: []struct {
+				Message struct {
+					Role      string           `json:"role"`
+					Content   string           `json:"content"`
+					ToolCalls []openAIToolCall `json:"tool_calls"`
+				} `json:"message"`
+				Delta struct {
+					Role      string           `json:"role"`
+					Content   string           `json:"content"`
+					ToolCalls []openAIToolCall `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			}{
+				{
+					Message: struct {
+						Role      string           `json:"role"`
+						Content   string           `json:"content"`
+						ToolCalls []openAIToolCall `json:"tool_calls"`
+					}{
+						Role:    "assistant",
+						Content: "ok",
+					},
+					FinishReason: "stop",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient("test-model", server.URL, "key", server.Client())
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "test"}}},
+		},
+	}
+
+	// 1. Default headers
+	for _, err := range client.GenerateContent(context.Background(), req, false) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if receivedUA != DefaultUserAgent {
+		t.Errorf("expected default UA %q, got %q", DefaultUserAgent, receivedUA)
+	}
+	if receivedSession == "" || !strings.HasPrefix(receivedSession, "golem-") {
+		t.Errorf("expected default session with golem- prefix, got %q", receivedSession)
+	}
+
+	// 2. Custom User-Agent and SetSessionID
+	client.SetUserAgent("custom-golem/2.5")
+	client.SetSessionID("session-custom-999")
+	if client.UserAgent() != "custom-golem/2.5" {
+		t.Errorf("expected client.UserAgent() to be custom-golem/2.5, got %s", client.UserAgent())
+	}
+	if client.SessionID() != "session-custom-999" {
+		t.Errorf("expected client.SessionID() to be session-custom-999, got %s", client.SessionID())
+	}
+
+	for _, err := range client.GenerateContent(context.Background(), req, false) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if receivedUA != "custom-golem/2.5" {
+		t.Errorf("expected custom UA 'custom-golem/2.5', got %q", receivedUA)
+	}
+	if receivedSession != "session-custom-999" {
+		t.Errorf("expected custom session 'session-custom-999', got %q", receivedSession)
+	}
+
+	// 3. Context override via WithSessionID
+	ctx := WithSessionID(context.Background(), "session-ctx-override-888")
+	extracted, ok := SessionIDFromContext(ctx)
+	if !ok || extracted != "session-ctx-override-888" {
+		t.Errorf("expected SessionIDFromContext to return session-ctx-override-888, got %q", extracted)
+	}
+
+	for _, err := range client.GenerateContent(ctx, req, false) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if receivedSession != "session-ctx-override-888" {
+		t.Errorf("expected context override session 'session-ctx-override-888', got %q", receivedSession)
 	}
 }

@@ -71,6 +71,7 @@ type Config struct {
 	MCPConfigPaths    []string
 	FileConfig        config.FileConfig
 	SwarmBus          *swarm.Bus
+	SessionID         string
 }
 
 // DefaultConfig provides recommended settings.
@@ -103,6 +104,7 @@ type Agent struct {
 	runner           *runner.Runner
 	adkAgent         agent.Agent
 	userID           string
+	sessionID        string
 	swarmBus         *swarm.Bus
 	activeHandlerMu     sync.RWMutex
 	activeHandler       StreamHandler
@@ -216,6 +218,11 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	var clientCfg *genai.ClientConfig
 	var modelInstance model.LLM
 
+	sessionID := cfg.SessionID
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("golem-%d", time.Now().UnixNano())
+	}
+
 	if cfg.Provider == config.ProviderGemini {
 		attempts := int32(5)
 		initialDelay := 1.0
@@ -270,7 +277,9 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		}
 		modelInstance = gm
 	} else {
-		modelInstance = openai.NewClient(cfg.ModelName, cfg.BaseURL, cfg.APIKey, nil)
+		cli := openai.NewClient(cfg.ModelName, cfg.BaseURL, cfg.APIKey, nil)
+		cli.SetSessionID(sessionID)
+		modelInstance = cli
 	}
 
 	// 4. Initialize Compactor Model (either dedicated compactor model or shared primary model)
@@ -316,7 +325,9 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 				compactorModelInstance = cgm
 			}
 		} else {
-			compactorModelInstance = openai.NewClient(compactorModelName, compactorBaseURL, compactorAPIKey, nil)
+			ccli := openai.NewClient(compactorModelName, compactorBaseURL, compactorAPIKey, nil)
+			ccli.SetSessionID(sessionID + "-compactor")
+			compactorModelInstance = ccli
 		}
 	}
 
@@ -634,6 +645,7 @@ Subagents & Delegation:
 		runner:           adkRunner,
 		adkAgent:         adkAgent,
 		userID:           "user",
+		sessionID:        sessionID,
 		swarmBus:         swarmBus,
 		compactorTrigger: make(chan struct{}, 1),
 		workerCancel:     workerCancel,
@@ -718,7 +730,12 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 		// Persistent memory is solely owned and injected via Fractal Memory view.
 		turnSessionID := fmt.Sprintf("turn-%d", time.Now().UnixNano())
 
-		eventsSeq := a.runner.Run(ctx, a.userID, turnSessionID, content, agent.RunConfig{
+		runCtx := ctx
+		if a.sessionID != "" {
+			runCtx = openai.WithSessionID(runCtx, a.sessionID)
+		}
+
+		eventsSeq := a.runner.Run(runCtx, a.userID, turnSessionID, content, agent.RunConfig{
 			StreamingMode: agent.StreamingModeSSE,
 		})
 		for ev, err := range eventsSeq {
@@ -902,7 +919,9 @@ func (a *Agent) SwitchProfile(ctx context.Context, profileName string) (config.P
 		}
 		newModel = gm
 	} else {
-		newModel = openai.NewClient(a.cfg.ModelName, a.cfg.BaseURL, a.cfg.APIKey, nil)
+		cli := openai.NewClient(a.cfg.ModelName, a.cfg.BaseURL, a.cfg.APIKey, nil)
+		cli.SetSessionID(a.sessionID)
+		newModel = cli
 	}
 
 	if a.dynModel != nil && newModel != nil {
@@ -1032,3 +1051,9 @@ func isTransientError(err error) bool {
 		strings.Contains(msg, "deadline exceeded") ||
 		strings.Contains(msg, "timeout")
 }
+
+// SessionID returns the agent's session identifier.
+func (a *Agent) SessionID() string {
+	return a.sessionID
+}
+

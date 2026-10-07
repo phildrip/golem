@@ -20,12 +20,34 @@ import (
 // DefaultBaseURL points to OpenCode Go OpenAI-compatible API.
 const DefaultBaseURL = "https://opencode.ai/zen/go/v1"
 
+// DefaultUserAgent is the client identity sent to OpenAI-compatible endpoints like OpenCode Go.
+const DefaultUserAgent = "golem/1.0"
+
+type contextKey string
+
+const (
+	sessionIDContextKey contextKey = "opencode_session_id"
+)
+
+// WithSessionID returns a copy of parent context with the session ID set.
+func WithSessionID(ctx context.Context, sessionID string) context.Context {
+	return context.WithValue(ctx, sessionIDContextKey, sessionID)
+}
+
+// SessionIDFromContext retrieves the session ID from ctx if present.
+func SessionIDFromContext(ctx context.Context) (string, bool) {
+	sid, ok := ctx.Value(sessionIDContextKey).(string)
+	return sid, ok
+}
+
 // Client implements ADK v2 model.LLM for OpenAI-compatible providers
 // such as OpenCode Go, DeepSeek, OpenRouter, and local inference engines.
 type Client struct {
 	modelName  string
 	baseURL    string
 	apiKey     string
+	sessionID  string
+	userAgent  string
 	httpClient *http.Client
 }
 
@@ -44,8 +66,34 @@ func NewClient(modelName, baseURL, apiKey string, httpClient *http.Client) *Clie
 		modelName:  modelName,
 		baseURL:    baseURL,
 		apiKey:     apiKey,
+		sessionID:  fmt.Sprintf("golem-%d", time.Now().UnixNano()),
+		userAgent:  DefaultUserAgent,
 		httpClient: httpClient,
 	}
+}
+
+// SetSessionID updates the default session ID for requests from this client.
+func (c *Client) SetSessionID(sessionID string) {
+	if sessionID != "" {
+		c.sessionID = sessionID
+	}
+}
+
+// SessionID returns the client's default session ID.
+func (c *Client) SessionID() string {
+	return c.sessionID
+}
+
+// SetUserAgent updates the client's User-Agent header value.
+func (c *Client) SetUserAgent(userAgent string) {
+	if userAgent != "" {
+		c.userAgent = userAgent
+	}
+}
+
+// UserAgent returns the client's User-Agent string.
+func (c *Client) UserAgent() string {
+	return c.userAgent
 }
 
 // Name returns the configured model identifier.
@@ -141,6 +189,21 @@ func (c *Client) GenerateContent(ctx context.Context, req *model.LLMRequest, str
 		if c.apiKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 		}
+
+		ua := c.userAgent
+		if ua == "" {
+			ua = DefaultUserAgent
+		}
+		httpReq.Header.Set("User-Agent", ua)
+
+		sid := c.sessionID
+		if ctxSid, ok := SessionIDFromContext(ctx); ok && ctxSid != "" {
+			sid = ctxSid
+		}
+		if sid == "" {
+			sid = fmt.Sprintf("golem-%d", time.Now().UnixNano())
+		}
+		httpReq.Header.Set("x-opencode-session", sid)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {

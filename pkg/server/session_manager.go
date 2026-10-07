@@ -61,6 +61,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, title string) (*Ses
 
 	// Session storage directory: isolated per session
 	cfg := sm.baseCfg
+	cfg.SessionID = id
 	if cfg.StorageDir == "" {
 		cfg.StorageDir = golem.DefaultConfig().StorageDir
 	}
@@ -126,6 +127,7 @@ func (sm *SessionManager) CreateSessionWithImport(ctx context.Context, title str
 	}
 
 	cfg := sm.baseCfg
+	cfg.SessionID = id
 	if cfg.StorageDir == "" {
 		cfg.StorageDir = golem.DefaultConfig().StorageDir
 	}

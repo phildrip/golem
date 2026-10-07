@@ -934,4 +934,27 @@ func TestSessionManager_DeleteActiveTurn(t *testing.T) {
 	}
 }
 
+func TestSessionManager_SessionIDPropagation(t *testing.T) {
+	tempDir := t.TempDir()
+	baseCfg := golem.Config{
+		Provider:        "opencode",
+		BaseURL:         "http://localhost:9999",
+		ModelName:       "test-model",
+		StorageDir:      tempDir,
+		WorkspaceDir:    tempDir,
+		LiveHeadCount:   4,
+		ViewBudgetBytes: 1024,
+	}
+
+	sm := NewSessionManager(baseCfg, NewHub())
+	sess, err := sm.CreateSession(context.Background(), "Session ID Test")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if sess.Agent.SessionID() != sess.ID {
+		t.Errorf("expected sess.Agent.SessionID() to match %q, got %q", sess.ID, sess.Agent.SessionID())
+	}
+}
+
 
