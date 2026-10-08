@@ -216,3 +216,31 @@ func TestSwarmBusUnsubscribe(t *testing.T) {
 	}
 	mu.Unlock()
 }
+
+func TestSwarmBusUnreadCount(t *testing.T) {
+	bus := NewBus()
+	defer bus.Close()
+
+	// No mailbox yet -> zero, and must not create one as a side effect.
+	if got := bus.UnreadCount("orchestrator"); got != 0 {
+		t.Fatalf("expected 0 unread for unknown agent, got %d", got)
+	}
+
+	// Deliver two messages without draining.
+	for i := 0; i < 2; i++ {
+		if err := bus.Send(Message{Recipient: "orchestrator", Sender: "subagent", Body: "hi"}); err != nil {
+			t.Fatalf("Send failed: %v", err)
+		}
+	}
+	if got := bus.UnreadCount("orchestrator"); got != 2 {
+		t.Fatalf("expected 2 unread, got %d", got)
+	}
+
+	// UnreadCount is a peek: draining afterwards must still yield both.
+	if got := len(bus.GetOrCreateMailbox("orchestrator").ReadUnread()); got != 2 {
+		t.Fatalf("expected 2 drained messages after peek, got %d", got)
+	}
+	if got := bus.UnreadCount("orchestrator"); got != 0 {
+		t.Fatalf("expected 0 unread after drain, got %d", got)
+	}
+}

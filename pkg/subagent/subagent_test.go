@@ -183,3 +183,23 @@ func TestRunner_FractalMemoryGuidanceAndLiveHead(t *testing.T) {
 		t.Errorf("expected prompt to contain recent live head context, got: %s", prompt)
 	}
 }
+
+func TestSubagentSwarmGuidance(t *testing.T) {
+	guidance := SubagentSwarmGuidance("subagent-coder-42")
+	for _, want := range []string{"subagent-coder-42", "send_message", "broadcast_message", "check_inbox", "claim_resource"} {
+		if !strings.Contains(guidance, want) {
+			t.Errorf("expected swarm guidance to mention %q, got: %s", want, guidance)
+		}
+	}
+}
+
+func TestInvokeToolDescriptionMentionsSwarmID(t *testing.T) {
+	runner := NewRunner(RunnerConfig{ModelFactory: NewModelFactory(nil, "gemini-flash-latest")})
+	invokeTool, err := NewInvokeTool(runner)
+	if err != nil {
+		t.Fatalf("NewInvokeTool failed: %v", err)
+	}
+	if !strings.Contains(invokeTool.Description(), "swarm id") {
+		t.Errorf("expected invoke_subagent description to explain the swarm id round-trip, got: %s", invokeTool.Description())
+	}
+}

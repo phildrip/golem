@@ -19,7 +19,7 @@ type Bus struct {
 	subscribers map[string]map[uint64]MessageHandler // channel -> subID -> listeners
 	listeners   map[uint64]MessageHandler            // global bus listeners
 	nextSubID   uint64
-	locks       map[string]ResourceLock              // resource path -> lock
+	locks       map[string]ResourceLock // resource path -> lock
 	closed      bool
 }
 
@@ -44,6 +44,18 @@ func (b *Bus) GetOrCreateMailbox(agentID string) *Mailbox {
 	mb := NewMailbox(agentID, 256)
 	b.mailboxes[agentID] = mb
 	return mb
+}
+
+// UnreadCount returns the number of unread messages in an agent's mailbox,
+// without draining them. Returns 0 if the agent has no mailbox yet.
+func (b *Bus) UnreadCount(agentID string) int {
+	b.mu.RLock()
+	mb, ok := b.mailboxes[agentID]
+	b.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return mb.UnreadCount()
 }
 
 // Send sends a point-to-point message directly to a target agent's mailbox.

@@ -22,6 +22,7 @@ type InvokeArgs struct {
 // InvokeResult defines the output returned after subagent completion.
 type InvokeResult struct {
 	Role       string        `json:"role"`
+	SubagentID string        `json:"subagent_id"`
 	ModelUsed  string        `json:"model_used"`
 	Output     string        `json:"output"`
 	ToolCalls  int           `json:"tool_calls"`
@@ -42,6 +43,7 @@ const (
 type Event struct {
 	Type        EventType
 	Role        string
+	SubagentID  string
 	Model       string
 	Prompt      string
 	Description string

@@ -78,6 +78,18 @@ Fractal Memory Architecture & Navigation:
   - date(id): Returns the creation timestamp for a specific event ID.
 - Use zoom when you need to inspect past requirements, verify architectural decisions, or check verbatim past user rulings without guessing.`
 
+// SubagentSwarmGuidance returns the swarm section appended to a subagent's
+// system prompt when it is attached to a shared swarm bus.
+func SubagentSwarmGuidance(agentID string) string {
+	return fmt.Sprintf(`
+
+Swarm Communication:
+- Your Swarm Agent ID is %q. Use this ID when communicating with peer agents or the orchestrator.
+- send_message delivers a point-to-point message to a peer (e.g. recipient "orchestrator" to report back); broadcast_message publishes to a topic channel (e.g. 'discoveries', 'warnings') visible to all listeners.
+- check_inbox reads messages sent to you. Call it after a substantial step if the orchestrator may have replied.
+- claim_resource / release_resource / list_locks manage advisory locks on files so parallel agents don't clobber the same target; claim before editing a file another agent may touch, release when done.`, agentID)
+}
+
 // SystemPromptForRole returns tailored instructions based on the archetype.
 func (r *Runner) SystemPromptForRole(role string) string {
 	cleanRole := strings.ToLower(strings.TrimSpace(role))
@@ -124,13 +136,16 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 		role = RoleGeneral
 	}
 
+	subagentID := fmt.Sprintf("subagent-%s-%d", role, time.Now().UnixNano())
+
 	modelInstance, resolvedModel, err := r.cfg.ModelFactory.GetModel(ctx, args.Model)
 	if err != nil {
 		return InvokeResult{
-			Role:      role,
-			ModelUsed: args.Model,
-			Error:     err.Error(),
-			Duration:  time.Since(start),
+			Role:       role,
+			SubagentID: subagentID,
+			ModelUsed:  args.Model,
+			Error:      err.Error(),
+			Duration:   time.Since(start),
 		}, errors.Wrap(err, "resolving model for subagent")
 	}
 
@@ -139,6 +154,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 		r.cfg.EventHandler(Event{
 			Type:        EventSubagentStart,
 			Role:        role,
+			SubagentID:  subagentID,
 			Model:       resolvedModel,
 			Prompt:      args.Prompt,
 			Description: args.Description,
@@ -146,7 +162,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 	}
 
 	tools := r.SelectTools(role)
-	subagentID := fmt.Sprintf("subagent-%s-%d", role, time.Now().UnixNano())
+
 	if r.cfg.SwarmBus != nil {
 		swarmTS := swarm.NewToolset(r.cfg.SwarmBus, subagentID)
 		if swarmTools, err := swarmTS.BuildTools(); err == nil {
@@ -155,7 +171,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 	}
 	systemPrompt := r.BuildSystemPrompt(role)
 	if r.cfg.SwarmBus != nil {
-		systemPrompt += fmt.Sprintf("\n\nYour Swarm Agent ID is %q. Use this ID when communicating with peer agents or orchestrator.", subagentID)
+		systemPrompt += SubagentSwarmGuidance(subagentID)
 	}
 
 	var toolCallsCount int32
@@ -244,19 +260,22 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 		duration := time.Since(start)
 		if r.cfg.EventHandler != nil {
 			r.cfg.EventHandler(Event{
-				Type:     EventSubagentDone,
-				Role:     role,
-				Model:    resolvedModel,
-				Duration: duration,
-				Err:      err,
+				Type:       EventSubagentDone,
+				Role:       role,
+				SubagentID: subagentID,
+				Model:      resolvedModel,
+				Duration:   duration,
+				Err:        err,
 			})
 		}
 		return InvokeResult{
-			Role:      role,
-			ModelUsed: resolvedModel,
-			Duration:  duration,
-			Error:     err.Error(),
+			Role:       role,
+			SubagentID: subagentID,
+			ModelUsed:  resolvedModel,
+			Duration:   duration,
+			Error:      err.Error(),
 		}, errors.Wrap(err, "creating subagent agent")
+
 	}
 
 	subRunner, err := runner.NewInMemory("subagent-run", subAgent)
@@ -264,19 +283,22 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 		duration := time.Since(start)
 		if r.cfg.EventHandler != nil {
 			r.cfg.EventHandler(Event{
-				Type:     EventSubagentDone,
-				Role:     role,
-				Model:    resolvedModel,
-				Duration: duration,
-				Err:      err,
+				Type:       EventSubagentDone,
+				Role:       role,
+				SubagentID: subagentID,
+				Model:      resolvedModel,
+				Duration:   duration,
+				Err:        err,
 			})
 		}
 		return InvokeResult{
-			Role:      role,
-			ModelUsed: resolvedModel,
-			Duration:  duration,
-			Error:     err.Error(),
+			Role:       role,
+			SubagentID: subagentID,
+			ModelUsed:  resolvedModel,
+			Duration:   duration,
+			Error:      err.Error(),
 		}, errors.Wrap(err, "creating subagent runner")
+
 	}
 
 	content := genai.Text(args.Prompt)[0]
@@ -316,11 +338,13 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 			select {
 			case <-ctx.Done():
 				return InvokeResult{
-					Role:      role,
-					ModelUsed: resolvedModel,
-					Duration:  time.Since(start),
-					Error:     ctx.Err().Error(),
+					Role:       role,
+					SubagentID: subagentID,
+					ModelUsed:  resolvedModel,
+					Duration:   time.Since(start),
+					Error:      ctx.Err().Error(),
 				}, ctx.Err()
+
 			case <-time.After(backoff):
 				backoff *= 2
 				continue
@@ -330,39 +354,45 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 		duration := time.Since(start)
 		if r.cfg.EventHandler != nil {
 			r.cfg.EventHandler(Event{
-				Type:     EventSubagentDone,
-				Role:     role,
-				Model:    resolvedModel,
-				Duration: duration,
-				Err:      runErr,
+				Type:       EventSubagentDone,
+				Role:       role,
+				SubagentID: subagentID,
+				Model:      resolvedModel,
+				Duration:   duration,
+				Err:        runErr,
 			})
 		}
 		return InvokeResult{
-			Role:      role,
-			ModelUsed: resolvedModel,
-			ToolCalls: int(atomic.LoadInt32(&toolCallsCount)),
-			Duration:  duration,
-			Error:     runErr.Error(),
+			Role:       role,
+			SubagentID: subagentID,
+			ModelUsed:  resolvedModel,
+			ToolCalls:  int(atomic.LoadInt32(&toolCallsCount)),
+			Duration:   duration,
+			Error:      runErr.Error(),
 		}, errors.Wrap(runErr, "executing subagent turn")
+
 	}
 
 	duration := time.Since(start)
 	result := InvokeResult{
-		Role:      role,
-		ModelUsed: resolvedModel,
-		Output:    finalResponse,
-		ToolCalls: int(atomic.LoadInt32(&toolCallsCount)),
-		Duration:  duration,
+		Role:       role,
+		SubagentID: subagentID,
+		ModelUsed:  resolvedModel,
+		Output:     finalResponse,
+		ToolCalls:  int(atomic.LoadInt32(&toolCallsCount)),
+		Duration:   duration,
 	}
 
 	if r.cfg.EventHandler != nil {
 		r.cfg.EventHandler(Event{
-			Type:     EventSubagentDone,
-			Role:     role,
-			Model:    resolvedModel,
-			Result:   finalResponse,
-			Duration: duration,
+			Type:       EventSubagentDone,
+			Role:       role,
+			SubagentID: subagentID,
+			Model:      resolvedModel,
+			Result:     finalResponse,
+			Duration:   duration,
 		})
+
 	}
 
 	return result, nil
