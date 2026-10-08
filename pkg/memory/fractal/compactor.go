@@ -232,7 +232,7 @@ type CompactorConfig struct {
 func DefaultCompactorConfig() CompactorConfig {
 	return CompactorConfig{
 		TargetBytes: DefaultNodeTargetBytes,
-		Concurrency: 4,
+		Concurrency: 2,
 	}
 }
 

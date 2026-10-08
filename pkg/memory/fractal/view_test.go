@@ -405,3 +405,12 @@ func TestZoomAndDateTools(t *testing.T) {
 	_ = ev1
 	_ = context.Background()
 }
+
+func TestDefaultViewBudgets(t *testing.T) {
+	if DefaultViewBudgetBytes != 64_000 {
+		t.Errorf("DefaultViewBudgetBytes = %d, want 64000", DefaultViewBudgetBytes)
+	}
+	if DefaultViewLowWaterBytes != 32_000 {
+		t.Errorf("DefaultViewLowWaterBytes = %d, want 32000", DefaultViewLowWaterBytes)
+	}
+}

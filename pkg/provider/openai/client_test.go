@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -593,7 +594,7 @@ func TestClient_ToolCallIDFallbackMatching(t *testing.T) {
 	req := &model.LLMRequest{
 		Contents: []*genai.Content{
 			{
-				Role: "user",
+				Role:  "user",
 				Parts: []*genai.Part{{Text: "do something"}},
 			},
 			{
@@ -641,3 +642,100 @@ func TestClient_ToolCallIDFallbackMatching(t *testing.T) {
 	}
 }
 
+func testUnaryRequest() *model.LLMRequest {
+	return &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+		},
+	}
+}
+
+func collectUnary(t *testing.T, c *Client, ctx context.Context) (string, error) {
+	t.Helper()
+	var text string
+	for resp, err := range c.GenerateContent(ctx, testUnaryRequest(), false) {
+		if err != nil {
+			return text, err
+		}
+		if resp != nil && resp.Content != nil {
+			for _, p := range resp.Content.Parts {
+				text += p.Text
+			}
+		}
+	}
+	return text, nil
+}
+
+func TestClient_RetriesTransientThenSucceeds(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("unavailable"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	c := NewClient("m", server.URL, "k", server.Client())
+	text, err := collectUnary(t, c, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if text != "ok" {
+		t.Errorf("text = %q, want ok", text)
+	}
+	if requests != 3 {
+		t.Errorf("requests = %d, want 3 (2 transient + 1 success)", requests)
+	}
+}
+
+func TestClient_DoesNotRetryPermanentError(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad request"}}`))
+	}))
+	defer server.Close()
+
+	c := NewClient("m", server.URL, "k", server.Client())
+	_, err := collectUnary(t, c, context.Background())
+	if err == nil {
+		t.Fatalf("expected an error for 400")
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Errorf("error = %v, want it to mention 400", err)
+	}
+	if requests != 1 {
+		t.Errorf("requests = %d, want 1 (permanent errors are not retried)", requests)
+	}
+}
+
+func TestClient_RetryHonorsContextCancellation(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("unavailable"))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	c := NewClient("m", server.URL, "k", server.Client())
+	_, err := collectUnary(t, c, ctx)
+	if err == nil {
+		t.Fatalf("expected cancellation error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "deadline") {
+		t.Errorf("error = %v, want context deadline", err)
+	}
+	if requests > 2 {
+		t.Errorf("requests = %d, want the backoff to stop promptly on cancellation", requests)
+	}
+}

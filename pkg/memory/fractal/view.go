@@ -14,11 +14,13 @@ import (
 
 // DefaultViewBudgetBytes is the high-water mark for the fractal summary view.
 // Once the view exceeds it, merges run in one batch down to the low-water mark.
-const DefaultViewBudgetBytes = 128_000
+// Kept at the low end of the OptChat 64-128 KB range so ordinary tasks carry a
+// lighter memory preamble; zoom still reaches older detail.
+const DefaultViewBudgetBytes = 64_000
 
 // DefaultViewLowWaterBytes is the low-water mark the view is merged down to once
-// it exceeds the high-water mark (OptChat sawtooth: 128 KB -> 64 KB).
-const DefaultViewLowWaterBytes = 64_000
+// it exceeds the high-water mark (OptChat sawtooth: 64 KB -> 32 KB).
+const DefaultViewLowWaterBytes = 32_000
 
 // DefaultLiveHeadCount is the number of recent raw events retained verbatim in the live head.
 const DefaultLiveHeadCount = 10

@@ -108,8 +108,10 @@ type Agent struct {
 	swarmBus            *swarm.Bus
 	activeHandlerMu     sync.RWMutex
 	activeHandler       StreamHandler
-	turnUserEventMu     sync.Mutex
-	turnUserEventID     int // event ID of the in-flight turn's user message, or -1
+	turnStateMu         sync.Mutex
+	turnStartEventID    int  // first event ID of the in-flight turn, or -1
+	turnToolCalls       int  // tool calls executed in the in-flight turn
+	turnActive          bool // whether a turn is currently running
 	compactorTrigger    chan struct{}
 	workerCancel        context.CancelFunc
 	dynModel            *dynamicModel
@@ -200,10 +202,11 @@ const (
 
 // formatLiveHead renders recent raw events (bounded) so the agent keeps the
 // short-term context that the multi-resolution summary view does not carry.
-// It keeps the newest events when the total cap is exceeded. excludeID >= 0
-// omits a single event (the in-flight turn's user message, which the runner
-// already passes as the turn content, so repeating it would duplicate it).
-func formatLiveHead(events []fractal.Event, excludeID int) string {
+// It keeps the newest events when the total cap is exceeded. excludeFrom >= 0
+// omits every event with ID >= excludeFrom: the in-flight turn's own user
+// message and tool/echo events, which the runner already passes in the
+// conversation, so re-injecting them would duplicate the ongoing turn.
+func formatLiveHead(events []fractal.Event, excludeFrom int) string {
 	if len(events) == 0 {
 		return ""
 	}
@@ -211,7 +214,7 @@ func formatLiveHead(events []fractal.Event, excludeID int) string {
 	lines := make([]string, 0, len(events))
 	total := 0
 	for _, ev := range events {
-		if ev.ID == excludeID {
+		if excludeFrom >= 0 && ev.ID >= excludeFrom {
 			continue
 		}
 		text := strings.ReplaceAll(ev.Text, "\n", " ")
@@ -236,8 +239,8 @@ func formatLiveHead(events []fractal.Event, excludeID int) string {
 
 // buildInstruction assembles the Golem system instruction: the static guidance,
 // the fractal summary view, the recent verbatim live head, and swarm state.
-// excludeEventID >= 0 omits that event from the live head.
-func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swarmBus *swarm.Bus, excludeEventID int) string {
+// excludeFrom >= 0 omits events with ID >= excludeFrom (the in-flight turn).
+func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swarmBus *swarm.Bus, excludeFrom int) string {
 	if memoryMgr != nil {
 		memoryMgr.SyncAll()
 	}
@@ -253,7 +256,7 @@ func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swar
 	}
 
 	if view != nil {
-		if live := formatLiveHead(view.LiveHeadEvents(), excludeEventID); live != "" {
+		if live := formatLiveHead(view.LiveHeadEvents(), excludeFrom); live != "" {
 			sb.WriteString(live)
 			sb.WriteString("\n\n")
 		}
@@ -629,11 +632,11 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		Toolsets:        adkToolsets,
 		IncludeContents: llmagent.IncludeContentsNone,
 		InstructionProvider: func(rc agent.ReadonlyContext) (string, error) {
-			excludeID := -1
+			excludeFrom := -1
 			if agentPtr != nil {
-				excludeID = agentPtr.currentTurnUserEventID()
+				excludeFrom = agentPtr.currentTurnStartEventID()
 			}
-			return buildInstruction(memoryMgr, view, swarmBus, excludeID), nil
+			return buildInstruction(memoryMgr, view, swarmBus, excludeFrom), nil
 		},
 		BeforeToolCallbacks: []llmagent.BeforeToolCallback{
 			func(ctx agent.Context, t tool.Tool, args map[string]any) (map[string]any, error) {
@@ -660,6 +663,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 				}
 
 				if agentPtr != nil {
+					agentPtr.noteToolCall()
 					agentPtr.activeHandlerMu.RLock()
 					h := agentPtr.activeHandler
 					agentPtr.activeHandlerMu.RUnlock()
@@ -741,7 +745,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		userID:           "user",
 		sessionID:        sessionID,
 		swarmBus:         swarmBus,
-		turnUserEventID:  -1,
+		turnStartEventID: -1,
 		compactorTrigger: make(chan struct{}, 1),
 		workerCancel:     workerCancel,
 		dynModel:         dynModel,
@@ -768,8 +772,15 @@ func (a *Agent) startCompactorWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-tickerChan:
+			if a.isTurnActive() {
+				// Do not contend with an active turn for provider quota.
+				continue
+			}
 			_, _ = a.compactor.Pump(ctx)
 		case <-a.compactorTrigger:
+			if a.isTurnActive() {
+				continue
+			}
 			_, _ = a.compactor.Pump(ctx)
 		}
 	}
@@ -783,19 +794,51 @@ func (a *Agent) triggerCompactor() {
 	}
 }
 
-// setTurnUserEventID records the in-flight turn's user event so the live head
-// can exclude it (the ADK runner already passes it as the turn content).
-func (a *Agent) setTurnUserEventID(id int) {
-	a.turnUserEventMu.Lock()
-	a.turnUserEventID = id
-	a.turnUserEventMu.Unlock()
+// beginTurn marks the start of a turn. startEventID is the user event's ID, so
+// every event appended during the turn is >= it.
+func (a *Agent) beginTurn(startEventID int) {
+	a.turnStateMu.Lock()
+	a.turnStartEventID = startEventID
+	a.turnToolCalls = 0
+	a.turnActive = true
+	a.turnStateMu.Unlock()
 }
 
-// currentTurnUserEventID returns the in-flight turn's user event ID, or -1.
-func (a *Agent) currentTurnUserEventID() int {
-	a.turnUserEventMu.Lock()
-	defer a.turnUserEventMu.Unlock()
-	return a.turnUserEventID
+// endTurn clears the in-flight turn state. It is idempotent.
+func (a *Agent) endTurn() {
+	a.turnStateMu.Lock()
+	a.turnStartEventID = -1
+	a.turnToolCalls = 0
+	a.turnActive = false
+	a.turnStateMu.Unlock()
+}
+
+// noteToolCall records that a tool ran, so the turn is known to have made
+// progress (side effects may exist) and must not be restarted from scratch.
+func (a *Agent) noteToolCall() {
+	a.turnStateMu.Lock()
+	a.turnToolCalls++
+	a.turnStateMu.Unlock()
+}
+
+func (a *Agent) turnToolCallCount() int {
+	a.turnStateMu.Lock()
+	defer a.turnStateMu.Unlock()
+	return a.turnToolCalls
+}
+
+// currentTurnStartEventID returns the first event ID of the in-flight turn, or -1.
+func (a *Agent) currentTurnStartEventID() int {
+	a.turnStateMu.Lock()
+	defer a.turnStateMu.Unlock()
+	return a.turnStartEventID
+}
+
+// isTurnActive reports whether a turn is currently running.
+func (a *Agent) isTurnActive() bool {
+	a.turnStateMu.Lock()
+	defer a.turnStateMu.Unlock()
+	return a.turnActive
 }
 
 // Process handles a single user turn synchronously, logs events to fractal memory, runs the model,
@@ -821,10 +864,11 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 	if err != nil {
 		return "", errors.Wrap(err, "logging user event")
 	}
-	// Exclude this turn's user message from the live head (the runner passes it
-	// as the turn content) for the whole turn, including mid-turn model calls.
-	a.setTurnUserEventID(userEvent.ID)
-	defer a.setTurnUserEventID(-1)
+	// Mark the turn: every event appended from here on has ID >= userEvent.ID, so
+	// the live head can exclude the in-flight turn (the runner passes it in the
+	// conversation) for the whole turn, including mid-turn model calls.
+	a.beginTurn(userEvent.ID)
+	defer a.endTurn()
 
 	// Sync view
 	a.view.Sync()
@@ -887,7 +931,10 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 			break
 		}
 
-		if isTransientError(runErr) && attempt < maxRetries {
+		// Only restart a turn from scratch when nothing has executed yet. Once a
+		// tool has run, a restart would re-execute its side effects and discard
+		// all work, so surface the error (with any partial text) instead.
+		if shouldRestartTurn(runErr, attempt, maxRetries, a.turnToolCallCount()) {
 			if a.cfg.OnRetry != nil {
 				a.cfg.OnRetry(attempt, maxRetries, backoff)
 			}
@@ -900,7 +947,7 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 			}
 		}
 
-		return "", errors.Wrap(runErr, "running adk agent")
+		return responseBuilder.String(), errors.Wrap(runErr, "running adk agent")
 	}
 
 	// 4. Log agent response to fractal store
@@ -910,8 +957,10 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 		}
 	}
 
-	// 5. Sync view and asynchronously trigger compactor pump
+	// 5. Sync view and asynchronously trigger compactor pump. End the turn first
+	// so the compactor worker is not gated by this still-active turn.
 	a.view.Sync()
+	a.endTurn()
 	a.triggerCompactor()
 
 	return finalResponse, nil
@@ -1165,6 +1214,13 @@ func isTransientError(err error) bool {
 		strings.Contains(msg, "resource_exhausted") ||
 		strings.Contains(msg, "deadline exceeded") ||
 		strings.Contains(msg, "timeout")
+}
+
+// shouldRestartTurn reports whether a failed attempt may be retried from
+// scratch: only when the failure is transient, attempts remain, and no tool has
+// executed yet (a restart would otherwise re-run side effects and redo work).
+func shouldRestartTurn(runErr error, attempt, maxRetries, toolCalls int) bool {
+	return isTransientError(runErr) && attempt < maxRetries && toolCalls == 0
 }
 
 // SessionID returns the agent's session identifier.

@@ -104,10 +104,10 @@ func (c *Client) Name() string {
 
 // OpenAIChatMessage represents a message in the OpenAI chat format.
 type openAIChatMessage struct {
-	Role       string              `json:"role"`
-	Content    string              `json:"content,omitempty"`
-	ToolCalls  []openAIToolCall    `json:"tool_calls,omitempty"`
-	ToolCallID string              `json:"tool_call_id,omitempty"`
+	Role       string           `json:"role"`
+	Content    string           `json:"content,omitempty"`
+	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
 type openAIToolCall struct {
@@ -181,22 +181,18 @@ func (c *Client) GenerateContent(ctx context.Context, req *model.LLMRequest, str
 			return
 		}
 
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
-		if err != nil {
-			yield(nil, errors.Wrap(err, "creating http request"))
-			return
+		headers := map[string]string{
+			"Content-Type": "application/json",
 		}
-
-		httpReq.Header.Set("Content-Type", "application/json")
 		if c.apiKey != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+			headers["Authorization"] = "Bearer " + c.apiKey
 		}
 
 		ua := c.userAgent
 		if ua == "" {
 			ua = DefaultUserAgent
 		}
-		httpReq.Header.Set("User-Agent", ua)
+		headers["User-Agent"] = ua
 
 		sid := c.sessionID
 		if ctxSid, ok := SessionIDFromContext(ctx); ok && ctxSid != "" {
@@ -205,11 +201,11 @@ func (c *Client) GenerateContent(ctx context.Context, req *model.LLMRequest, str
 		if sid == "" {
 			sid = fmt.Sprintf("golem-%d", time.Now().UnixNano())
 		}
-		httpReq.Header.Set("x-opencode-session", sid)
+		headers["x-opencode-session"] = sid
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.doRequestWithRetry(ctx, endpoint, bodyBytes, headers)
 		if err != nil {
-			yield(nil, errors.Wrapf(err, "executing request to %s", endpoint))
+			yield(nil, err)
 			return
 		}
 		defer resp.Body.Close()
@@ -226,6 +222,93 @@ func (c *Client) GenerateContent(ctx context.Context, req *model.LLMRequest, str
 			c.handleUnaryResponse(resp.Body, yield)
 		}
 	}
+}
+
+// Request-level retry bounds, for transient provider failures.
+const (
+	maxRequestAttempts = 4
+	initialRetryDelay  = 500 * time.Millisecond
+	maxRetryDelay      = 8 * time.Second
+)
+
+func retryableStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusInternalServerError,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// doRequestWithRetry posts body to endpoint, retrying transient network errors
+// and retryable HTTP statuses with bounded exponential backoff. A retryable
+// status on the final attempt is returned unread so the caller can report its
+// body. Cancellation stops immediately.
+func (c *Client) doRequestWithRetry(ctx context.Context, endpoint string, body []byte, headers map[string]string) (*http.Response, error) {
+	delay := initialRetryDelay
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRequestAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, errors.Wrap(err, "creating http request")
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+
+		resp, err := c.httpClient.Do(req)
+		sleep := delay
+		switch {
+		case err != nil:
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			lastErr = errors.Wrapf(err, "executing request to %s", endpoint)
+		case !retryableStatus(resp.StatusCode):
+			return resp, nil
+		default:
+			lastErr = fmt.Errorf("api error %d from %s", resp.StatusCode, endpoint)
+			sleep = retryAfter(resp, delay)
+			if attempt < maxRequestAttempts {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+			}
+		}
+
+		if attempt == maxRequestAttempts {
+			if resp != nil && err == nil {
+				return resp, nil // caller surfaces the final retryable status body
+			}
+			return nil, lastErr
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(sleep):
+		}
+		if delay < maxRetryDelay {
+			delay *= 2
+		}
+	}
+
+	return nil, lastErr
+}
+
+// retryAfter honors a Retry-After header (seconds) when present, bounded.
+func retryAfter(resp *http.Response, fallback time.Duration) time.Duration {
+	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if v == "" {
+		return fallback
+	}
+	if secs, err := time.ParseDuration(v + "s"); err == nil && secs > 0 {
+		if secs > maxRetryDelay {
+			return maxRetryDelay
+		}
+		return secs
+	}
+	return fallback
 }
 
 func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChatRequest, error) {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/user/golem/pkg/config"
@@ -425,6 +426,9 @@ func TestBuildInstructionIncludesLiveHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.AppendEvent(fractal.KindTool, `shell: {"command":"true"}`); err != nil {
+		t.Fatal(err)
+	}
 	view.Sync()
 
 	if withCur := buildInstruction(mgr, view, nil, -1); !strings.Contains(withCur, "CURRENT-TURN-MARKER") {
@@ -433,6 +437,9 @@ func TestBuildInstructionIncludesLiveHead(t *testing.T) {
 	out2 := buildInstruction(mgr, view, nil, curEv.ID)
 	if strings.Contains(out2, "CURRENT-TURN-MARKER") {
 		t.Errorf("in-flight user message was duplicated into the live head")
+	}
+	if strings.Contains(out2, "command") {
+		t.Errorf("current-turn tool event leaked into the live head")
 	}
 	if !strings.Contains(out2, "review the swarm changes in pwd") {
 		t.Errorf("prior turn dropped after appending the in-flight message")
@@ -465,5 +472,126 @@ func TestFormatLiveHeadBoundsAndKeepsNewest(t *testing.T) {
 	}
 	if !strings.Contains(filtered, "#18 [") {
 		t.Errorf("exclusion removed neighbours of the excluded event")
+	}
+}
+
+func TestShouldRestartTurn(t *testing.T) {
+	transient := errors.New("Error 503: high demand")
+	permanent := errors.New("Error 400: INVALID_ARGUMENT")
+	cases := []struct {
+		name       string
+		err        error
+		attempt    int
+		maxRetries int
+		toolCalls  int
+		want       bool
+	}{
+		{"transient before progress", transient, 1, 3, 0, true},
+		{"transient after progress", transient, 1, 3, 1, false},
+		{"permanent", permanent, 1, 3, 0, false},
+		{"no attempts left", transient, 3, 3, 0, false},
+	}
+	for _, tc := range cases {
+		if got := shouldRestartTurn(tc.err, tc.attempt, tc.maxRetries, tc.toolCalls); got != tc.want {
+			t.Errorf("%s: shouldRestartTurn = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestTurnStateGate(t *testing.T) {
+	a := &Agent{}
+	if a.isTurnActive() {
+		t.Fatal("turn should start inactive")
+	}
+	a.beginTurn(5)
+	if !a.isTurnActive() {
+		t.Errorf("turn should be active after beginTurn")
+	}
+	if a.currentTurnStartEventID() != 5 {
+		t.Errorf("start id = %d, want 5", a.currentTurnStartEventID())
+	}
+	a.noteToolCall()
+	a.noteToolCall()
+	if a.turnToolCallCount() != 2 {
+		t.Errorf("tool calls = %d, want 2", a.turnToolCallCount())
+	}
+	a.endTurn()
+	if a.isTurnActive() {
+		t.Errorf("turn should be inactive after endTurn")
+	}
+	if a.currentTurnStartEventID() != -1 || a.turnToolCallCount() != 0 {
+		t.Errorf("endTurn did not reset state: id=%d calls=%d", a.currentTurnStartEventID(), a.turnToolCallCount())
+	}
+}
+
+// TestProcessStreamDoesNotRestartAfterProgress proves that a transient error
+// after a tool has run surfaces instead of restarting the whole turn (which
+// would re-execute side effects and redo all work).
+func TestProcessStreamDoesNotRestartAfterProgress(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		n := requests
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("expected http.Flusher")
+		}
+
+		if n == 1 {
+			// One tool call: the runner will execute it, then call the model again.
+			fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"true\"}"}}]}}]}`)
+			fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"finish_reason":"tool_calls"}]}`)
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			fl.Flush()
+			return
+		}
+
+		// A transient error delivered on a 200 stream, so the HTTP retry layer
+		// cannot absorb it and the turn-level guard is what matters.
+		fmt.Fprintf(w, "data: %s\n\n", `{"error":{"message":"Error 503: upstream unavailable","type":"server_error"}}`)
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		fl.Flush()
+	}))
+	defer mockServer.Close()
+
+	cfg := Config{
+		Provider:        "opencode",
+		BaseURL:         mockServer.URL,
+		ModelName:       "test-model",
+		APIKey:          "test-key",
+		StorageDir:      t.TempDir(),
+		LiveHeadCount:   4,
+		ViewBudgetBytes: 4096,
+	}
+	agent, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New agent failed: %v", err)
+	}
+	defer agent.Close()
+
+	if _, err := agent.ProcessStream(context.Background(), "run true", nil); err == nil {
+		t.Fatalf("expected the transient error to surface")
+	}
+
+	mu.Lock()
+	got := requests
+	mu.Unlock()
+	if got != 2 {
+		t.Errorf("model requests = %d, want 2 (tool call + failing call, no turn restart)", got)
+	}
+
+	toolRan := false
+	for _, ev := range agent.Store().GetAllEvents() {
+		if ev.Kind == fractal.KindTool {
+			toolRan = true
+		}
+	}
+	if !toolRan {
+		t.Errorf("expected the shell tool to have executed once")
 	}
 }
