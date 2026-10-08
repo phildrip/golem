@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/user/golem/pkg/memory/fractal"
 )
@@ -124,6 +125,54 @@ func TestEventsToEntriesToolEchoPairingAndWork(t *testing.T) {
 	}
 	if entries[2].Type != TypeTool || entries[2].ToolName != "result" {
 		t.Errorf("orphan echo mapped to %+v, want result tool", entries[2])
+	}
+}
+
+func TestEventsToEntriesTrailingToolNotRunning(t *testing.T) {
+	now := time.Now()
+	// A turn interrupted mid-tool leaves a tool with no echo in the log.
+	events := []fractal.Event{
+		mkEvent(0, fractal.KindUser, "run it", now),
+		mkEvent(1, fractal.KindTool, `shell: {"command":"sleep 999"}`, now),
+	}
+	entries := eventsToEntries(events)
+	last := entries[len(entries)-1]
+	if last.Type != TypeTool {
+		t.Fatalf("expected a trailing tool entry, got %+v", last)
+	}
+	if last.IsRunning {
+		t.Errorf("historical tool must not replay as RUNNING: %+v", last)
+	}
+}
+
+func TestFormatStartupHeaderZeroTimestamp(t *testing.T) {
+	now := time.Now()
+	events := []fractal.Event{{ID: 0, Kind: fractal.KindUser, Text: "x"}} // zero Timestamp
+	header := formatStartupHeader(events, "/w", "default", now)
+	if strings.Contains(header, "last active") {
+		t.Errorf("zero timestamp must not render an age: %q", header)
+	}
+	if !strings.Contains(header, "1 messages") {
+		t.Errorf("header should still report the count: %q", header)
+	}
+}
+
+func TestClampLines(t *testing.T) {
+	long := "Resuming golem  ·  workspace: /very/deep/path/that/keeps/going/and/going/more"
+	got := clampLines(long, 20)
+	if utf8.RuneCountInString(got) != 20 || !strings.HasSuffix(got, "…") {
+		t.Errorf("clampLines = %q (%d runes), want 20 ending in ellipsis", got, utf8.RuneCountInString(got))
+	}
+	multi := clampLines("short\nthis line is definitely too long for the width", 10)
+	lines := strings.Split(multi, "\n")
+	if lines[0] != "short" {
+		t.Errorf("short line changed: %q", lines[0])
+	}
+	if utf8.RuneCountInString(lines[1]) != 10 {
+		t.Errorf("second line not clamped: %q", lines[1])
+	}
+	if clampLines("ok", 0) != "ok" {
+		t.Errorf("clampLines with width<=1 should be a no-op")
 	}
 }
 

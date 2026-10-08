@@ -482,6 +482,24 @@ func (s *Store) EventsSlice(start, end int) []Event {
 	return res
 }
 
+// EventsTail returns a copy of the last n events in order (fewer if the store is
+// shorter). It avoids copying the whole log when only the tail is needed.
+func (s *Store) EventsTail(n int) []Event {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed || len(s.events) == 0 || n <= 0 {
+		return []Event{}
+	}
+	start := len(s.events) - n
+	if start < 0 {
+		start = 0
+	}
+	res := make([]Event, len(s.events)-start)
+	copy(res, s.events[start:])
+	return res
+}
+
 // GetAllEvents atomically acquires a read lock and returns a safe copy of all logged events.
 func (s *Store) GetAllEvents() []Event {
 	s.mu.RLock()

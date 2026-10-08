@@ -148,7 +148,7 @@ func NewModel(agentInstance *golem.Agent, store *fractal.Store, viewEngine *frac
 
 	var allEvents []fractal.Event
 	if store != nil {
-		allEvents = store.EventsSlice(0, store.CountEvents())
+		allEvents = store.EventsTail(startupEventScanLimit)
 	}
 
 	var initialHistory []string
@@ -907,7 +907,7 @@ func (m *Model) renderConversationToViewport() {
 	var sb strings.Builder
 
 	if m.startupHeader != "" {
-		sb.WriteString(HeaderTitleStyle.Render(m.startupHeader) + "\n\n")
+		sb.WriteString(HeaderTitleStyle.Render(clampLines(m.startupHeader, m.viewport.Width-4)) + "\n\n")
 	}
 
 	for i := 0; i < len(m.entries); i++ {

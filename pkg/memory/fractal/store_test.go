@@ -1,6 +1,7 @@
 package fractal
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -322,5 +323,34 @@ func TestAppendEventOptsTimestamp(t *testing.T) {
 	}
 	if !retrieved2.Timestamp.Equal(historicalTime) {
 		t.Errorf("reopened event timestamp mismatch: expected %v, got %v", historicalTime, retrieved2.Timestamp)
+	}
+}
+
+func TestStoreEventsTail(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	for i := 0; i < 5; i++ {
+		if _, err := store.AppendEvent(KindUser, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tail := store.EventsTail(3)
+	if len(tail) != 3 || tail[0].Text != "e2" || tail[2].Text != "e4" {
+		t.Errorf("EventsTail(3) = %v, want e2..e4", tail)
+	}
+	if all := store.EventsTail(100); len(all) != 5 || all[0].Text != "e0" {
+		t.Errorf("EventsTail(100) = %v, want all 5 in order", all)
+	}
+	if none := store.EventsTail(0); len(none) != 0 {
+		t.Errorf("EventsTail(0) = %v, want empty", none)
+	}
+	if neg := store.EventsTail(-1); len(neg) != 0 {
+		t.Errorf("EventsTail(-1) = %v, want empty", neg)
 	}
 }

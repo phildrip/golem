@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/user/golem/pkg/memory/fractal"
 )
@@ -14,6 +15,10 @@ const (
 	startupReplayTurns = 5
 	// startupReplayEvents caps the replay regardless of turn count.
 	startupReplayEvents = 200
+	// startupEventScanLimit is how far back from the store the startup reads, so
+	// opening golem never copies the whole event log. It is larger than the
+	// replay cap to leave room for the turn window to find 5 user turns.
+	startupEventScanLimit = 500
 	// startupMaxEventText caps a single replayed event so startup stays fast.
 	startupMaxEventText = 2000
 )
@@ -111,6 +116,14 @@ func eventsToEntries(events []fractal.Event) []ChatEntry {
 		}
 	}
 
+	// Nothing in history is still running: a tool whose echo is missing (an
+	// interrupted turn, or a pair split by the window) must not show RUNNING.
+	for i := range entries {
+		if entries[i].Type == TypeTool {
+			entries[i].IsRunning = false
+		}
+	}
+
 	return entries
 }
 
@@ -129,8 +142,27 @@ func formatStartupHeader(events []fractal.Event, workspace, profile string, now 
 	}
 
 	last := events[len(events)-1].Timestamp
+	if last.IsZero() {
+		return fmt.Sprintf("Resuming golem  ·  workspace: %s  ·  profile: %s\n%d messages",
+			workspace, profile, len(events))
+	}
 	return fmt.Sprintf("Resuming golem  ·  workspace: %s  ·  profile: %s\n%d messages  ·  last active %s",
 		workspace, profile, len(events), humanizeAgo(now.Sub(last)))
+}
+
+// clampLines truncates each line of s to width runes, appending an ellipsis
+// when it cuts, so a deep workspace path cannot overflow the header block.
+func clampLines(s string, width int) string {
+	if width <= 1 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		if utf8.RuneCountInString(ln) > width {
+			lines[i] = string([]rune(ln)[:width-1]) + "…"
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // humanizeAgo renders a coarse relative time.
