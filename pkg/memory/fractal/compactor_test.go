@@ -50,7 +50,7 @@ func TestTruncateUTF8(t *testing.T) {
 		{
 			name:       "utf8 multi-byte rune boundary",
 			input:      "hello 世界", // "hello " (6) + "世" (3) + "界" (3) = 12 bytes
-			limit:      8,        // 8 cuts inside "世" (bytes 6, 7, 8) -> should truncate to 6 ("hello ")
+			limit:      8,          // 8 cuts inside "世" (bytes 6, 7, 8) -> should truncate to 6 ("hello ")
 			wantLength: 6,
 		},
 	}
@@ -62,6 +62,95 @@ func TestTruncateUTF8(t *testing.T) {
 				t.Errorf("len(res) = %d, want %d (content: %q)", len([]byte(res)), tc.wantLength, res)
 			}
 		})
+	}
+}
+
+func TestScaleLineIsExactly512Bytes(t *testing.T) {
+	if got := len([]byte(ScaleLine512Bytes)); got != DefaultNodeTargetBytes {
+		t.Errorf("ScaleLine512Bytes = %d bytes, want exactly %d", got, DefaultNodeTargetBytes)
+	}
+}
+
+// correctingStub returns an initial (usually over-length) candidate and then a
+// scripted sequence of corrections.
+type correctingStub struct {
+	initial    string
+	corrected  []string
+	calls      int
+	lastPrompt string
+}
+
+func (s *correctingStub) Summarize(ctx context.Context, contextView, content string, isMerge bool) (string, error) {
+	return s.initial, nil
+}
+
+func (s *correctingStub) Correct(ctx context.Context, contextView, content string, isMerge bool, prior, correction string) (string, error) {
+	s.lastPrompt = correction
+	idx := s.calls
+	s.calls++
+	if idx < len(s.corrected) {
+		return s.corrected[idx], nil
+	}
+	return prior, nil
+}
+
+func TestSummarizeBoundedCorrectsOverLength(t *testing.T) {
+	ctx := context.Background()
+
+	// A single correction brings it under the limit.
+	stub := &correctingStub{
+		initial:   strings.Repeat("a", 600),
+		corrected: []string{strings.Repeat("b", 500)},
+	}
+	got, err := SummarizeBounded(ctx, stub, "view", "input", false)
+	if err != nil {
+		t.Fatalf("SummarizeBounded failed: %v", err)
+	}
+	if len([]byte(got)) != 500 {
+		t.Errorf("got %d bytes, want the 500-byte corrected candidate", len([]byte(got)))
+	}
+	if stub.calls != 1 {
+		t.Errorf("Correct calls = %d, want 1", stub.calls)
+	}
+	if !strings.Contains(stub.lastPrompt, "Too long") {
+		t.Errorf("correction prompt missing 'Too long': %q", stub.lastPrompt)
+	}
+
+	// If corrections never reach the limit, stop after maxSummaryCorrections and
+	// keep the shortest candidate (no truncation).
+	stub2 := &correctingStub{
+		initial: strings.Repeat("a", 600),
+		corrected: []string{
+			strings.Repeat("b", 560),
+			strings.Repeat("c", 570),
+			strings.Repeat("d", 580),
+			strings.Repeat("e", 590),
+			strings.Repeat("f", 595),
+			strings.Repeat("g", 599),
+		},
+	}
+	got2, err := SummarizeBounded(ctx, stub2, "view", "input", false)
+	if err != nil {
+		t.Fatalf("SummarizeBounded failed: %v", err)
+	}
+	if len([]byte(got2)) != 560 {
+		t.Errorf("got %d bytes, want shortest candidate 560", len([]byte(got2)))
+	}
+	if stub2.calls != maxSummaryCorrections {
+		t.Errorf("Correct calls = %d, want %d", stub2.calls, maxSummaryCorrections)
+	}
+
+	// Within the limit: no correction at all.
+	stub3 := &correctingStub{initial: strings.Repeat("z", 100)}
+	got3, err := SummarizeBounded(ctx, stub3, "view", "input", true)
+	if err != nil {
+		t.Fatalf("SummarizeBounded failed: %v", err)
+	}
+	if got3 != stub3.initial {
+		t.Errorf("in-limit candidate changed: %q", got3)
+	}
+	if stub3.calls != 0 {
+		t.Errorf("Correct calls = %d, want 0", stub3.calls)
 	}
 }
 

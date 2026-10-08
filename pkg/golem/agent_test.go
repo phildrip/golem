@@ -223,12 +223,12 @@ func TestAgentProfileAndMountedMemory(t *testing.T) {
 	docsStore.Close()
 
 	cfg := Config{
-		Provider:        "opencode",
-		BaseURL:         "https://api.opencode.ai/v1",
-		ModelName:       "deepseek-chat",
-		APIKey:          "opencode-test-key",
-		StorageDir:      primaryDir,
-		Profile:         "work",
+		Provider:   "opencode",
+		BaseURL:    "https://api.opencode.ai/v1",
+		ModelName:  "deepseek-chat",
+		APIKey:     "opencode-test-key",
+		StorageDir: primaryDir,
+		Profile:    "work",
 		MountedMemories: []config.MountedMemoryConfig{
 			{Name: "shared-docs", Path: docsDir, ReadOnly: true},
 		},
@@ -325,7 +325,7 @@ func (h *testStreamHandler) OnChunk(token string) {
 	}
 }
 
-func (h *testStreamHandler) OnToolStart(toolName, command string) {}
+func (h *testStreamHandler) OnToolStart(toolName, command string)             {}
 func (h *testStreamHandler) OnToolDone(toolName, output string, exitCode int) {}
 
 func TestAgent_ProcessStreamWithMockLLM(t *testing.T) {
@@ -385,3 +385,71 @@ func TestAgent_ProcessStreamWithMockLLM(t *testing.T) {
 	}
 }
 
+// TestBuildInstructionIncludesLiveHead guards the fix for the main agent
+// forgetting recent context: the newest raw events must appear in the prompt,
+// which previously rendered only the summary view (excluding the live head).
+func TestBuildInstructionIncludesLiveHead(t *testing.T) {
+	store, err := fractal.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	view := fractal.NewView(store, fractal.ViewConfig{LiveHeadCount: 10})
+	mgr := fractal.NewMemoryManager(store, view)
+
+	// A short prior exchange: fewer events than the live-head window, so the
+	// summary view alone would carry nothing.
+	if _, err := store.AppendEvent(fractal.KindUser, "review the swarm changes in pwd"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendEvent(fractal.KindTalk, "starting the review now"); err != nil {
+		t.Fatal(err)
+	}
+	view.Sync()
+
+	out := buildInstruction(mgr, view, nil)
+	if !strings.Contains(out, "<recent_live_head>") {
+		t.Errorf("instruction missing <recent_live_head> block:\n%s", out)
+	}
+	for _, want := range []string{"review the swarm changes in pwd", "starting the review now"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("instruction missing prior event %q from live head", want)
+		}
+	}
+
+	// The in-flight user message is the turn content, so it must be dropped from
+	// the live head to avoid duplication.
+	if _, err := store.AppendEvent(fractal.KindUser, "CURRENT-TURN-MARKER"); err != nil {
+		t.Fatal(err)
+	}
+	view.Sync()
+
+	out2 := buildInstruction(mgr, view, nil)
+	if strings.Contains(out2, "CURRENT-TURN-MARKER") {
+		t.Errorf("in-flight user message was duplicated into the live head")
+	}
+	if !strings.Contains(out2, "review the swarm changes in pwd") {
+		t.Errorf("prior turn dropped after appending the in-flight message")
+	}
+}
+
+// TestFormatLiveHeadBoundsAndKeepsNewest verifies the live head is bounded and
+// retains the most recent events when the cap is exceeded.
+func TestFormatLiveHeadBoundsAndKeepsNewest(t *testing.T) {
+	var events []fractal.Event
+	for i := 0; i < 20; i++ {
+		events = append(events, fractal.Event{ID: i, Kind: fractal.KindEcho, Text: strings.Repeat("x", 1000)})
+	}
+
+	out := formatLiveHead(events)
+	if len(out) > liveHeadMaxTotalBytes+256 {
+		t.Errorf("live head size = %d, want roughly <= %d", len(out), liveHeadMaxTotalBytes)
+	}
+	if !strings.Contains(out, "#19 [") {
+		t.Errorf("live head dropped the newest event (#19)")
+	}
+	if strings.Contains(out, "#0 [") {
+		t.Errorf("live head kept the oldest event (#0) instead of trimming from the front")
+	}
+}

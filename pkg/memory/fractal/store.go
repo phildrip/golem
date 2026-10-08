@@ -20,7 +20,17 @@ var (
 	bucketEvents   = []byte("events")
 	bucketNodes    = []byte("nodes")
 	bucketMetadata = []byte("metadata")
+	bucketView     = []byte("view")
 )
+
+// viewStateKey is the single key under bucketView holding the persisted tiling.
+var viewStateKey = []byte("state")
+
+// ViewState is the persisted tiling of a View: its parts and tail boundary.
+type ViewState struct {
+	Parts  []ViewPart `json:"parts"`
+	TailTo int        `json:"tail_to"`
+}
 
 // EventListener is a callback function invoked when a new event is logged.
 type EventListener func(Event)
@@ -82,6 +92,9 @@ func OpenStore(dir string) (*Store, error) {
 			return err
 		}
 		if _, err := tx.CreateBucketIfNotExists(bucketMetadata); err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(bucketView); err != nil {
 			return err
 		}
 		return nil
@@ -375,6 +388,52 @@ func (s *Store) SaveNode(node Node) error {
 
 	s.nodes[node.Key()] = node
 	return nil
+}
+
+// SaveViewState persists the View tiling so it survives restarts; the view is
+// loaded rather than rebuilt (OptChat mistake #3: never rebuild the view).
+func (s *Store) SaveViewState(st ViewState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	data, err := json.Marshal(st)
+	if err != nil {
+		return errors.Wrap(err, "marshaling view state")
+	}
+
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketView).Put(viewStateKey, data)
+	})
+}
+
+// LoadViewState returns the persisted View tiling, if any.
+func (s *Store) LoadViewState() (ViewState, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var st ViewState
+	if s.closed {
+		return st, false
+	}
+
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		data := tx.Bucket(bucketView).Get(viewStateKey)
+		if data == nil {
+			return nil
+		}
+		return json.Unmarshal(data, &st)
+	})
+	if err != nil {
+		return ViewState{}, false
+	}
+	if len(st.Parts) == 0 && st.TailTo == 0 {
+		return ViewState{}, false
+	}
+	return st, true
 }
 
 // GetEvent returns the event by ID if present.

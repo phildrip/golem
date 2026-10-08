@@ -12,22 +12,32 @@ import (
 	"google.golang.org/adk/v2/tool/functiontool"
 )
 
-// DefaultViewBudgetBytes is the budget for the fractal summary view (approx 64k tokens).
+// DefaultViewBudgetBytes is the high-water mark for the fractal summary view.
+// Once the view exceeds it, merges run in one batch down to the low-water mark.
 const DefaultViewBudgetBytes = 128_000
+
+// DefaultViewLowWaterBytes is the low-water mark the view is merged down to once
+// it exceeds the high-water mark (OptChat sawtooth: 128 KB -> 64 KB).
+const DefaultViewLowWaterBytes = 64_000
 
 // DefaultLiveHeadCount is the number of recent raw events retained verbatim in the live head.
 const DefaultLiveHeadCount = 10
 
 // ViewConfig configures view budget and live head retention.
 type ViewConfig struct {
+	// ViewBudgetBytes is the high-water mark: merges start once the view exceeds it.
 	ViewBudgetBytes int
-	LiveHeadCount   int
+	// LowWaterBytes is the low-water mark a merge batch aims for. When zero it
+	// defaults to half the high-water mark.
+	LowWaterBytes int
+	LiveHeadCount int
 }
 
 // DefaultViewConfig returns the default view configuration.
 func DefaultViewConfig() ViewConfig {
 	return ViewConfig{
 		ViewBudgetBytes: DefaultViewBudgetBytes,
+		LowWaterBytes:   DefaultViewLowWaterBytes,
 		LiveHeadCount:   DefaultLiveHeadCount,
 	}
 }
@@ -57,13 +67,19 @@ type View struct {
 	cfg    ViewConfig
 	store  *Store
 	parts  []ViewPart
-	tailTo int // number of events covered by the tail
+	tailTo int  // number of events covered by the tail
+	dirty  bool // tiling changed since it was last persisted
 }
 
-// NewView constructs a View over the given Store.
+// NewView constructs a View over the given Store. It loads the persisted tiling
+// when it is still consistent with the store, and falls back to Rebuild only
+// when there is none (OptChat mistake #3: never rebuild the view on restart).
 func NewView(store *Store, cfg ViewConfig) *View {
 	if cfg.ViewBudgetBytes <= 0 {
 		cfg.ViewBudgetBytes = DefaultViewBudgetBytes
+	}
+	if cfg.LowWaterBytes <= 0 || cfg.LowWaterBytes >= cfg.ViewBudgetBytes {
+		cfg.LowWaterBytes = cfg.ViewBudgetBytes / 2
 	}
 	if cfg.LiveHeadCount < 0 {
 		cfg.LiveHeadCount = DefaultLiveHeadCount
@@ -73,8 +89,71 @@ func NewView(store *Store, cfg ViewConfig) *View {
 		cfg:   cfg,
 		store: store,
 	}
-	v.Rebuild()
+	if !v.loadStateLocked() {
+		v.Rebuild()
+	}
 	return v
+}
+
+// validTiling reports whether parts is a gap-free, ordered tiling of [0, tailTo).
+func validTiling(parts []ViewPart, tailTo int) bool {
+	if tailTo < 0 {
+		return false
+	}
+	if tailTo == 0 {
+		return len(parts) == 0
+	}
+	pos := 0
+	for _, p := range parts {
+		if p.Level < 0 || p.Level > 62 || p.Index < 0 {
+			return false
+		}
+		start, end := p.Range()
+		if start != pos || end <= start {
+			return false
+		}
+		pos = end
+	}
+	return pos == tailTo
+}
+
+// loadStateLocked restores a persisted tiling if it is consistent with the
+// current event count and live-head configuration. It returns false when the
+// caller must rebuild.
+func (v *View) loadStateLocked() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	st, ok := v.store.LoadViewState()
+	if !ok {
+		return false
+	}
+
+	total := v.store.CountEvents()
+	expectedTail := total - v.cfg.LiveHeadCount
+	if expectedTail < 0 {
+		expectedTail = 0
+	}
+	if st.TailTo != expectedTail || !validTiling(st.Parts, st.TailTo) {
+		return false
+	}
+
+	v.parts = st.Parts
+	v.tailTo = st.TailTo
+	v.dirty = false
+	return true
+}
+
+// saveLocked persists the tiling when it changed. A failed write is non-fatal:
+// the view stays usable in memory and the state is retried on the next save.
+func (v *View) saveLocked() {
+	if !v.dirty {
+		return
+	}
+	if err := v.store.SaveViewState(ViewState{Parts: v.parts, TailTo: v.tailTo}); err != nil {
+		return
+	}
+	v.dirty = false
 }
 
 // Rebuild folds the view from message 0 up to T_tail = totalEvents - LiveHeadCount.
@@ -96,6 +175,11 @@ func (v *View) Rebuild() {
 		v.tailTo = i + 1
 		v.fitLocked()
 	}
+
+	if tailEnd > 0 {
+		v.dirty = true
+		v.saveLocked()
+	}
 }
 
 // Sync updates the view as new events are added to the store.
@@ -111,6 +195,7 @@ func (v *View) Sync() {
 
 	if tailEnd <= v.tailTo {
 		v.fitLocked()
+		v.saveLocked()
 		return
 	}
 
@@ -119,44 +204,73 @@ func (v *View) Sync() {
 		v.tailTo = i + 1
 		v.fitLocked()
 	}
+
+	v.dirty = true
+	v.saveLocked()
 }
 
-// fitLocked performs due-age coarsening until the view fits within ViewBudgetBytes.
+// pairDue returns the merge age of the sibling pair whose left half is part a,
+// measured from the pair's LAST message (OptChat 3.2):
+//
+//	due = (T - last) / 2^level
+//
+// Measuring from the pair's FIRST message is wrong: near ties it merges old
+// pairs and rewrites old lines that rollback-push would keep. a must be the
+// even-indexed left sibling; the pair then spans [end, end+width).
+func (v *View) pairDue(a ViewPart) float64 {
+	width := int(1) << a.Level
+	_, end := a.Range()
+	last := end + width - 1
+	return float64(v.tailTo-last) / float64(width)
+}
+
+// bestMergeIndex returns the index of the most-due mergeable sibling pair, or
+// -1 if none is available. A pair is mergeable when its two halves are
+// adjacent same-level siblings (even left index) whose parent node is built.
+// On equal due, the oldest (lowest index) pair wins, matching rollback-push.
+func (v *View) bestMergeIndex() int {
+	bestIdx := -1
+	var maxDue float64 = -1.0
+
+	for idx := 0; idx < len(v.parts)-1; idx++ {
+		a := v.parts[idx]
+		b := v.parts[idx+1]
+
+		// Adjacent parts must have same level, even index, and consecutive indices.
+		if a.Level != b.Level || a.Index%2 != 0 || b.Index != a.Index+1 {
+			continue
+		}
+
+		// Parent node must already be built in store.
+		if _, ok := v.store.GetNode(a.Level+1, a.Index/2); !ok {
+			continue
+		}
+
+		if due := v.pairDue(a); due > maxDue {
+			maxDue = due
+			bestIdx = idx
+		}
+	}
+
+	return bestIdx
+}
+
+// fitLocked performs due-age coarsening once the view exceeds its high-water
+// mark, merging in a single batch down toward the low-water mark (OptChat 3.2).
+// Between batches the view only grows at its end; a small append below the
+// high-water mark never triggers a merge, so old lines do not churn.
 func (v *View) fitLocked() {
+	if v.calculateSizeBytes() <= v.cfg.ViewBudgetBytes {
+		return
+	}
+
 	for {
 		currentSize := v.calculateSizeBytes()
-		if currentSize <= v.cfg.ViewBudgetBytes || len(v.parts) < 2 {
+		if currentSize <= v.cfg.LowWaterBytes || len(v.parts) < 2 {
 			break
 		}
 
-		bestIdx := -1
-		var maxDue float64 = -1.0
-
-		for idx := 0; idx < len(v.parts)-1; idx++ {
-			a := v.parts[idx]
-			b := v.parts[idx+1]
-
-			// Adjacent parts must have same level, even index, and consecutive indices
-			if a.Level == b.Level && (a.Index%2 == 0) && (b.Index == a.Index+1) {
-				parentLevel := a.Level + 1
-				parentIndex := a.Index / 2
-
-				// Parent node must already be built in store
-				if _, ok := v.store.GetNode(parentLevel, parentIndex); !ok {
-					continue
-				}
-
-				start, _ := a.Range()
-				weight := float64(int(1) << (a.Level + 2))
-				due := float64(v.tailTo-start) / weight
-
-				if due > maxDue {
-					maxDue = due
-					bestIdx = idx
-				}
-			}
-		}
-
+		bestIdx := v.bestMergeIndex()
 		if bestIdx == -1 {
 			// No built parents available to coarsen; cannot shrink further right now
 			break
@@ -166,6 +280,7 @@ func (v *View) fitLocked() {
 		a := v.parts[bestIdx]
 		parent := ViewPart{Level: a.Level + 1, Index: a.Index / 2}
 		v.parts = append(v.parts[:bestIdx], append([]ViewPart{parent}, v.parts[bestIdx+2:]...)...)
+		v.dirty = true
 	}
 }
 

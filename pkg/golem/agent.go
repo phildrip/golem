@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pkg/errors"
 	"github.com/user/golem/pkg/config"
@@ -93,19 +94,19 @@ func DefaultConfig() Config {
 
 // Agent wraps the ADK Agent, Runner, and the fractal memory subsystem.
 type Agent struct {
-	cfg              Config
-	store            *fractal.Store
-	view             *fractal.View
-	memoryMgr        *fractal.MemoryManager
-	compactor        *fractal.Compactor
-	mcpManager       *mcp.Manager
-	mcpToolsets      []mcp.NamedToolset
-	subagentRunner   *subagent.Runner
-	runner           *runner.Runner
-	adkAgent         agent.Agent
-	userID           string
-	sessionID        string
-	swarmBus         *swarm.Bus
+	cfg                 Config
+	store               *fractal.Store
+	view                *fractal.View
+	memoryMgr           *fractal.MemoryManager
+	compactor           *fractal.Compactor
+	mcpManager          *mcp.Manager
+	mcpToolsets         []mcp.NamedToolset
+	subagentRunner      *subagent.Runner
+	runner              *runner.Runner
+	adkAgent            agent.Agent
+	userID              string
+	sessionID           string
+	swarmBus            *swarm.Bus
 	activeHandlerMu     sync.RWMutex
 	activeHandler       StreamHandler
 	compactorTrigger    chan struct{}
@@ -151,6 +152,133 @@ func (d *dynamicModel) GenerateContent(ctx context.Context, req *model.LLMReques
 	m := d.current
 	d.mu.RUnlock()
 	return m.GenerateContent(ctx, req, stream)
+}
+
+// golemSystemPrompt is the static instruction prefix. It never changes, so it
+// stays warm in the provider prompt cache across turns.
+const golemSystemPrompt = `You are Golem, an AI agent working with the user across long-running sessions.
+You have access to local file operations, a shell execution environment, and an infinite fractal memory.
+
+Memory Navigation & Scopes:
+- The memory section below contains multi-resolution summaries of older messages and mounted profile memories.
+- Each line is formatted: id+n|summary (where id is the starting message ID and n is the message count).
+- For normal requests and coding tasks, focus directly on the user's immediate prompt and project files.
+- Only use zoom(id, n) (with optional target) when you specifically need historical context, past user rulings, or earlier conversation details not in the immediate context. Never call zoom repeatedly in loops.
+- zoom(id, 1) returns the exact verbatim message in full.
+- Use date(id) to check the timestamp of any message.
+- Use remember(text, scope) to persist important user preferences, architectural decisions, or conventions into profile memory.
+
+Fast File Search & Safe Editing:
+- Use find_files to locate files by name or fuzzy path across the project.
+- Use grep_files to search for code occurrences or regular expressions across files.
+- For reading and editing files safely, prefer hashline_read, hashline_find_block, and hashline_patch:
+  - hashline_read formats lines with stable xxHash anchors (e.g. 42:a3).
+  - hashline_find_block locates the enclosing syntactic block (function, struct, etc.) around an anchor.
+  - hashline_patch applies changes ('SWAP', 'DEL', 'INS.PRE', 'INS.POST', 'SWAP.BLK', 'DEL.BLK', 'INS.BLK.PRE', 'INS.BLK.POST') bound to anchors.
+  - This guarantees edits never hit wrong lines or stale content.
+- You may also use read_file, write_file, and replace_regex when standard editing is preferred.
+
+Subagents & Delegation:
+- Use invoke_subagent to delegate focused investigations, file explorations, or complex coding tasks to subagents.
+- Subagents run with isolated context windows, preventing context bloat.
+- Both you and your subagents share the same fractal memory store. Subagents can use zoom(id, n), date(id), and remember(text) to inspect and update memory.
+
+Swarm (multi-agent coordination):
+- You and your subagents are agents on a shared in-memory swarm bus, each with an identity ("orchestrator" for you).
+- send_message delivers a point-to-point message to a peer's mailbox; broadcast_message publishes to a topic channel (e.g. 'discoveries', 'warnings').
+- check_inbox reads your mailbox. Prefer calling it after delegating work, before concluding a task, or whenever a peer may have replied — messages are not surfaced automatically.
+- invoke_subagent returns the subagent's swarm id in its result header ("id: ..."); use that id with send_message to reach a specific subagent.
+- claim_resource / release_resource / list_locks manage advisory locks on files or resources so parallel agents don't clobber the same target. Locks are advisory: claim before editing a file another agent may touch, and release when done.
+
+`
+
+const (
+	liveHeadMaxEventBytes = 600
+	liveHeadMaxTotalBytes = 8000
+)
+
+// truncateSafe cuts s to at most max bytes without splitting a UTF-8 rune.
+func truncateSafe(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// formatLiveHead renders recent raw events (bounded) so the agent keeps the
+// short-term context that the multi-resolution summary view does not carry.
+// It keeps the newest events when the total cap is exceeded.
+func formatLiveHead(events []fractal.Event) string {
+	if len(events) == 0 {
+		return ""
+	}
+
+	lines := make([]string, 0, len(events))
+	total := 0
+	for _, ev := range events {
+		text := strings.ReplaceAll(ev.Text, "\n", " ")
+		if len(text) > liveHeadMaxEventBytes {
+			text = truncateSafe(text, liveHeadMaxEventBytes) + "..."
+		}
+		line := fmt.Sprintf("#%d [%s]: %s\n", ev.ID, ev.Kind, text)
+		lines = append(lines, line)
+		total += len(line)
+	}
+	// Drop from the front, keeping the most recent events in view.
+	for total > liveHeadMaxTotalBytes && len(lines) > 1 {
+		total -= len(lines[0])
+		lines = lines[1:]
+	}
+
+	return "<recent_live_head>\n" + strings.Join(lines, "") + "</recent_live_head>"
+}
+
+// dropInFlightUserEvent removes the turn's own user message from the live head:
+// the ADK runner already passes it to the model as the turn content, so
+// repeating it in the live head would duplicate it.
+func dropInFlightUserEvent(events []fractal.Event) []fractal.Event {
+	if n := len(events); n > 0 && events[n-1].Kind == fractal.KindUser {
+		return events[:n-1]
+	}
+	return events
+}
+
+// buildInstruction assembles the Golem system instruction: the static guidance,
+// the fractal summary view, the recent verbatim live head, and swarm state.
+func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swarmBus *swarm.Bus) string {
+	if memoryMgr != nil {
+		memoryMgr.SyncAll()
+	}
+
+	var sb strings.Builder
+	sb.WriteString(golemSystemPrompt)
+
+	if memoryMgr != nil {
+		if renderedView := memoryMgr.RenderCombined(); renderedView != "" {
+			sb.WriteString(renderedView)
+			sb.WriteString("\n\n")
+		}
+	}
+
+	if view != nil {
+		if live := formatLiveHead(dropInFlightUserEvent(view.LiveHeadEvents())); live != "" {
+			sb.WriteString(live)
+			sb.WriteString("\n\n")
+		}
+	}
+
+	if swarmBus != nil {
+		if n := swarmBus.UnreadCount("orchestrator"); n > 0 {
+			sb.WriteString(fmt.Sprintf("\n\n<swarm_inbox>You have %d unread swarm message(s). Call check_inbox to read them.</swarm_inbox>\n", n))
+		}
+	}
+
+	sb.WriteString("Now assist the user with their request accurately and effectively.")
+	return sb.String()
 }
 
 // New constructs an operational Golem agent.
@@ -486,25 +614,11 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 			}
 		},
 		MemoryContext: func() string {
-			if view != nil {
-				view.Sync()
-				liveHead := view.LiveHeadEvents()
-				if len(liveHead) == 0 {
-					return ""
-				}
-				var sb strings.Builder
-				sb.WriteString("<recent_live_head>\n")
-				for _, ev := range liveHead {
-					clean := strings.ReplaceAll(ev.Text, "\n", " ")
-					if len(clean) > 120 {
-						clean = clean[:120] + "..."
-					}
-					sb.WriteString(fmt.Sprintf("#%d [%s]: %s\n", ev.ID, ev.Kind, clean))
-				}
-				sb.WriteString("</recent_live_head>")
-				return sb.String()
+			if view == nil {
+				return ""
 			}
-			return ""
+			view.Sync()
+			return formatLiveHead(view.LiveHeadEvents())
 		},
 	})
 	invokeSubagentTool, err := subagent.NewInvokeTool(subagentRunner)
@@ -518,51 +632,14 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	// 8. Build LLM Agent with dynamic fractal memory injection & logging callbacks
 	dynModel := newDynamicModel(modelInstance)
 	adkAgent, err := llmagent.New(llmagent.Config{
-		Name:        "golem",
-		Description: "An autonomous agent equipped with shell and file tools, and infinite fractal memory.",
-		Model:       dynModel,
-		Tools:       allTools,
-		Toolsets:    adkToolsets,
+		Name:            "golem",
+		Description:     "An autonomous agent equipped with shell and file tools, and infinite fractal memory.",
+		Model:           dynModel,
+		Tools:           allTools,
+		Toolsets:        adkToolsets,
 		IncludeContents: llmagent.IncludeContentsNone,
 		InstructionProvider: func(rc agent.ReadonlyContext) (string, error) {
-			memoryMgr.SyncAll()
-			renderedView := memoryMgr.RenderCombined()
-
-			var sb strings.Builder
-			sb.WriteString(`You are Golem, an AI agent working with the user across long-running sessions.
-You have access to local file operations, a shell execution environment, and an infinite fractal memory.
-
-Memory Navigation & Scopes:
-- The memory section below contains multi-resolution summaries of older messages and mounted profile memories.
-- Each line is formatted: id+n|summary (where id is the starting message ID and n is the message count).
-- For normal requests and coding tasks, focus directly on the user's immediate prompt and project files.
-- Only use zoom(id, n) (with optional target) when you specifically need historical context, past user rulings, or earlier conversation details not in the immediate context. Never call zoom repeatedly in loops.
-- zoom(id, 1) returns the exact verbatim message in full.
-- Use date(id) to check the timestamp of any message.
-- Use remember(text, scope) to persist important user preferences, architectural decisions, or conventions into profile memory.
-
-Fast File Search & Safe Editing:
-- Use find_files to locate files by name or fuzzy path across the project.
-- Use grep_files to search for code occurrences or regular expressions across files.
-- For reading and editing files safely, prefer hashline_read, hashline_find_block, and hashline_patch:
-  - hashline_read formats lines with stable xxHash anchors (e.g. 42:a3).
-  - hashline_find_block locates the enclosing syntactic block (function, struct, etc.) around an anchor.
-  - hashline_patch applies changes ('SWAP', 'DEL', 'INS.PRE', 'INS.POST', 'SWAP.BLK', 'DEL.BLK', 'INS.BLK.PRE', 'INS.BLK.POST') bound to anchors.
-  - This guarantees edits never hit wrong lines or stale content.
-- You may also use read_file, write_file, and replace_regex when standard editing is preferred.
-
-Subagents & Delegation:
-- Use invoke_subagent to delegate focused investigations, file explorations, or complex coding tasks to subagents.
-- Subagents run with isolated context windows, preventing context bloat.
-- Both you and your subagents share the same fractal memory store. Subagents can use zoom(id, n), date(id), and remember(text) to inspect and update memory.
-
-`)
-			if renderedView != "" {
-				sb.WriteString(renderedView)
-				sb.WriteString("\n\n")
-			}
-			sb.WriteString("Now assist the user with their request accurately and effectively.")
-			return sb.String(), nil
+			return buildInstruction(memoryMgr, view, swarmBus), nil
 		},
 		BeforeToolCallbacks: []llmagent.BeforeToolCallback{
 			func(ctx agent.Context, t tool.Tool, args map[string]any) (map[string]any, error) {
@@ -1074,4 +1151,3 @@ func isTransientError(err error) bool {
 func (a *Agent) SessionID() string {
 	return a.sessionID
 }
-
