@@ -249,6 +249,126 @@ func TestViewPersistsAcrossRestart(t *testing.T) {
 	}
 }
 
+// TestViewLoadsPersistedTilingNotRebuild injects a valid tiling that a rebuild
+// would never produce (coarser than the sequential algorithm), and asserts
+// NewView returns exactly it. This distinguishes loading from rebuilding.
+func TestViewLoadsPersistedTilingNotRebuild(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	for i := 0; i < 33; i++ {
+		if _, err := store.AppendEvent(KindUser, "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 16 level-1 parts tile [0, 32). A sequential rebuild with a large budget
+	// would instead emit 32 level-0 parts.
+	parts := make([]ViewPart, 16)
+	for i := range parts {
+		parts[i] = ViewPart{Level: 1, Index: i}
+	}
+	if err := store.SaveViewState(ViewState{Parts: parts, TailTo: 32}); err != nil {
+		t.Fatalf("SaveViewState failed: %v", err)
+	}
+
+	v := NewView(store, ViewConfig{ViewBudgetBytes: DefaultViewBudgetBytes, LiveHeadCount: 1})
+	if len(v.parts) != 16 {
+		t.Fatalf("loaded %d parts, want the 16 persisted level-1 parts (a rebuild would give 32 level-0 parts)", len(v.parts))
+	}
+	for _, p := range v.parts {
+		if p.Level != 1 {
+			t.Fatalf("loaded part %v, want every part at level 1", p)
+		}
+	}
+	if v.tailTo != 32 {
+		t.Errorf("tailTo = %d, want 32", v.tailTo)
+	}
+}
+
+// TestViewCatchesUpPersistedTiling verifies that a saved tiling behind the
+// current tail is caught up (events appended without a rebuild) rather than
+// discarded, and that the persisted detail is retained.
+func TestViewCatchesUpPersistedTiling(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+
+	for i := 0; i < 32; i++ {
+		if _, err := store.AppendEvent(KindUser, "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parts := make([]ViewPart, 16)
+	for i := range parts {
+		parts[i] = ViewPart{Level: 1, Index: i}
+	}
+	if err := store.SaveViewState(ViewState{Parts: parts, TailTo: 32}); err != nil {
+		t.Fatalf("SaveViewState failed: %v", err)
+	}
+	// Three events appended after the save: total 35, tail 34.
+	for i := 0; i < 3; i++ {
+		if _, err := store.AppendEvent(KindUser, "later"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := ViewConfig{ViewBudgetBytes: DefaultViewBudgetBytes, LiveHeadCount: 1}
+	v := NewView(store, cfg)
+	if v.tailTo != 34 {
+		t.Errorf("tailTo = %d, want 34 (caught up)", v.tailTo)
+	}
+	retained := false
+	for _, p := range v.parts {
+		if p.Level >= 1 {
+			retained = true
+		}
+	}
+	if !retained {
+		t.Errorf("persisted merged detail was not retained: %v", v.parts)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	reopened, err := OpenStore(dir)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer reopened.Close()
+	if v2 := NewView(reopened, cfg); v2.tailTo != 34 {
+		t.Errorf("after reopen tailTo = %d, want 34", v2.tailTo)
+	}
+}
+
+// TestNewViewNormalizesWaterMarks covers the ViewConfig water-mark defaults.
+func TestNewViewNormalizesWaterMarks(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	cases := []struct {
+		high, low, wantLow int
+	}{
+		{1000, 0, 500},    // low unset -> half of high
+		{1000, 1000, 500}, // low >= high -> half of high
+		{1000, 200, 200},  // explicit valid low is kept
+		{1, 0, 1},         // tiny high -> clamped to at least 1
+	}
+	for _, tc := range cases {
+		v := NewView(store, ViewConfig{ViewBudgetBytes: tc.high, LowWaterBytes: tc.low})
+		if v.cfg.LowWaterBytes != tc.wantLow {
+			t.Errorf("high=%d low=%d -> LowWaterBytes=%d, want %d", tc.high, tc.low, v.cfg.LowWaterBytes, tc.wantLow)
+		}
+	}
+}
+
 func TestZoomAndDateTools(t *testing.T) {
 	tempDir := t.TempDir()
 	store, err := OpenStore(tempDir)

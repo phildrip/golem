@@ -81,6 +81,9 @@ func NewView(store *Store, cfg ViewConfig) *View {
 	if cfg.LowWaterBytes <= 0 || cfg.LowWaterBytes >= cfg.ViewBudgetBytes {
 		cfg.LowWaterBytes = cfg.ViewBudgetBytes / 2
 	}
+	if cfg.LowWaterBytes < 1 {
+		cfg.LowWaterBytes = 1
+	}
 	if cfg.LiveHeadCount < 0 {
 		cfg.LiveHeadCount = DefaultLiveHeadCount
 	}
@@ -117,9 +120,10 @@ func validTiling(parts []ViewPart, tailTo int) bool {
 	return pos == tailTo
 }
 
-// loadStateLocked restores a persisted tiling if it is consistent with the
-// current event count and live-head configuration. It returns false when the
-// caller must rebuild.
+// loadStateLocked restores a persisted tiling and catches it up to the current
+// tail. It returns false only when the saved tiling is unusable (geometrically
+// invalid, or extending past the tail because events were removed or the
+// live-head configuration changed), in which case the caller rebuilds.
 func (v *View) loadStateLocked() bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -134,13 +138,26 @@ func (v *View) loadStateLocked() bool {
 	if expectedTail < 0 {
 		expectedTail = 0
 	}
-	if st.TailTo != expectedTail || !validTiling(st.Parts, st.TailTo) {
+	if st.TailTo > expectedTail || !validTiling(st.Parts, st.TailTo) {
 		return false
 	}
 
 	v.parts = st.Parts
 	v.tailTo = st.TailTo
 	v.dirty = false
+
+	// Catch up events appended since the last save (e.g. a crash between the
+	// event write and the view save) without rebuilding from message 0.
+	if v.tailTo < expectedTail {
+		for i := v.tailTo; i < expectedTail; i++ {
+			v.parts = append(v.parts, ViewPart{Level: 0, Index: i})
+			v.tailTo = i + 1
+			v.fitLocked()
+		}
+		v.dirty = true
+		v.saveLocked()
+	}
+
 	return true
 }
 

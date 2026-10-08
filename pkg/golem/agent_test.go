@@ -408,7 +408,7 @@ func TestBuildInstructionIncludesLiveHead(t *testing.T) {
 	}
 	view.Sync()
 
-	out := buildInstruction(mgr, view, nil)
+	out := buildInstruction(mgr, view, nil, -1)
 	if !strings.Contains(out, "<recent_live_head>") {
 		t.Errorf("instruction missing <recent_live_head> block:\n%s", out)
 	}
@@ -418,14 +418,19 @@ func TestBuildInstructionIncludesLiveHead(t *testing.T) {
 		}
 	}
 
-	// The in-flight user message is the turn content, so it must be dropped from
-	// the live head to avoid duplication.
-	if _, err := store.AppendEvent(fractal.KindUser, "CURRENT-TURN-MARKER"); err != nil {
+	// The in-flight user message is the turn content, so passing its event ID as
+	// the exclusion must drop it from the live head; without the exclusion it is
+	// present, proving the filter (not a position heuristic) does the work.
+	curEv, err := store.AppendEvent(fractal.KindUser, "CURRENT-TURN-MARKER")
+	if err != nil {
 		t.Fatal(err)
 	}
 	view.Sync()
 
-	out2 := buildInstruction(mgr, view, nil)
+	if withCur := buildInstruction(mgr, view, nil, -1); !strings.Contains(withCur, "CURRENT-TURN-MARKER") {
+		t.Errorf("expected the current user event in the live head when not excluded")
+	}
+	out2 := buildInstruction(mgr, view, nil, curEv.ID)
 	if strings.Contains(out2, "CURRENT-TURN-MARKER") {
 		t.Errorf("in-flight user message was duplicated into the live head")
 	}
@@ -442,7 +447,7 @@ func TestFormatLiveHeadBoundsAndKeepsNewest(t *testing.T) {
 		events = append(events, fractal.Event{ID: i, Kind: fractal.KindEcho, Text: strings.Repeat("x", 1000)})
 	}
 
-	out := formatLiveHead(events)
+	out := formatLiveHead(events, -1)
 	if len(out) > liveHeadMaxTotalBytes+256 {
 		t.Errorf("live head size = %d, want roughly <= %d", len(out), liveHeadMaxTotalBytes)
 	}
@@ -451,5 +456,14 @@ func TestFormatLiveHeadBoundsAndKeepsNewest(t *testing.T) {
 	}
 	if strings.Contains(out, "#0 [") {
 		t.Errorf("live head kept the oldest event (#0) instead of trimming from the front")
+	}
+
+	// An excluded event ID is omitted.
+	filtered := formatLiveHead(events, 19)
+	if strings.Contains(filtered, "#19 [") {
+		t.Errorf("excluded event #19 still present in live head")
+	}
+	if !strings.Contains(filtered, "#18 [") {
+		t.Errorf("exclusion removed neighbours of the excluded event")
 	}
 }

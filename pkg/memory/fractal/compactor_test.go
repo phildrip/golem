@@ -19,7 +19,7 @@ func (s *stubSummarizer) Summarize(ctx context.Context, contextView string, cont
 	}
 	summary := fmt.Sprintf("%s %s", tag, content)
 	s.calls = append(s.calls, summary)
-	return truncateUTF8(summary, DefaultNodeTargetBytes), nil
+	return TruncateUTF8(summary, DefaultNodeTargetBytes), nil
 }
 
 func TestTruncateUTF8(t *testing.T) {
@@ -57,7 +57,7 @@ func TestTruncateUTF8(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			res := truncateUTF8(tc.input, tc.limit)
+			res := TruncateUTF8(tc.input, tc.limit)
 			if len([]byte(res)) != tc.wantLength {
 				t.Errorf("len(res) = %d, want %d (content: %q)", len([]byte(res)), tc.wantLength, res)
 			}
@@ -151,6 +151,26 @@ func TestSummarizeBoundedCorrectsOverLength(t *testing.T) {
 	}
 	if stub3.calls != 0 {
 		t.Errorf("Correct calls = %d, want 0", stub3.calls)
+	}
+}
+
+func TestSummarizeBoundedCapsNonConverging(t *testing.T) {
+	ctx := context.Background()
+	huge := strings.Repeat("x", 100000)
+	stub := &correctingStub{
+		initial:   huge,
+		corrected: []string{huge, huge, huge, huge, huge},
+	}
+
+	got, err := SummarizeBounded(ctx, stub, "view", "input", false)
+	if err != nil {
+		t.Fatalf("SummarizeBounded failed: %v", err)
+	}
+	if len([]byte(got)) != maxNodeBytes {
+		t.Errorf("got %d bytes, want safety cap %d", len([]byte(got)), maxNodeBytes)
+	}
+	if stub.calls != maxSummaryCorrections {
+		t.Errorf("Correct calls = %d, want %d", stub.calls, maxSummaryCorrections)
 	}
 }
 

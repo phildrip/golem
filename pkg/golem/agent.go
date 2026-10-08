@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/pkg/errors"
 	"github.com/user/golem/pkg/config"
@@ -109,6 +108,8 @@ type Agent struct {
 	swarmBus            *swarm.Bus
 	activeHandlerMu     sync.RWMutex
 	activeHandler       StreamHandler
+	turnUserEventMu     sync.Mutex
+	turnUserEventID     int // event ID of the in-flight turn's user message, or -1
 	compactorTrigger    chan struct{}
 	workerCancel        context.CancelFunc
 	dynModel            *dynamicModel
@@ -197,22 +198,12 @@ const (
 	liveHeadMaxTotalBytes = 8000
 )
 
-// truncateSafe cuts s to at most max bytes without splitting a UTF-8 rune.
-func truncateSafe(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	cut := max
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
-}
-
 // formatLiveHead renders recent raw events (bounded) so the agent keeps the
 // short-term context that the multi-resolution summary view does not carry.
-// It keeps the newest events when the total cap is exceeded.
-func formatLiveHead(events []fractal.Event) string {
+// It keeps the newest events when the total cap is exceeded. excludeID >= 0
+// omits a single event (the in-flight turn's user message, which the runner
+// already passes as the turn content, so repeating it would duplicate it).
+func formatLiveHead(events []fractal.Event, excludeID int) string {
 	if len(events) == 0 {
 		return ""
 	}
@@ -220,9 +211,12 @@ func formatLiveHead(events []fractal.Event) string {
 	lines := make([]string, 0, len(events))
 	total := 0
 	for _, ev := range events {
+		if ev.ID == excludeID {
+			continue
+		}
 		text := strings.ReplaceAll(ev.Text, "\n", " ")
 		if len(text) > liveHeadMaxEventBytes {
-			text = truncateSafe(text, liveHeadMaxEventBytes) + "..."
+			text = fractal.TruncateUTF8(text, liveHeadMaxEventBytes) + "..."
 		}
 		line := fmt.Sprintf("#%d [%s]: %s\n", ev.ID, ev.Kind, text)
 		lines = append(lines, line)
@@ -233,23 +227,17 @@ func formatLiveHead(events []fractal.Event) string {
 		total -= len(lines[0])
 		lines = lines[1:]
 	}
+	if len(lines) == 0 {
+		return ""
+	}
 
 	return "<recent_live_head>\n" + strings.Join(lines, "") + "</recent_live_head>"
 }
 
-// dropInFlightUserEvent removes the turn's own user message from the live head:
-// the ADK runner already passes it to the model as the turn content, so
-// repeating it in the live head would duplicate it.
-func dropInFlightUserEvent(events []fractal.Event) []fractal.Event {
-	if n := len(events); n > 0 && events[n-1].Kind == fractal.KindUser {
-		return events[:n-1]
-	}
-	return events
-}
-
 // buildInstruction assembles the Golem system instruction: the static guidance,
 // the fractal summary view, the recent verbatim live head, and swarm state.
-func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swarmBus *swarm.Bus) string {
+// excludeEventID >= 0 omits that event from the live head.
+func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swarmBus *swarm.Bus, excludeEventID int) string {
 	if memoryMgr != nil {
 		memoryMgr.SyncAll()
 	}
@@ -265,7 +253,7 @@ func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swar
 	}
 
 	if view != nil {
-		if live := formatLiveHead(dropInFlightUserEvent(view.LiveHeadEvents())); live != "" {
+		if live := formatLiveHead(view.LiveHeadEvents(), excludeEventID); live != "" {
 			sb.WriteString(live)
 			sb.WriteString("\n\n")
 		}
@@ -618,7 +606,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 				return ""
 			}
 			view.Sync()
-			return formatLiveHead(view.LiveHeadEvents())
+			return formatLiveHead(view.LiveHeadEvents(), -1)
 		},
 	})
 	invokeSubagentTool, err := subagent.NewInvokeTool(subagentRunner)
@@ -639,7 +627,11 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		Toolsets:        adkToolsets,
 		IncludeContents: llmagent.IncludeContentsNone,
 		InstructionProvider: func(rc agent.ReadonlyContext) (string, error) {
-			return buildInstruction(memoryMgr, view, swarmBus), nil
+			excludeID := -1
+			if agentPtr != nil {
+				excludeID = agentPtr.currentTurnUserEventID()
+			}
+			return buildInstruction(memoryMgr, view, swarmBus, excludeID), nil
 		},
 		BeforeToolCallbacks: []llmagent.BeforeToolCallback{
 			func(ctx agent.Context, t tool.Tool, args map[string]any) (map[string]any, error) {
@@ -742,6 +734,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		userID:           "user",
 		sessionID:        sessionID,
 		swarmBus:         swarmBus,
+		turnUserEventID:  -1,
 		compactorTrigger: make(chan struct{}, 1),
 		workerCancel:     workerCancel,
 		dynModel:         dynModel,
@@ -783,6 +776,21 @@ func (a *Agent) triggerCompactor() {
 	}
 }
 
+// setTurnUserEventID records the in-flight turn's user event so the live head
+// can exclude it (the ADK runner already passes it as the turn content).
+func (a *Agent) setTurnUserEventID(id int) {
+	a.turnUserEventMu.Lock()
+	a.turnUserEventID = id
+	a.turnUserEventMu.Unlock()
+}
+
+// currentTurnUserEventID returns the in-flight turn's user event ID, or -1.
+func (a *Agent) currentTurnUserEventID() int {
+	a.turnUserEventMu.Lock()
+	defer a.turnUserEventMu.Unlock()
+	return a.turnUserEventID
+}
+
 // Process handles a single user turn synchronously, logs events to fractal memory, runs the model,
 // and returns the agent's textual response.
 func (a *Agent) Process(ctx context.Context, input string) (string, error) {
@@ -802,9 +810,14 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 	}()
 
 	// 1. Log user message to fractal store
-	if _, err := a.store.AppendEvent(fractal.KindUser, input); err != nil {
+	userEvent, err := a.store.AppendEvent(fractal.KindUser, input)
+	if err != nil {
 		return "", errors.Wrap(err, "logging user event")
 	}
+	// Exclude this turn's user message from the live head (the runner passes it
+	// as the turn content) for the whole turn, including mid-turn model calls.
+	a.setTurnUserEventID(userEvent.ID)
+	defer a.setTurnUserEventID(-1)
 
 	// Sync view
 	a.view.Sync()

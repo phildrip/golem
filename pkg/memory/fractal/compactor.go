@@ -3,6 +3,7 @@ package fractal
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,12 @@ const ScaleLine512Bytes = "user: deploy v2 to staging; tool: shell git checkout 
 
 // maxSummaryCorrections bounds the OptChat "too long" correction loop.
 const maxSummaryCorrections = 5
+
+// maxNodeBytes is a last-resort safety cap applied only after the correction
+// loop is exhausted. OptChat tolerates a few bytes over the 512-byte target,
+// not an unbounded line, so a model that never converges must not be allowed to
+// store an arbitrarily large node. Triggering it is logged, never silent.
+const maxNodeBytes = 4 * DefaultNodeTargetBytes
 
 // buildCompactorPrompt renders the shared compaction instruction for both the
 // initial summary and the correction turn.
@@ -161,8 +168,8 @@ func (s *LLMSummarizer) generate(ctx context.Context, contents []*genai.Content)
 	return cleanSummary(textBuilder.String()), nil
 }
 
-// truncateUTF8 safely cuts string at byteLimit without splitting a UTF-8 rune.
-func truncateUTF8(s string, byteLimit int) string {
+// TruncateUTF8 safely cuts string at byteLimit without splitting a UTF-8 rune.
+func TruncateUTF8(s string, byteLimit int) string {
 	if len(s) <= byteLimit {
 		return s
 	}
@@ -192,7 +199,7 @@ func SummarizeBounded(ctx context.Context, s Summarizer, contextView, content st
 	for attempt := 0; attempt < maxSummaryCorrections && len([]byte(best)) > DefaultNodeTargetBytes; attempt++ {
 		correction := fmt.Sprintf(
 			"Too long: your line is %d bytes, over the %d-byte limit. Write the whole line again for the same <input>, cutting just enough of the least valuable items to fit before this cut:\n%s| LIMIT",
-			len([]byte(best)), DefaultNodeTargetBytes, truncateUTF8(best, DefaultNodeTargetBytes),
+			len([]byte(best)), DefaultNodeTargetBytes, TruncateUTF8(best, DefaultNodeTargetBytes),
 		)
 		next, err := corrector.Correct(ctx, contextView, content, isMerge, best, correction)
 		if err != nil {
@@ -205,6 +212,11 @@ func SummarizeBounded(ctx context.Context, s Summarizer, contextView, content st
 		if len([]byte(next)) < len([]byte(best)) {
 			best = next
 		}
+	}
+
+	if len([]byte(best)) > maxNodeBytes {
+		log.Printf("fractal: summary still %d bytes after %d corrections; capping at %d (isMerge=%t)", len([]byte(best)), maxSummaryCorrections, maxNodeBytes, isMerge)
+		best = TruncateUTF8(best, maxNodeBytes)
 	}
 
 	return best, nil
