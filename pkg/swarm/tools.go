@@ -47,16 +47,50 @@ type ListLocksArgs struct{}
 
 // Toolset wraps the Swarm Bus into ADK Tools bound to a specific agent's identity.
 type Toolset struct {
-	bus     *Bus
-	agentID string
+	bus        *Bus
+	agentID    string
+	sessionID  string
+	registered bool
 }
 
-// NewToolset creates a Swarm Toolset for an agent.
+// NewToolset creates a Swarm Toolset for an agent without registering it on the
+// bus. The agent will not receive broadcasts until Register is called.
 func NewToolset(bus *Bus, agentID string) *Toolset {
 	return &Toolset{
 		bus:     bus,
 		agentID: agentID,
 	}
+}
+
+// NewToolsetWithSession creates a Toolset for an agent, registers the agent as
+// alive on the bus under the given session, and returns it. Call Close (or
+// Unregister) when the agent finishes so peers see it go offline.
+func NewToolsetWithSession(bus *Bus, agentID, sessionID string) *Toolset {
+	ts := NewToolset(bus, agentID)
+	ts.sessionID = sessionID
+	ts.Register()
+	return ts
+}
+
+// AgentID returns the identity this toolset acts as.
+func (ts *Toolset) AgentID() string { return ts.agentID }
+
+// Register marks the toolset's agent alive and ensures it has a mailbox.
+func (ts *Toolset) Register() {
+	if ts.bus == nil {
+		return
+	}
+	ts.bus.RegisterAgent(ts.agentID, ts.sessionID)
+	ts.registered = true
+}
+
+// Unregister marks the toolset's agent offline. Safe to call multiple times.
+func (ts *Toolset) Unregister() {
+	if ts.bus == nil || !ts.registered {
+		return
+	}
+	ts.bus.UnregisterAgent(ts.agentID)
+	ts.registered = false
 }
 
 // BuildTools constructs the collection of tools for the agent.
@@ -73,14 +107,19 @@ func (ts *Toolset) BuildTools() ([]tool.Tool, error) {
 			priority = PriorityUrgent
 		}
 		msg := Message{
+			SessionID: ts.sessionID,
 			Sender:    ts.agentID,
 			Recipient: args.Recipient,
 			Subject:   args.Subject,
 			Body:      args.Body,
 			Priority:  priority,
 		}
-		if err := ts.bus.Send(msg); err != nil {
+		status, err := ts.bus.Send(msg)
+		if err != nil {
 			return "", errors.Wrap(err, "sending swarm message")
+		}
+		if status == DeliveryDeadLetter {
+			return fmt.Sprintf("Message to %q could NOT be delivered (agent not registered/live). It was parked in the dead-letter queue; registered agents are: %v.", args.Recipient, ts.bus.LiveAgentIDs()), nil
 		}
 		return fmt.Sprintf("Message sent to %s successfully.", args.Recipient), nil
 	})
@@ -95,15 +134,21 @@ func (ts *Toolset) BuildTools() ([]tool.Tool, error) {
 		Description: "Broadcasts a message to an entire topic channel (e.g. 'discoveries', 'warnings', 'general') for all agents to see.",
 	}, func(ctx agent.Context, args BroadcastMessageArgs) (string, error) {
 		msg := Message{
-			Sender:  ts.agentID,
-			Channel: args.Channel,
-			Subject: args.Subject,
-			Body:    args.Body,
+			SessionID: ts.sessionID,
+			Sender:    ts.agentID,
+			Channel:   args.Channel,
+			Subject:   args.Subject,
+			Body:      args.Body,
 		}
-		if err := ts.bus.Broadcast(msg); err != nil {
+		n, err := ts.bus.Broadcast(msg)
+		if err != nil {
 			return "", errors.Wrap(err, "broadcasting swarm message")
 		}
-		return fmt.Sprintf("Message broadcasted to channel #%s.", args.Channel), nil
+		channel := args.Channel
+		if channel == "" {
+			channel = "general"
+		}
+		return fmt.Sprintf("Message broadcasted to channel #%s (delivered to %d live agent inbox(es)).", channel, n), nil
 	})
 	if err != nil {
 		return nil, err
@@ -143,7 +188,7 @@ func (ts *Toolset) BuildTools() ([]tool.Tool, error) {
 		if args.TTLSecs > 0 {
 			ttl = time.Duration(args.TTLSecs) * time.Second
 		}
-		ok, err := ts.bus.ClaimResource(ctx, args.Resource, ts.agentID, "", ttl)
+		ok, err := ts.bus.ClaimResource(ctx, args.Resource, ts.agentID, ts.sessionID, ttl)
 		if err != nil {
 			return "", err
 		}

@@ -164,7 +164,11 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 	tools := r.SelectTools(role)
 
 	if r.cfg.SwarmBus != nil {
-		swarmTS := swarm.NewToolset(r.cfg.SwarmBus, subagentID)
+		// Register the subagent on the shared bus for its lifetime so direct
+		// messages and channel broadcasts reach its inbox. Unregistering at the
+		// end of the run marks it offline for peers.
+		swarmTS := swarm.NewToolsetWithSession(r.cfg.SwarmBus, subagentID, subagentID)
+		defer swarmTS.Unregister()
 		if swarmTools, err := swarmTS.BuildTools(); err == nil {
 			tools = append(tools, swarmTools...)
 		}
@@ -187,6 +191,10 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 		},
 		BeforeToolCallbacks: []llmagent.BeforeToolCallback{
 			func(ctx agent.Context, t tool.Tool, toolArgs map[string]any) (map[string]any, error) {
+				// Enforce advisory swarm locks before mutating a shared resource.
+				if lockErr := swarm.CheckToolLock(r.cfg.SwarmBus, subagentID, t.Name(), toolArgs); lockErr != nil {
+					return nil, lockErr
+				}
 				atomic.AddInt32(&toolCallsCount, 1)
 				if r.cfg.EventHandler != nil {
 					argsBytes, _ := json.Marshal(toolArgs)
@@ -203,12 +211,13 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 						cmd = q
 					}
 					r.cfg.EventHandler(Event{
-						Type:      EventSubagentTool,
-						Role:      role,
-						Model:     resolvedModel,
-						ToolName:  t.Name(),
-						Command:   cmd,
-						IsRunning: true,
+						Type:       EventSubagentTool,
+						Role:       role,
+						SubagentID: subagentID,
+						Model:      resolvedModel,
+						ToolName:   t.Name(),
+						Command:    cmd,
+						IsRunning:  true,
 					})
 				}
 				return nil, nil
@@ -245,6 +254,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 					r.cfg.EventHandler(Event{
 						Type:       EventSubagentTool,
 						Role:       role,
+						SubagentID: subagentID,
 						Model:      resolvedModel,
 						ToolName:   t.Name(),
 						ToolOutput: out,

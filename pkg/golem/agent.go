@@ -260,7 +260,7 @@ func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swar
 	}
 
 	if swarmBus != nil {
-		if n := swarmBus.UnreadCount("orchestrator"); n > 0 {
+		if n := swarmBus.UnreadCount(swarm.OrchestratorID); n > 0 {
 			sb.WriteString(fmt.Sprintf("\n\n<swarm_inbox>You have %d unread swarm message(s). Call check_inbox to read them.</swarm_inbox>\n", n))
 		}
 	}
@@ -575,7 +575,9 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	if swarmBus == nil {
 		swarmBus = swarm.NewBus()
 	}
-	orchestratorSwarmTS := swarm.NewToolset(swarmBus, "orchestrator")
+	// Register the orchestrator as a live bus participant so subagents can
+	// address it directly and channel broadcasts reach its inbox.
+	orchestratorSwarmTS := swarm.NewToolsetWithSession(swarmBus, swarm.OrchestratorID, sessionID)
 	if swarmTools, err := orchestratorSwarmTS.BuildTools(); err == nil {
 		allTools = append(allTools, swarmTools...)
 	}
@@ -647,6 +649,11 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 					cmdStr = patArg
 				} else if qArg, ok := args["query"].(string); ok {
 					cmdStr = qArg
+				}
+				// Enforce advisory swarm locks: refuse to mutate a resource another
+				// agent has claimed (until it is released or expires).
+				if lockErr := swarm.CheckToolLock(swarmBus, swarm.OrchestratorID, t.Name(), args); lockErr != nil {
+					return nil, lockErr
 				}
 				if t.Name() != "zoom" && t.Name() != "date" {
 					_, _ = store.AppendEvent(fractal.KindTool, fmt.Sprintf("%s: %s", t.Name(), string(argsBytes)))

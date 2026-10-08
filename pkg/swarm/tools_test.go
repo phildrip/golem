@@ -9,7 +9,8 @@ func TestSwarmToolset(t *testing.T) {
 	bus := NewBus()
 	defer bus.Close()
 
-	ts1 := NewToolset(bus, "agent-coder")
+	ts1 := NewToolsetWithSession(bus, "agent-coder", "sess-1")
+	defer ts1.Unregister()
 	tools1, err := ts1.BuildTools()
 	if err != nil {
 		t.Fatalf("BuildTools failed: %v", err)
@@ -54,4 +55,41 @@ func TestSwarmToolset(t *testing.T) {
 	if listLocksTool.Name() != "list_locks" {
 		t.Fatalf("expected tool 5 to be list_locks, got %s", listLocksTool.Name())
 	}
+}
+
+func TestToolsetRegistrationLifecycle(t *testing.T) {
+	bus := NewBus()
+	defer bus.Close()
+
+	// NewToolset does NOT register; NewToolsetWithSession does.
+	plain := NewToolset(bus, "plain-agent")
+	if bus.IsRegistered("plain-agent") {
+		t.Fatal("NewToolset must not register the agent")
+	}
+	plain.Register()
+	if !bus.IsRegistered("plain-agent") {
+		t.Fatal("Register should mark the agent alive")
+	}
+	plain.Unregister()
+	if bus.IsRegistered("plain-agent") {
+		t.Fatal("Unregister should take the agent offline")
+	}
+
+	sessionTS := NewToolsetWithSession(bus, "agent-x", "sess-42")
+	if !bus.IsRegistered("agent-x") {
+		t.Fatal("NewToolsetWithSession should register the agent")
+	}
+	if sessionTS.AgentID() != "agent-x" {
+		t.Fatalf("unexpected AgentID: %s", sessionTS.AgentID())
+	}
+	agents := bus.LiveAgents()
+	if len(agents) != 1 || agents[0].SessionID != "sess-42" {
+		t.Fatalf("expected session to be recorded, got %+v", agents)
+	}
+	sessionTS.Unregister()
+	if bus.IsRegistered("agent-x") {
+		t.Fatal("Unregister should take the agent offline")
+	}
+	// Double Unregister is safe.
+	sessionTS.Unregister()
 }

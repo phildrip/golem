@@ -18,6 +18,7 @@
 		memory,
 		patches,
 		swarmMessages,
+		swarmLocks,
 		isGenerating,
 		serverConnected,
 		activeProfile,
@@ -25,7 +26,7 @@
 		userConfigPath,
 		workspaceConfigPath
 	} from '$lib/stores';
-	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal, SwarmMessage, ProfilesResponse } from '$lib/types';
+	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal, SwarmMessage, ResourceLock, SwarmLockEvent, ProfilesResponse } from '$lib/types';
 
 	let activeSession = $derived(
 		$sessions.find((s) => s.id === $activeSessionId) || null
@@ -41,6 +42,10 @@
 
 	let currentSwarmMessages = $derived(
 		$activeSessionId && $swarmMessages[$activeSessionId] ? $swarmMessages[$activeSessionId] : []
+	);
+
+	let currentSwarmLocks = $derived(
+		$activeSessionId && $swarmLocks[$activeSessionId] ? $swarmLocks[$activeSessionId] : []
 	);
 
 	let currentMemory = $derived(
@@ -496,6 +501,17 @@
 				break;
 			}
 
+			case 'swarm_lock': {
+				const payload = event.payload as SwarmLockEvent;
+				const current = $swarmLocks[sessId] || [];
+				const next =
+					payload.type === 'released'
+						? current.filter((l) => l.resource !== payload.lock.resource)
+						: [...current.filter((l) => l.resource !== payload.lock.resource), payload.lock];
+				$swarmLocks = { ...$swarmLocks, [sessId]: next };
+				break;
+			}
+
 			case 'profile_changed': {
 				const payload = event.payload as ProfilesResponse;
 				if (payload.active_profile) $activeProfile = payload.active_profile;
@@ -613,6 +629,7 @@
 			<SwarmTree
 				subagents={currentSubagents}
 				swarmMessages={currentSwarmMessages}
+				locks={currentSwarmLocks}
 			/>
 		</aside>
 	</div>

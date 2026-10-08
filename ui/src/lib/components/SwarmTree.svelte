@@ -1,18 +1,19 @@
 <script lang="ts">
-	import { Network, Bot, Cpu, CheckCircle2, AlertCircle, Clock, ChevronRight, MessageSquare, Radio } from '@lucide/svelte';
-	import type { SubagentNode, SwarmMessage } from '$lib/types';
+	import { Network, Bot, Cpu, CheckCircle2, AlertCircle, Clock, ChevronRight, MessageSquare, Radio, Lock } from '@lucide/svelte';
+	import type { SubagentNode, SwarmMessage, ResourceLock } from '$lib/types';
 	import { cn } from '$lib/utils';
 
 	interface Props {
 		subagents: SubagentNode[];
 		swarmMessages?: SwarmMessage[];
+		locks?: ResourceLock[];
 		selectedAgentId?: string | null;
 		onSelectAgent?: (agent: SubagentNode) => void;
 	}
 
-	let { subagents, swarmMessages = [], selectedAgentId = null, onSelectAgent }: Props = $props();
+	let { subagents, swarmMessages = [], locks = [], selectedAgentId = null, onSelectAgent }: Props = $props();
 
-	let activeTab = $state<'tree' | 'chat'>('tree');
+	let activeTab = $state<'tree' | 'chat' | 'locks'>('tree');
 </script>
 
 <div class="flex flex-col h-full bg-[#0a0e17] border-l border-slate-800/80 text-xs text-slate-300 w-80">
@@ -48,6 +49,23 @@
 				{#if swarmMessages.length > 0}
 					<span class="px-1.5 py-0.2 rounded-full text-[9px] bg-blue-500 text-white font-mono font-bold animate-pulse">
 						{swarmMessages.length}
+					</span>
+				{/if}
+			</button>
+
+			<button
+				type="button"
+				class={cn(
+					"flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-colors",
+					activeTab === 'locks' ? "bg-amber-950/50 text-amber-300 font-medium" : "text-slate-400 hover:text-slate-200"
+				)}
+				onclick={() => (activeTab = 'locks')}
+			>
+				<Lock class="w-3.5 h-3.5 text-amber-400" />
+				<span>Locks</span>
+				{#if locks.length > 0}
+					<span class="px-1 py-0.2 rounded text-[9px] bg-amber-500/20 text-amber-300 font-mono">
+						{locks.length}
 					</span>
 				{/if}
 			</button>
@@ -171,6 +189,34 @@
 				<Radio class="w-8 h-8 opacity-20 mb-2" />
 				<p class="text-xs">No chatter in swarm</p>
 				<p class="text-[10px] text-slate-600 mt-1">Direct agent messages and channel broadcasts will stream here.</p>
+			</div>
+		{/if}
+	</div>
+
+	<!-- Resource Locks Tab Content -->
+	<div class={cn("flex-1 overflow-y-auto p-2.5 space-y-2 no-scrollbar", activeTab !== 'locks' && "hidden")}>
+		{#if locks.length > 0}
+			{#each locks as lock (lock.resource)}
+				<div class="p-2.5 rounded-lg border border-slate-800 bg-slate-900/60 space-y-1.5 shadow-sm">
+					<div class="flex items-center gap-2">
+						<Lock class="w-3 h-3 text-amber-400 shrink-0" />
+						<span class="text-xs font-mono text-slate-200 truncate">{lock.resource}</span>
+					</div>
+					<div class="flex items-center justify-between text-[10px] font-mono">
+						<span class="text-purple-400">{lock.owner}</span>
+						{#if lock.expires_at}
+							<span class="text-slate-500">expires {new Date(lock.expires_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+						{:else}
+							<span class="text-slate-500">held</span>
+						{/if}
+					</div>
+				</div>
+			{/each}
+		{:else}
+			<div class="flex flex-col items-center justify-center p-6 text-center text-slate-500">
+				<Lock class="w-8 h-8 opacity-20 mb-2" />
+				<p class="text-xs">No advisory locks held</p>
+				<p class="text-[10px] text-slate-600 mt-1">claim_resource locks appear here so parallel agents avoid clobbering the same file.</p>
 			</div>
 		{/if}
 	</div>

@@ -28,6 +28,19 @@ export interface SwarmMessage {
 	timestamp: string;
 }
 
+export interface ResourceLock {
+	resource: string;
+	owner: string;
+	session_id?: string;
+	acquired_at: string;
+	expires_at?: string;
+}
+
+export interface SwarmLockEvent {
+	type: 'claimed' | 'released';
+	lock: ResourceLock;
+}
+
 export interface WSEvent<T = unknown> {
 	type: WSEventType;
 	session_id?: string;

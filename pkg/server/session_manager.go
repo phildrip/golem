@@ -16,17 +16,18 @@ import (
 
 // Session represents an independent orchestrator agent session.
 type Session struct {
-	ID        string
-	Title     string
-	Agent     *golem.Agent
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID         string
+	Title      string
+	Agent      *golem.Agent
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 	TurnCount  int
 	isBusy     bool
 	turnWg     sync.WaitGroup
 	ctx        context.Context
 	cancel     context.CancelFunc
 	unsubSwarm func()
+	unsubLock  func()
 	mu         sync.Mutex
 }
 
@@ -104,6 +105,9 @@ func (sm *SessionManager) CreateSession(ctx context.Context, title string) (*Ses
 		sess.unsubSwarm = sb.OnMessage(func(msg swarm.Message) {
 			_ = sm.hub.Broadcast(WSEventSwarmMessage, sessID, msg)
 		})
+		sess.unsubLock = sb.OnLockChange(func(ev swarm.LockEvent) {
+			_ = sm.hub.Broadcast(WSEventSwarmLock, sessID, ev)
+		})
 	}
 
 	_ = sm.hub.Broadcast(WSEventSessionCreated, id, SessionInfo{
@@ -180,6 +184,9 @@ func (sm *SessionManager) CreateSessionWithImport(ctx context.Context, title str
 	if sb := agentInstance.SwarmBus(); sb != nil {
 		sess.unsubSwarm = sb.OnMessage(func(msg swarm.Message) {
 			_ = sm.hub.Broadcast(WSEventSwarmMessage, sessID, msg)
+		})
+		sess.unsubLock = sb.OnLockChange(func(ev swarm.LockEvent) {
+			_ = sm.hub.Broadcast(WSEventSwarmLock, sessID, ev)
 		})
 	}
 
@@ -311,6 +318,9 @@ func (sm *SessionManager) DeleteSession(id string) error {
 
 	if sess.unsubSwarm != nil {
 		sess.unsubSwarm()
+	}
+	if sess.unsubLock != nil {
+		sess.unsubLock()
 	}
 	_ = sess.Agent.Close()
 	_ = sm.hub.Broadcast(WSEventSessionDeleted, id, map[string]string{"id": id})
@@ -444,6 +454,9 @@ func (sm *SessionManager) Close() {
 		s.cancel()
 		if s.unsubSwarm != nil {
 			s.unsubSwarm()
+		}
+		if s.unsubLock != nil {
+			s.unsubLock()
 		}
 		_ = s.Agent.Close()
 		delete(sm.sessions, id)
