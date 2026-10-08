@@ -253,7 +253,7 @@ func main() {
 	}
 
 	fmt.Printf("Golem AI Agent (ADK v2 + %s:%s + Fractal Memory)\n", providerLabel, modelLabel)
-	fmt.Printf("Model: %s | Memory: %s\n", cfg.ModelName, cfg.StorageDir)
+	fmt.Printf("Model: %s | Memory: %s | Workspace: %s\n", cfg.ModelName, cfg.StorageDir, workDir)
 	fmt.Println(formatAuthStatus(cfg.Provider, cfg.APIKey))
 
 	if opts.Serve {

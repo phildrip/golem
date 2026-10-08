@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -88,20 +89,21 @@ type memoryStatsMsg struct {
 
 // Model is the Bubbletea TUI application state machine.
 type Model struct {
-	agent           *golem.Agent
-	store           *fractal.Store
-	viewEngine      *fractal.View
-	viewport        viewport.Model
-	textarea        textarea.Model
-	spinner         spinner.Model
-	entries         []ChatEntry
-	width           int
-	height          int
-	ready           bool
-	isLoading       bool
-	streamingReply  string
-	renderer        *glamour.TermRenderer
-	memoryStats     memoryStatsMsg
+	agent              *golem.Agent
+	store              *fractal.Store
+	viewEngine         *fractal.View
+	viewport           viewport.Model
+	textarea           textarea.Model
+	spinner            spinner.Model
+	entries            []ChatEntry
+	startupHeader      string
+	width              int
+	height             int
+	ready              bool
+	isLoading          bool
+	streamingReply     string
+	renderer           *glamour.TermRenderer
+	memoryStats        memoryStatsMsg
 	showTreeModal      bool
 	treeContent        string
 	treeViewport       viewport.Model
@@ -114,14 +116,14 @@ type Model struct {
 	profileViewport    viewport.Model
 	currentProfile     string
 	inputHistory       []string
-	historyIndex    int
-	currentDraft    string
-	statusMessage   string
-	statusMessageAt time.Time
-	cancelTurn      context.CancelFunc
-	streamChan      <-chan tea.Msg
-	isBlurred       bool
-	expandTools     bool
+	historyIndex       int
+	currentDraft       string
+	statusMessage      string
+	statusMessageAt    time.Time
+	cancelTurn         context.CancelFunc
+	streamChan         <-chan tea.Msg
+	isBlurred          bool
+	expandTools        bool
 }
 
 // NewModel constructs a new Bubbletea TUI model for Golem.
@@ -144,15 +146,17 @@ func NewModel(agentInstance *golem.Agent, store *fractal.Store, viewEngine *frac
 		glamour.WithWordWrap(80),
 	)
 
-	var initialHistory []string
+	var allEvents []fractal.Event
 	if store != nil {
-		events := store.EventsSlice(0, store.CountEvents())
-		for _, ev := range events {
-			if ev.Kind == fractal.KindUser && strings.TrimSpace(ev.Text) != "" {
-				trimmed := strings.TrimSpace(ev.Text)
-				if len(initialHistory) == 0 || initialHistory[len(initialHistory)-1] != trimmed {
-					initialHistory = append(initialHistory, trimmed)
-				}
+		allEvents = store.EventsSlice(0, store.CountEvents())
+	}
+
+	var initialHistory []string
+	for _, ev := range allEvents {
+		if ev.Kind == fractal.KindUser && strings.TrimSpace(ev.Text) != "" {
+			trimmed := strings.TrimSpace(ev.Text)
+			if len(initialHistory) == 0 || initialHistory[len(initialHistory)-1] != trimmed {
+				initialHistory = append(initialHistory, trimmed)
 			}
 		}
 	}
@@ -162,6 +166,10 @@ func NewModel(agentInstance *golem.Agent, store *fractal.Store, viewEngine *frac
 		currentProfile = agentInstance.Config().Profile
 	}
 
+	// Restore the recent conversation so opening golem shows where you left off.
+	cwd, _ := os.Getwd()
+	startupHeader, startupEntries := buildStartupEntries(allEvents, cwd, currentProfile, time.Now())
+
 	return Model{
 		agent:          agentInstance,
 		store:          store,
@@ -169,7 +177,8 @@ func NewModel(agentInstance *golem.Agent, store *fractal.Store, viewEngine *frac
 		textarea:       ta,
 		spinner:        sp,
 		renderer:       renderer,
-		entries:        []ChatEntry{},
+		entries:        startupEntries,
+		startupHeader:  startupHeader,
 		currentProfile: currentProfile,
 		inputHistory:   initialHistory,
 		historyIndex:   len(initialHistory),
@@ -896,6 +905,10 @@ func (m Model) View() string {
 // renderConversationToViewport re-renders formatted conversation history into the viewport.
 func (m *Model) renderConversationToViewport() {
 	var sb strings.Builder
+
+	if m.startupHeader != "" {
+		sb.WriteString(HeaderTitleStyle.Render(m.startupHeader) + "\n\n")
+	}
 
 	for i := 0; i < len(m.entries); i++ {
 		entry := m.entries[i]
