@@ -3,8 +3,12 @@ package fractal
 import (
 	"context"
 	"fmt"
+	"iter"
 	"strings"
 	"testing"
+
+	"google.golang.org/adk/v2/model"
+	"google.golang.org/genai"
 )
 
 // stubSummarizer implements Summarizer for testing.
@@ -236,5 +240,103 @@ func TestCompactorFreeNodesAndSummarization(t *testing.T) {
 		t.Errorf("expected parent merge node (1, 0) to be built")
 	} else if !strings.Contains(nodeMerged.Text, "short command") {
 		t.Errorf("unexpected merged text: %s", nodeMerged.Text)
+	}
+}
+
+func TestFreeMergeJoinsWithNewline(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	_, _ = store.AppendEvent(KindUser, "a")
+	_, _ = store.AppendEvent(KindTalk, "b")
+	_ = store.SaveNode(Node{Level: 0, Index: 0, Text: "user: a"})
+	_ = store.SaveNode(Node{Level: 0, Index: 1, Text: "talk: b"})
+
+	c := NewCompactor(store, NewView(store, ViewConfig{LiveHeadCount: 0}), nil, DefaultCompactorConfig())
+	node, err := c.BuildNode(context.Background(), 1, 0)
+	if err != nil {
+		t.Fatalf("BuildNode failed: %v", err)
+	}
+	if !strings.Contains(node.Text, "\n") {
+		t.Errorf("short lines should be joined by a newline, got %q", node.Text)
+	}
+	if strings.Contains(node.Text, "; ") {
+		t.Errorf("merge still uses a semicolon separator: %q", node.Text)
+	}
+}
+
+func TestPumpWatermarkSkipsAlreadyBuilt(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	for i := 0; i < 4; i++ {
+		_, _ = store.AppendEvent(KindUser, fmt.Sprintf("e%d", i))
+	}
+	view := NewView(store, ViewConfig{LiveHeadCount: 0})
+	c := NewCompactor(store, view, &stubSummarizer{}, DefaultCompactorConfig())
+	ctx := context.Background()
+
+	if _, err := c.Pump(ctx); err != nil {
+		t.Fatalf("first Pump failed: %v", err)
+	}
+	// Nothing changed: the watermark makes the second pass a no-op.
+	built, err := c.Pump(ctx)
+	if err != nil {
+		t.Fatalf("second Pump failed: %v", err)
+	}
+	if built != 0 {
+		t.Errorf("second Pump built %d nodes, want 0 (watermark)", built)
+	}
+
+	// New events must still be processed.
+	_, _ = store.AppendEvent(KindUser, "e4")
+	_, _ = store.AppendEvent(KindUser, "e5")
+	if built, err := c.Pump(ctx); err != nil {
+		t.Fatalf("third Pump failed: %v", err)
+	} else if built == 0 {
+		t.Errorf("third Pump built 0 nodes, want the new events compressed")
+	}
+	for i := 0; i < 6; i++ {
+		if _, ok := store.GetNode(0, i); !ok {
+			t.Errorf("level-0 node %d missing after pumps", i)
+		}
+	}
+}
+
+// capturingLLM records the last request for assertions.
+type capturingLLM struct{ req *model.LLMRequest }
+
+func (c *capturingLLM) Name() string { return "capture" }
+func (c *capturingLLM) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
+	return func(yield func(*model.LLMResponse, error) bool) {
+		c.req = req
+		yield(&model.LLMResponse{
+			Content:      &genai.Content{Role: "model", Parts: []*genai.Part{{Text: "summary"}}},
+			TurnComplete: true,
+		}, nil)
+	}
+}
+
+func TestLLMSummarizerSharesSystemPrompt(t *testing.T) {
+	fm := &capturingLLM{}
+	s := NewLLMSummarizer(fm, "STATIC SYSTEM PROMPT")
+	out, err := s.Summarize(context.Background(), "<chat></chat>", "user: hi", false)
+	if err != nil {
+		t.Fatalf("Summarize failed: %v", err)
+	}
+	if out != "summary" {
+		t.Errorf("out = %q, want summary", out)
+	}
+	if fm.req == nil || fm.req.Config == nil || fm.req.Config.SystemInstruction == nil {
+		t.Fatalf("compaction request did not carry a system instruction")
+	}
+	if got := fm.req.Config.SystemInstruction.Parts[0].Text; got != "STATIC SYSTEM PROMPT" {
+		t.Errorf("system instruction = %q, want the shared prompt", got)
 	}
 }

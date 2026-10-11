@@ -595,3 +595,23 @@ func TestProcessStreamDoesNotRestartAfterProgress(t *testing.T) {
 		t.Errorf("expected the shell tool to have executed once")
 	}
 }
+
+func TestClipHeadTail(t *testing.T) {
+	s := strings.Repeat("a", 100) + "MIDDLE" + strings.Repeat("z", 100)
+	got := clipHeadTail(s, 50)
+	if !strings.HasPrefix(got, "aaa") {
+		t.Errorf("head not preserved: %q", got)
+	}
+	if !strings.HasSuffix(got, "zzz") {
+		t.Errorf("tail not preserved: %q", got)
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Errorf("missing truncation marker: %q", got)
+	}
+	if strings.Contains(got, "MIDDLE") {
+		t.Errorf("middle should be elided: %q", got)
+	}
+	if short := clipHeadTail("ok", 50); short != "ok" {
+		t.Errorf("short string changed: %q", short)
+	}
+}

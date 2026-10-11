@@ -200,6 +200,17 @@ const (
 	liveHeadMaxTotalBytes = 8000
 )
 
+// clipHeadTail clips s to limit bytes, keeping the start and the end (thesis
+// section 1: a tool output is clipped to its head and tail, never only its head).
+func clipHeadTail(s string, limit int) string {
+	if len(s) <= limit || limit <= 0 {
+		return s
+	}
+	head := limit * 2 / 3
+	tail := limit - head
+	return s[:head] + "\n... [truncated] ...\n" + s[len(s)-tail:]
+}
+
 // formatLiveHead renders recent raw events (bounded) so the agent keeps the
 // short-term context that the multi-resolution summary view does not carry.
 // It keeps the newest events when the total cap is exceeded. excludeFrom >= 0
@@ -455,7 +466,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		compactorCfg.TargetBytes = cfg.FileConfig.Compactor.TargetBytes
 	}
 
-	summarizer := fractal.NewLLMSummarizer(compactorModelInstance)
+	summarizer := fractal.NewLLMSummarizer(compactorModelInstance, golemSystemPrompt)
 	compactor := fractal.NewCompactor(store, view, summarizer, compactorCfg)
 
 	// 4. Initialize Tools (sandboxed to current working directory)
@@ -697,10 +708,8 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 					} else if ec, ok := result["exit_code"].(int); ok {
 						exitCode = ec
 					}
-					// Cap output to 30,000 characters if huge
-					if len(out) > 30000 {
-						out = out[:30000] + "... [truncated]"
-					}
+					// Clip huge output to its head and tail (thesis section 1).
+					out = clipHeadTail(out, 30000)
 				}
 				if t.Name() != "zoom" && t.Name() != "date" {
 					_, _ = store.AppendEvent(fractal.KindEcho, fmt.Sprintf("%s: %s", t.Name(), out))

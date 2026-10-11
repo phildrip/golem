@@ -14,13 +14,13 @@ import (
 
 // DefaultViewBudgetBytes is the high-water mark for the fractal summary view.
 // Once the view exceeds it, merges run in one batch down to the low-water mark.
-// Kept at the low end of the OptChat 64-128 KB range so ordinary tasks carry a
-// lighter memory preamble; zoom still reaches older detail.
-const DefaultViewBudgetBytes = 64_000
+// The UniiChat thesis fixes the view at 64-128 KB (average 96 KB), batching
+// 128 KB down to 64 KB.
+const DefaultViewBudgetBytes = 128_000
 
 // DefaultViewLowWaterBytes is the low-water mark the view is merged down to once
-// it exceeds the high-water mark (OptChat sawtooth: 64 KB -> 32 KB).
-const DefaultViewLowWaterBytes = 32_000
+// it exceeds the high-water mark (thesis sawtooth: 128 KB -> 64 KB).
+const DefaultViewLowWaterBytes = 64_000
 
 // DefaultLiveHeadCount is the number of recent raw events retained verbatim in the live head.
 const DefaultLiveHeadCount = 10
@@ -248,12 +248,16 @@ func (v *View) pairDue(a ViewPart) float64 {
 // adjacent same-level siblings (even left index) whose parent node is built.
 // On equal due, the oldest (lowest index) pair wins, matching rollback-push.
 func (v *View) bestMergeIndex() int {
+	return v.bestMergeIndexFor(v.parts)
+}
+
+func (v *View) bestMergeIndexFor(parts []ViewPart) int {
 	bestIdx := -1
 	var maxDue float64 = -1.0
 
-	for idx := 0; idx < len(v.parts)-1; idx++ {
-		a := v.parts[idx]
-		b := v.parts[idx+1]
+	for idx := 0; idx < len(parts)-1; idx++ {
+		a := parts[idx]
+		b := parts[idx+1]
 
 		// Adjacent parts must have same level, even index, and consecutive indices.
 		if a.Level != b.Level || a.Index%2 != 0 || b.Index != a.Index+1 {
@@ -304,8 +308,14 @@ func (v *View) fitLocked() {
 }
 
 func (v *View) calculateSizeBytes() int {
+	return v.sizeOf(v.parts)
+}
+
+// sizeOf sums the byte size of a tiling, using a placeholder estimate for
+// unbuilt nodes.
+func (v *View) sizeOf(parts []ViewPart) int {
 	size := 0
-	for _, p := range v.parts {
+	for _, p := range parts {
 		if node, ok := v.store.GetNode(p.Level, p.Index); ok {
 			size += node.Size
 		} else {
@@ -319,14 +329,43 @@ func (v *View) calculateSizeBytes() int {
 func (v *View) Render() string {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
+	return v.renderParts(v.parts)
+}
 
-	if len(v.parts) == 0 {
+// RenderCompacted renders the view coarsened further to fit targetBytes, using
+// the same merge order but only pairs whose parent is already built. It is used
+// as compaction context, which needs less detail than a turn (thesis section 4:
+// the compaction view is 16-32 KB, merged with the same sawtooth).
+func (v *View) RenderCompacted(targetBytes int) string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	if targetBytes <= 0 || len(v.parts) < 2 || v.sizeOf(v.parts) <= targetBytes {
+		return v.renderParts(v.parts)
+	}
+
+	parts := append([]ViewPart(nil), v.parts...)
+	for v.sizeOf(parts) > targetBytes {
+		idx := v.bestMergeIndexFor(parts)
+		if idx == -1 {
+			break
+		}
+		a := parts[idx]
+		parent := ViewPart{Level: a.Level + 1, Index: a.Index / 2}
+		parts = append(parts[:idx], append([]ViewPart{parent}, parts[idx+2:]...)...)
+	}
+	return v.renderParts(parts)
+}
+
+// renderParts formats a tiling as the <chat>...</chat> view. Callers hold v.mu.
+func (v *View) renderParts(parts []ViewPart) string {
+	if len(parts) == 0 {
 		return ""
 	}
 
 	var sb strings.Builder
 	sb.WriteString("<chat>\n")
-	for _, p := range v.parts {
+	for _, p := range parts {
 		addr := p.Address()
 		if node, ok := v.store.GetNode(p.Level, p.Index); ok {
 			cleanText := strings.ReplaceAll(node.Text, "\n", " ")

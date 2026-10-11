@@ -407,10 +407,43 @@ func TestZoomAndDateTools(t *testing.T) {
 }
 
 func TestDefaultViewBudgets(t *testing.T) {
-	if DefaultViewBudgetBytes != 64_000 {
-		t.Errorf("DefaultViewBudgetBytes = %d, want 64000", DefaultViewBudgetBytes)
+	if DefaultViewBudgetBytes != 128_000 {
+		t.Errorf("DefaultViewBudgetBytes = %d, want 128000", DefaultViewBudgetBytes)
 	}
-	if DefaultViewLowWaterBytes != 32_000 {
-		t.Errorf("DefaultViewLowWaterBytes = %d, want 32000", DefaultViewLowWaterBytes)
+	if DefaultViewLowWaterBytes != 64_000 {
+		t.Errorf("DefaultViewLowWaterBytes = %d, want 64000", DefaultViewLowWaterBytes)
+	}
+}
+
+func TestRenderCompactedCoarsens(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	for i := 0; i < 32; i++ {
+		if _, err := store.AppendEvent(KindUser, fmt.Sprintf("event %d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for lvl := 0; lvl <= 5; lvl++ {
+		for idx := 0; idx < 32>>lvl; idx++ {
+			_ = store.SaveNode(Node{Level: lvl, Index: idx, Text: strings.Repeat("s", 40)})
+		}
+	}
+
+	view := NewView(store, ViewConfig{ViewBudgetBytes: 1 << 20, LiveHeadCount: 0})
+	full := view.Render()
+	if view.calculateSizeBytes() <= 200 {
+		t.Fatalf("setup expected a large uncompacted view, size=%d", view.calculateSizeBytes())
+	}
+
+	comp := view.RenderCompacted(200)
+	if len(comp) >= len(full) {
+		t.Errorf("compacted view not smaller: %d bytes vs %d", len(comp), len(full))
+	}
+	if !strings.Contains(comp, "<chat>") || !strings.Contains(comp, "</chat>") {
+		t.Errorf("compacted view missing chat tags: %q", comp)
 	}
 }

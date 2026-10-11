@@ -78,24 +78,38 @@ func cleanSummary(raw string) string {
 
 // GeminiSummarizer compresses memory nodes using Google GenAI (Gemini 3.8 Flash).
 type GeminiSummarizer struct {
-	client *genai.Client
-	model  string
+	client       *genai.Client
+	model        string
+	systemPrompt string
 }
 
-// NewGeminiSummarizer creates a new summarizer using Gemini 3.8 Flash.
-func NewGeminiSummarizer(client *genai.Client, model string) *GeminiSummarizer {
+// NewGeminiSummarizer creates a new summarizer using Gemini 3.8 Flash. The
+// system prompt is the same one turns use, so the request shares their cacheable
+// prefix (thesis section 4: a compaction is a call like a turn).
+func NewGeminiSummarizer(client *genai.Client, model, systemPrompt string) *GeminiSummarizer {
 	if model == "" {
 		model = DefaultCompactorModel
 	}
 	return &GeminiSummarizer{
-		client: client,
-		model:  model,
+		client:       client,
+		model:        model,
+		systemPrompt: systemPrompt,
+	}
+}
+
+// config returns the request config carrying the shared system prompt.
+func (g *GeminiSummarizer) config() *genai.GenerateContentConfig {
+	if g.systemPrompt == "" {
+		return nil
+	}
+	return &genai.GenerateContentConfig{
+		SystemInstruction: genai.NewContentFromText(g.systemPrompt, "system"),
 	}
 }
 
 // Summarize sends a single compression step to the model with cached context prefix.
 func (g *GeminiSummarizer) Summarize(ctx context.Context, contextView string, content string, isMerge bool) (string, error) {
-	resp, err := g.client.Models.GenerateContent(ctx, g.model, genai.Text(buildCompactorPrompt(contextView, content, isMerge)), nil)
+	resp, err := g.client.Models.GenerateContent(ctx, g.model, genai.Text(buildCompactorPrompt(contextView, content, isMerge)), g.config())
 	if err != nil {
 		return "", errors.Wrap(err, "generating summary content")
 	}
@@ -111,7 +125,7 @@ func (g *GeminiSummarizer) Correct(ctx context.Context, contextView, content str
 		&genai.Content{Role: "user", Parts: []*genai.Part{{Text: correction}}},
 	)
 
-	resp, err := g.client.Models.GenerateContent(ctx, g.model, contents, nil)
+	resp, err := g.client.Models.GenerateContent(ctx, g.model, contents, g.config())
 	if err != nil {
 		return "", errors.Wrap(err, "generating corrected summary")
 	}
@@ -120,12 +134,14 @@ func (g *GeminiSummarizer) Correct(ctx context.Context, contextView, content str
 
 // LLMSummarizer compresses memory nodes using any ADK model.LLM (Gemini or OpenAI-compatible).
 type LLMSummarizer struct {
-	model model.LLM
+	model        model.LLM
+	systemPrompt string
 }
 
-// NewLLMSummarizer creates a summarizer using any ADK model.LLM.
-func NewLLMSummarizer(m model.LLM) *LLMSummarizer {
-	return &LLMSummarizer{model: m}
+// NewLLMSummarizer creates a summarizer using any ADK model.LLM. systemPrompt is
+// the same static prompt turns use, so compaction requests share the turn prefix.
+func NewLLMSummarizer(m model.LLM, systemPrompt string) *LLMSummarizer {
+	return &LLMSummarizer{model: m, systemPrompt: systemPrompt}
 }
 
 // Summarize sends a single compression step to the model with cached context prefix.
@@ -150,6 +166,11 @@ func (s *LLMSummarizer) Correct(ctx context.Context, contextView, content string
 
 func (s *LLMSummarizer) generate(ctx context.Context, contents []*genai.Content) (string, error) {
 	req := &model.LLMRequest{Contents: contents}
+	if s.systemPrompt != "" {
+		req.Config = &genai.GenerateContentConfig{
+			SystemInstruction: genai.NewContentFromText(s.systemPrompt, "system"),
+		}
+	}
 
 	var textBuilder strings.Builder
 	for resp, err := range s.model.GenerateContent(ctx, req, false) {
@@ -222,17 +243,25 @@ func SummarizeBounded(ctx context.Context, s Summarizer, contextView, content st
 	return best, nil
 }
 
+// CompactionViewBytes is the default target for the compaction context view
+// (thesis section 4: 16-32 KB, 24 KB on average).
+const CompactionViewBytes = 24_000
+
 // CompactorConfig configures the tree compactor.
 type CompactorConfig struct {
 	TargetBytes int
 	Concurrency int
+	// CompactionViewBytes is the target size of the context view passed to a
+	// compaction, smaller than a turn's view.
+	CompactionViewBytes int
 }
 
 // DefaultCompactorConfig provides standard compactor configuration.
 func DefaultCompactorConfig() CompactorConfig {
 	return CompactorConfig{
-		TargetBytes: DefaultNodeTargetBytes,
-		Concurrency: 2,
+		TargetBytes:         DefaultNodeTargetBytes,
+		Concurrency:         2,
+		CompactionViewBytes: CompactionViewBytes,
 	}
 }
 
@@ -243,6 +272,10 @@ type Compactor struct {
 	summarizer Summarizer
 	cfg        CompactorConfig
 	mu         sync.Mutex
+	// levelBuilt[L] is the number of leading indices at level L already resolved
+	// (built or found). It lets Pump consider only newly appended nodes instead
+	// of scanning the whole tree each pass (thesis section 4: never scan).
+	levelBuilt []int
 }
 
 // NewCompactor creates a new Compactor instance.
@@ -252,6 +285,9 @@ func NewCompactor(store *Store, view *View, summarizer Summarizer, cfg Compactor
 	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 4
+	}
+	if cfg.CompactionViewBytes <= 0 {
+		cfg.CompactionViewBytes = CompactionViewBytes
 	}
 
 	return &Compactor{
@@ -294,7 +330,7 @@ func (c *Compactor) BuildNode(ctx context.Context, level, index int) (Node, erro
 			return Node{}, errors.New("cannot summarize oversized event: no summarizer configured")
 		}
 
-		contextView := c.view.Render()
+		contextView := c.view.RenderCompacted(c.cfg.CompactionViewBytes)
 		summary, err := SummarizeBounded(ctx, c.summarizer, contextView, formatted, false)
 		if err != nil {
 			return Node{}, errors.Wrapf(err, "summarizing level 0 node %d", index)
@@ -335,7 +371,7 @@ func (c *Compactor) BuildNode(ctx context.Context, level, index int) (Node, erro
 		}
 	}
 
-	mergedText := fmt.Sprintf("%s; %s", childA.Text, childB.Text)
+	mergedText := fmt.Sprintf("%s\n%s", childA.Text, childB.Text)
 	// Free merge node if combined length fits in TargetBytes
 	if len([]byte(mergedText)) <= c.cfg.TargetBytes {
 		node := Node{
@@ -356,7 +392,7 @@ func (c *Compactor) BuildNode(ctx context.Context, level, index int) (Node, erro
 	}
 
 	contentToMerge := fmt.Sprintf("Child 1: %s\nChild 2: %s", childA.Text, childB.Text)
-	contextView := c.view.Render()
+	contextView := c.view.RenderCompacted(c.cfg.CompactionViewBytes)
 	summary, err := SummarizeBounded(ctx, c.summarizer, contextView, contentToMerge, true)
 	if err != nil {
 		return Node{}, errors.Wrapf(err, "merging node (%d, %d)", level, index)
@@ -388,17 +424,20 @@ func (c *Compactor) Pump(ctx context.Context) (int, error) {
 
 	builtCount := 0
 
-	// 1. Build level 0 nodes for uncompressed tail events
-	for i := 0; i < tailEnd; i++ {
+	// 1. Build level-0 nodes for new tail events (from the last watermark).
+	for i := c.watermark(0); i < tailEnd; i++ {
 		if _, ok := c.store.GetNode(0, i); !ok {
 			if _, err := c.BuildNode(ctx, 0, i); err != nil {
 				return builtCount, errors.Wrapf(err, "building level 0 node %d", i)
 			}
 			builtCount++
 		}
+		c.setWatermark(0, i+1)
 	}
 
-	// 2. Build higher-level merge nodes where both children exist
+	// 2. Build higher-level merge nodes, considering only new indices. A level's
+	// watermark advances only over consecutive resolved nodes, so a node waiting
+	// on unbuilt children is retried on a later pass rather than skipped.
 	for level := 1; ; level++ {
 		step := 1 << level
 		if step > tailEnd {
@@ -406,21 +445,29 @@ func (c *Compactor) Pump(ctx context.Context) (int, error) {
 		}
 
 		maxIndex := tailEnd / step
-		for idx := 0; idx < maxIndex; idx++ {
-			if _, ok := c.store.GetNode(level, idx); !ok {
-				// Verify both children exist
-				childAIdx := 2 * idx
-				childBIdx := childAIdx + 1
-				_, okA := c.store.GetNode(level-1, childAIdx)
-				_, okB := c.store.GetNode(level-1, childBIdx)
+		if start := c.watermark(level); start > maxIndex {
+			c.setWatermark(level, maxIndex)
+		}
 
-				if okA && okB {
-					if _, err := c.BuildNode(ctx, level, idx); err != nil {
-						return builtCount, errors.Wrapf(err, "merging node (%d, %d)", level, idx)
-					}
-					builtCount++
-				}
+		idx := c.watermark(level)
+		for ; idx < maxIndex; idx++ {
+			if _, ok := c.store.GetNode(level, idx); ok {
+				c.setWatermark(level, idx+1)
+				continue
 			}
+			_, okA := c.store.GetNode(level-1, 2*idx)
+			_, okB := c.store.GetNode(level-1, 2*idx+1)
+			if !okA || !okB {
+				break // children not ready; leave the watermark here
+			}
+			if _, err := c.BuildNode(ctx, level, idx); err != nil {
+				return builtCount, errors.Wrapf(err, "merging node (%d, %d)", level, idx)
+			}
+			builtCount++
+			c.setWatermark(level, idx+1)
+		}
+		if idx >= maxIndex {
+			c.setWatermark(level, maxIndex)
 		}
 	}
 
@@ -429,6 +476,22 @@ func (c *Compactor) Pump(ctx context.Context) (int, error) {
 	}
 
 	return builtCount, nil
+}
+
+// watermark returns the resolved-index watermark for a level (0 if unset).
+func (c *Compactor) watermark(level int) int {
+	if level < len(c.levelBuilt) {
+		return c.levelBuilt[level]
+	}
+	return 0
+}
+
+// setWatermark records the resolved-index watermark for a level.
+func (c *Compactor) setWatermark(level, v int) {
+	for len(c.levelBuilt) <= level {
+		c.levelBuilt = append(c.levelBuilt, 0)
+	}
+	c.levelBuilt[level] = v
 }
 
 // StartBackground starts a background goroutine that periodically pumps the compactor.
