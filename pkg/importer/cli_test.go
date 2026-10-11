@@ -17,6 +17,11 @@ func TestHandleImportOption(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
+	// Isolate discovery from the host: HOME/XDG_DATA_HOME point at tempDir so the
+	// Cursor and OpenCode sources find nothing, leaving only the AGY fixture.
+	t.Setenv("HOME", tempDir)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tempDir, "xdg"))
+
 	storeDir := filepath.Join(tempDir, "store")
 	store, err := fractal.OpenStore(storeDir)
 	if err != nil {

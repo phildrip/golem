@@ -83,7 +83,7 @@ func HandleImportOption(importArg string, store *fractal.Store, workspaceDir str
 
 func promptUserSessionPicker(sessions []DiscoveredSession, in io.Reader, out io.Writer) (*DiscoveredSession, error) {
 	if len(sessions) == 0 {
-		return nil, errors.New("no importable histories found in local environment (checked Antigravity & Cursor)")
+		return nil, errors.New("no importable histories found in local environment (checked Antigravity, Cursor & OpenCode)")
 	}
 
 	fmt.Fprintln(out)

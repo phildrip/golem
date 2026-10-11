@@ -35,6 +35,11 @@ func ImportFileOrDir(path string, targetStore *fractal.Store, sessionID ...strin
 		if err != nil {
 			return 0, errors.Wrap(err, "parsing Cursor history")
 		}
+	case FormatOpenCode:
+		events, err = ParseOpenCode(path, targetID)
+		if err != nil {
+			return 0, errors.Wrap(err, "parsing OpenCode history")
+		}
 	default:
 		return 0, errors.Errorf("unsupported or unknown format for %q", path)
 	}

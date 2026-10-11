@@ -10,9 +10,10 @@ import (
 type FormatType string
 
 const (
-	FormatUnknown FormatType = "unknown"
-	FormatAGY     FormatType = "agy"    // Antigravity JSONL transcripts
-	FormatCursor  FormatType = "cursor" // Cursor SQLite state.vscdb / composerData
+	FormatUnknown  FormatType = "unknown"
+	FormatAGY      FormatType = "agy"      // Antigravity JSONL transcripts
+	FormatCursor   FormatType = "cursor"   // Cursor SQLite state.vscdb / composerData
+	FormatOpenCode FormatType = "opencode" // OpenCode SQLite opencode.db
 )
 
 // DiscoveredSession represents an importable conversation found in the environment.

@@ -41,7 +41,12 @@ func deduceDirFormat(dir string) (FormatType, error) {
 		return FormatCursor, nil
 	}
 
-	return FormatUnknown, errors.Errorf("unable to deduce format for directory %q: neither AGY nor Cursor markers found", dir)
+	// 3. OpenCode data directory (contains opencode.db)
+	if fileExists(filepath.Join(dir, "opencode.db")) {
+		return FormatOpenCode, nil
+	}
+
+	return FormatUnknown, errors.Errorf("unable to deduce format for directory %q: no AGY, Cursor, or OpenCode markers found", dir)
 }
 
 func deduceFileFormat(filePath string) (FormatType, error) {
@@ -51,6 +56,9 @@ func deduceFileFormat(filePath string) (FormatType, error) {
 	// Fast path for known names/extensions
 	if ext == ".vscdb" {
 		return FormatCursor, nil
+	}
+	if base == "opencode.db" {
+		return FormatOpenCode, nil
 	}
 	if base == "transcript.jsonl" || base == "transcript_full.jsonl" {
 		return FormatAGY, nil
@@ -69,14 +77,18 @@ func deduceFileFormat(filePath string) (FormatType, error) {
 
 	// Check for SQLite database magic header
 	if len(header) >= 16 && bytes.HasPrefix(header, []byte("SQLite format 3\x00")) {
-		// Verify this is a Cursor database by inspecting table catalog
 		db, err := sql.Open("sqlite", filePath)
 		if err == nil {
-			var tableCount int
-			_ = db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('ItemTable', 'cursorDiskKV')").Scan(&tableCount)
-			db.Close()
-			if tableCount > 0 {
+			defer db.Close()
+			var cursorTables int
+			_ = db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('ItemTable', 'cursorDiskKV')").Scan(&cursorTables)
+			if cursorTables > 0 {
 				return FormatCursor, nil
+			}
+			var openCodeTables int
+			_ = db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('session', 'message', 'part')").Scan(&openCodeTables)
+			if openCodeTables == 3 {
+				return FormatOpenCode, nil
 			}
 		}
 	}

@@ -26,7 +26,7 @@ func DefaultAGYBrainDir() string {
 	return filepath.Join(home, ".gemini", "antigravity-cli", "brain")
 }
 
-// DiscoverHistories scans local environments (Antigravity and Cursor) for past sessions.
+// DiscoverHistories scans local environments (Antigravity, Cursor, and OpenCode) for past sessions.
 // Results are sorted with current workspace matches first, ordered by most recent update time.
 func DiscoverHistories(currentWorkspace string) ([]DiscoveredSession, error) {
 	var sessions []DiscoveredSession
@@ -47,7 +47,13 @@ func DiscoverHistories(currentWorkspace string) ([]DiscoveredSession, error) {
 		sessions = append(sessions, cursorSessions...)
 	}
 
-	// 3. Sort: matches workspace first, then UpdatedAt descending
+	// 3. Discover OpenCode sessions
+	openCodeSessions, err := discoverOpenCodeSessions(cleanWorkspace)
+	if err == nil {
+		sessions = append(sessions, openCodeSessions...)
+	}
+
+	// 4. Sort: matches workspace first, then UpdatedAt descending
 	sort.Slice(sessions, func(i, j int) bool {
 		if sessions[i].MatchesWorkspace != sessions[j].MatchesWorkspace {
 			return sessions[i].MatchesWorkspace
