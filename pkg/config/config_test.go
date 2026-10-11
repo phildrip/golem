@@ -321,4 +321,28 @@ func TestCompactorConfig(t *testing.T) {
 	}
 }
 
+func TestResolveWebConfig(t *testing.T) {
+	got := ResolveWebConfig(nil)
+	if got.Provider != "google_cse" || got.MaxFetch != 5<<20 {
+		t.Errorf("defaults = %+v, want google_cse / 5MiB", got)
+	}
 
+	t.Setenv("GOOGLE_CSE_API_KEY", "envkey")
+	t.Setenv("GOOGLE_CSE_CX", "envcx")
+	got = ResolveWebConfig(&WebConfig{})
+	if got.APIKey != "envkey" || got.CX != "envcx" {
+		t.Errorf("env fallback: key=%q cx=%q, want envkey/envcx", got.APIKey, got.CX)
+	}
+
+	got = ResolveWebConfig(&WebConfig{APIKey: "direct", CX: "directcx", Provider: "custom"})
+	if got.APIKey != "direct" || got.CX != "directcx" || got.Provider != "custom" {
+		t.Errorf("explicit values overridden: %+v", got)
+	}
+
+	t.Setenv("MY_CSE_KEY", "mykey")
+	t.Setenv("MY_CSE_CX", "mycx")
+	got = ResolveWebConfig(&WebConfig{APIKeyEnv: "MY_CSE_KEY", CXEnv: "MY_CSE_CX"})
+	if got.APIKey != "mykey" || got.CX != "mycx" {
+		t.Errorf("named env not honored: %+v", got)
+	}
+}

@@ -44,6 +44,21 @@ type CompactorConfig struct {
 	TargetBytes int    `json:"target_bytes,omitempty"`
 }
 
+// WebConfig configures the web_search / web_fetch tools. Only web_search needs
+// credentials; web_fetch is unrestricted apart from the SSRF guard.
+type WebConfig struct {
+	// Provider selects the search backend (default "google_cse").
+	Provider string `json:"provider,omitempty"`
+	// APIKey and APIKeyEnv supply the search API key (env wins when APIKey empty).
+	APIKey    string `json:"api_key,omitempty"`
+	APIKeyEnv string `json:"api_key_env,omitempty"`
+	// CX is the Google Programmable Search Engine id.
+	CX       string `json:"cx,omitempty"`
+	CXEnv    string `json:"cx_env,omitempty"`
+	BaseURL  string `json:"base_url,omitempty"`
+	MaxFetch int    `json:"max_fetch_bytes,omitempty"`
+}
+
 // ProfileConfig encapsulates provider settings, model preferences, and memory directories
 // for a named profile (e.g. "work", "personal").
 type ProfileConfig struct {
@@ -55,6 +70,7 @@ type ProfileConfig struct {
 	MemoryDir       string                `json:"memory_dir,omitempty"`
 	MountedMemories []MountedMemoryConfig `json:"mounted_memories,omitempty"`
 	Compactor       *CompactorConfig      `json:"compactor,omitempty"`
+	Web             *WebConfig            `json:"web,omitempty"`
 }
 
 // ProviderConfig stores credentials and endpoint for an individual model provider.
@@ -76,6 +92,7 @@ type FileConfig struct {
 	MountedMemories []MountedMemoryConfig     `json:"mounted_memories,omitempty"`
 	Providers       map[string]ProviderConfig `json:"providers,omitempty"`
 	Compactor       *CompactorConfig          `json:"compactor,omitempty"`
+	Web             *WebConfig                `json:"web,omitempty"`
 }
 
 // UserDir returns Golem's user configuration directory.
@@ -588,6 +605,11 @@ func ResolveActiveProfile(flagProfile string, fileCfg FileConfig) (string, Profi
 		prof.Compactor = fileCfg.Compactor
 	}
 
+	// Inherit web config from top-level if profile doesn't specify one
+	if prof.Web == nil && fileCfg.Web != nil {
+		prof.Web = fileCfg.Web
+	}
+
 	return name, prof
 }
 
@@ -616,7 +638,36 @@ func (c FileConfig) ApplyProfile(profileName string, prof ProfileConfig) FileCon
 	if prof.Compactor != nil {
 		updated.Compactor = prof.Compactor
 	}
+	if prof.Web != nil {
+		updated.Web = prof.Web
+	}
 	return updated
 }
 
-
+// ResolveWebConfig returns the effective web config, applying provider defaults
+// and environment fallbacks for the API key and CSE id.
+func ResolveWebConfig(web *WebConfig) WebConfig {
+	var out WebConfig
+	if web != nil {
+		out = *web
+	}
+	if out.Provider == "" {
+		out.Provider = "google_cse"
+	}
+	if out.APIKey == "" && out.APIKeyEnv != "" {
+		out.APIKey = os.Getenv(out.APIKeyEnv)
+	}
+	if out.APIKey == "" {
+		out.APIKey = os.Getenv("GOOGLE_CSE_API_KEY")
+	}
+	if out.CX == "" && out.CXEnv != "" {
+		out.CX = os.Getenv(out.CXEnv)
+	}
+	if out.CX == "" {
+		out.CX = os.Getenv("GOOGLE_CSE_CX")
+	}
+	if out.MaxFetch <= 0 {
+		out.MaxFetch = 5 << 20 // 5 MiB
+	}
+	return out
+}
