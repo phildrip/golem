@@ -25,16 +25,17 @@ import (
 
 // CLIOptions holds parsed command-line flags.
 type CLIOptions struct {
-	Profile    string
-	Provider   string
-	BaseURL    string
-	Model      string
-	MemoryDir  string
-	APIKey     string
-	ConfigPath string
-	NoTUI      bool
-	TUI        bool
-	Serve      bool
+	Profile           string
+	Provider          string
+	BaseURL           string
+	Model             string
+	MemoryDir         string
+	APIKey            string
+	ConfigPath        string
+	NoTUI             bool
+	TUI               bool
+	NoMouse           bool
+	Serve             bool
 	WebPort           int
 	Import            string
 	CompactorModel    string
@@ -58,6 +59,7 @@ func parseFlags(args []string) (CLIOptions, error) {
 	configPathFlag := fs.String("config", "", "Path to config file")
 	noTuiFlag := fs.Bool("no-tui", false, "Disable rich TUI and fall back to standard readline CLI")
 	tuiFlag := fs.Bool("tui", false, "Force enable rich TUI even if terminal detection is ambiguous")
+	noMouseFlag := fs.Bool("no-mouse", false, "Disable mouse capture in the TUI (restores native terminal/tmux text selection)")
 	serveFlag := fs.Bool("serve", false, "Launch realtime Web UI multiplexer server")
 	webFlag := fs.Bool("web", false, "Launch realtime Web UI multiplexer server (alias for -serve)")
 	portFlag := fs.Int("port", 8080, "Port for realtime Web UI server (default: 8080)")
@@ -79,6 +81,7 @@ func parseFlags(args []string) (CLIOptions, error) {
 		ConfigPath:        *configPathFlag,
 		NoTUI:             *noTuiFlag,
 		TUI:               *tuiFlag,
+		NoMouse:           *noMouseFlag,
 		Serve:             *serveFlag || *webFlag,
 		WebPort:           *portFlag,
 		Import:            *importFlag,
@@ -314,10 +317,18 @@ func main() {
 	}
 
 	if useTUI {
-		p := tea.NewProgram(
-			tui.NewModel(agentInstance, agentInstance.Store(), agentInstance.View()),
+		programOpts := []tea.ProgramOption{
 			tea.WithAltScreen(),
 			tea.WithReportFocus(),
+		}
+		// Enable in-app mouse wheel scrolling unless the user opts out (tmux
+		// users sometimes prefer native pane copy/selection over mouse capture).
+		if !opts.NoMouse {
+			programOpts = append(programOpts, tea.WithMouseCellMotion())
+		}
+		p := tea.NewProgram(
+			tui.NewModel(agentInstance, agentInstance.Store(), agentInstance.View()),
+			programOpts...,
 		)
 		if _, err := p.Run(); err != nil {
 			log.Fatalf("Error running Golem TUI: %v", err)
@@ -364,4 +375,3 @@ func formatAuthStatus(provider, apiKey string) string {
 		return fmt.Sprintf("Auth: %s (no API key configured)", cleanProvider)
 	}
 }
-

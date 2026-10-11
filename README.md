@@ -192,6 +192,7 @@ Example `~/.golem/config.json`:
 | `-import pick\|latest\|<id>` | Import past session history |
 | `-no-tui` / `-tui` | Force plain CLI / force TUI |
 | `-serve` / `-web` / `-port <n>` | Web UI cockpit (default port 8080) |
+| `-no-mouse` | Disable in-TUI mouse capture (restores native terminal/tmux text selection) |
 
 ## Architecture
 

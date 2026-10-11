@@ -703,8 +703,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentChunkMsg:
 		m.streamingReply += string(msg)
-		m.renderConversationToViewport()
-		m.viewport.GotoBottom()
+		m.renderAndFollow()
 
 	case toolStartMsg:
 		m.entries = append(m.entries, ChatEntry{
@@ -713,8 +712,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Command:   msg.command,
 			IsRunning: true,
 		})
-		m.renderConversationToViewport()
-		m.viewport.GotoBottom()
+		m.renderAndFollow()
 
 	case toolDoneMsg:
 		// Update latest tool entry
@@ -726,8 +724,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		m.renderConversationToViewport()
-		m.viewport.GotoBottom()
+		m.renderAndFollow()
 
 	case subagentStartMsg:
 		m.entries = append(m.entries, ChatEntry{
@@ -737,8 +734,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			SubagentPrompt: msg.prompt,
 			IsRunning:      true,
 		})
-		m.renderConversationToViewport()
-		m.viewport.GotoBottom()
+		m.renderAndFollow()
 
 	case subagentDoneMsg:
 		for i := len(m.entries) - 1; i >= 0; i-- {
@@ -754,8 +750,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		m.renderConversationToViewport()
-		m.viewport.GotoBottom()
+		m.renderAndFollow()
 
 	case agentDoneMsg:
 		if !m.isLoading {
@@ -779,8 +774,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Content: reply,
 		})
 		m.streamingReply = ""
-		m.renderConversationToViewport()
-		m.viewport.GotoBottom()
+		m.renderAndFollow()
 
 		return m, m.updateMemoryStatsCmd()
 
@@ -907,7 +901,7 @@ func (m *Model) renderConversationToViewport() {
 	var sb strings.Builder
 
 	if m.startupHeader != "" {
-		sb.WriteString(HeaderTitleStyle.Render(clampLines(m.startupHeader, m.viewport.Width-4)) + "\n\n")
+		sb.WriteString(StartupHeaderStyle.Render(clampLines(m.startupHeader, m.viewport.Width-4)) + "\n\n")
 	}
 
 	for i := 0; i < len(m.entries); i++ {
@@ -964,6 +958,17 @@ func (m *Model) renderConversationToViewport() {
 	}
 
 	m.viewport.SetContent(sb.String())
+}
+
+// renderAndFollow re-renders the conversation and, if the viewport is already at
+// the bottom, keeps it pinned to the newest output. When the user has scrolled up
+// to read history, new chunks no longer yank them back down.
+func (m *Model) renderAndFollow() {
+	atBottom := m.viewport.AtBottom()
+	m.renderConversationToViewport()
+	if atBottom {
+		m.viewport.GotoBottom()
+	}
 }
 
 // tuiStreamBridge adapts golem.StreamHandler into a channel of Bubbletea messages.
@@ -1279,11 +1284,7 @@ func (m Model) renderMCPModalView() string {
 func (m Model) generateShortcutsVisual() string {
 	var sb strings.Builder
 
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(ColorHighlight).
-		Background(ColorSecondary).
-		Padding(0, 1)
+	titleStyle := ModalTitleStyle
 
 	headerSection := lipgloss.NewStyle().
 		Bold(true).
@@ -1332,6 +1333,7 @@ func (m Model) generateShortcutsVisual() string {
 				{"Ctrl+↓ / Shift+↓", "Scroll down", "Scrolls conversation viewport down by 2 lines"},
 				{"PgUp / Ctrl+U", "Half page up", "Scrolls conversation viewport up by half a page (when blurred)"},
 				{"PgDn / Ctrl+D", "Half page down", "Scrolls conversation viewport down by half a page (when blurred)"},
+				{"Mouse wheel", "Scroll", "Scrolls the conversation (disable capture with --no-mouse)"},
 			},
 		},
 		{
@@ -1371,7 +1373,7 @@ func (m Model) generateShortcutsVisual() string {
 	}
 
 	for _, sec := range sections {
-		sb.WriteString(headerSection.Render("■ "+sec.title) + "\n")
+		sb.WriteString(headerSection.Render("▍ "+sec.title) + "\n")
 		for _, item := range sec.items {
 			line := fmt.Sprintf("  %-18s  %-24s", keyStyle.Render(item.keys), descStyle.Render(item.desc))
 			if item.note != "" {
@@ -1389,11 +1391,7 @@ func (m Model) generateShortcutsVisual() string {
 func (m *Model) generateMCPVisual() string {
 	var sb strings.Builder
 
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(ColorHighlight).
-		Background(ColorPrimary).
-		Padding(0, 1)
+	titleStyle := ModalTitleStyle
 
 	headerSection := lipgloss.NewStyle().
 		Bold(true).
@@ -1403,7 +1401,7 @@ func (m *Model) generateMCPVisual() string {
 	sb.WriteString(titleStyle.Render("MODEL CONTEXT PROTOCOL (MCP) SERVERS") + "\n\n")
 
 	// 1. Discovered configuration files
-	sb.WriteString(headerSection.Render("■ Discovered Configurations") + "\n")
+	sb.WriteString(headerSection.Render("▍ Discovered Configurations") + "\n")
 	var configPaths []string
 	if m.agent != nil {
 		configPaths = m.agent.MCPConfigPaths()
@@ -1421,7 +1419,7 @@ func (m *Model) generateMCPVisual() string {
 	sb.WriteString("\n")
 
 	// 2. Registered servers & tools
-	sb.WriteString(headerSection.Render("■ Registered Servers & Tools") + "\n")
+	sb.WriteString(headerSection.Render("▍ Registered Servers & Tools") + "\n")
 	if m.agent == nil || m.agent.MCPManager() == nil {
 		sb.WriteString("  " + lipgloss.NewStyle().Foreground(ColorMuted).Render("(MCP manager not initialized)") + "\n")
 	} else {
@@ -1489,11 +1487,7 @@ func (m Model) renderProfileModalView() string {
 func (m *Model) generateProfileVisual() string {
 	var sb strings.Builder
 
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(ColorHighlight).
-		Background(ColorPrimary).
-		Padding(0, 1)
+	titleStyle := ModalTitleStyle
 
 	headerSection := lipgloss.NewStyle().
 		Bold(true).
@@ -1501,7 +1495,7 @@ func (m *Model) generateProfileVisual() string {
 		MarginTop(1)
 
 	sb.WriteString(titleStyle.Render("GOLEM PROVIDER PROFILES") + "\n\n")
-	sb.WriteString(headerSection.Render("■ Configured Profiles") + "\n")
+	sb.WriteString(headerSection.Render("▍ Configured Profiles") + "\n")
 
 	active := m.currentProfile
 	if active == "" {

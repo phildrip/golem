@@ -7,17 +7,25 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Theme colors
+// Theme colors.
+//
+// The palette is adaptive: every colour resolves differently for light and dark
+// terminal backgrounds so the UI stays readable either way, and the tones are
+// muted rather than neon. Body text uses the semantic ColorHighlight tone
+// instead of forcing a hard white, so Golem blends with the user's own theme.
 var (
-	ColorPrimary   = lipgloss.Color("#00D4FF") // Neon Cyan
-	ColorSecondary = lipgloss.Color("#7D56F4") // Electric Purple
-	ColorSuccess   = lipgloss.Color("#00E676") // Emerald Green
-	ColorWarning   = lipgloss.Color("#FFD600") // Amber Yellow
-	ColorDanger    = lipgloss.Color("#FF5252") // Coral Red
-	ColorMuted     = lipgloss.Color("#6B7280") // Cool Gray
-	ColorHighlight = lipgloss.Color("#F3F4F6") // Bright White
-	ColorDarkBg    = lipgloss.Color("#111827") // Deep Slate
-	ColorBorder    = lipgloss.Color("#374151") // Border Slate
+	ColorPrimary   lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#5E81AC", Dark: "#88C0D0"} // frost blue (accent)
+	ColorSecondary lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#7C6A9C", Dark: "#B48EAD"} // muted purple
+	ColorSuccess   lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#5F7E4E", Dark: "#A3BE8C"} // sage green
+	ColorWarning   lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#9C7A2E", Dark: "#EBCB8B"} // sand amber
+	ColorDanger    lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#A33A44", Dark: "#BF616A"} // muted red
+	ColorMuted     lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#6A737D", Dark: "#7B8794"} // cool gray
+	ColorHighlight lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#2E3440", Dark: "#E5E9F0"} // body text
+	ColorSurface   lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#E7EAEE", Dark: "#3B4252"} // subtle fill
+	ColorBorder    lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#C2C7D0", Dark: "#4C566A"} // border
+
+	// ColorDarkBg is kept as a legacy alias for the subtle surface fill.
+	ColorDarkBg lipgloss.TerminalColor = ColorSurface
 )
 
 // Component Styles
@@ -25,23 +33,32 @@ var (
 	// Header & Titles
 	HeaderTitleStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("#FFFFFF")).
-				Background(ColorSecondary).
+				Foreground(ColorPrimary).
 				Padding(0, 1)
 
 	HeaderSubStyle = lipgloss.NewStyle().
+			Foreground(ColorMuted)
+
+	// StartupHeaderStyle renders the replay header above the conversation.
+	StartupHeaderStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(ColorPrimary)
+
+	// ModalTitleStyle is the shared banner used by the inspector popups.
+	ModalTitleStyle = lipgloss.NewStyle().
+			Bold(true).
 			Foreground(ColorPrimary).
-			Bold(true)
+			Background(ColorSurface).
+			Padding(0, 1)
 
 	// Status & HUD
 	StatusBarModelStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#FFFFFF")).
-				Background(lipgloss.Color("#1F2937")).
+				Foreground(ColorHighlight).
+				Background(ColorSurface).
 				Padding(0, 1)
 
 	StatusBarMemoryStyle = lipgloss.NewStyle().
-				Foreground(ColorSuccess).
-				Background(lipgloss.Color("#1F2937")).
+				Foreground(ColorMuted).
 				Padding(0, 1)
 
 	StatusBarKeyHintStyle = lipgloss.NewStyle().
@@ -50,15 +67,11 @@ var (
 	// User & Agent labels
 	UserBadgeStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(ColorPrimary).
-			Padding(0, 1)
+			Foreground(ColorMuted)
 
 	AgentBadgeStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(ColorSecondary).
-			Padding(0, 1)
+			Foreground(ColorPrimary)
 
 	// Tool execution card styles
 	ToolCardBox = lipgloss.NewStyle().
@@ -69,22 +82,16 @@ var (
 			MarginBottom(0)
 
 	ToolRunningBadge = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#000000")).
-				Background(ColorWarning).
-				Bold(true).
-				Padding(0, 1)
+				Foreground(ColorWarning).
+				Bold(true)
 
 	ToolSuccessBadge = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#000000")).
-				Background(ColorSuccess).
-				Bold(true).
-				Padding(0, 1)
+				Foreground(ColorSuccess).
+				Bold(true)
 
 	ToolErrorBadge = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(ColorDanger).
-			Bold(true).
-			Padding(0, 1)
+			Foreground(ColorDanger).
+			Bold(true)
 
 	// Memory tree visualization styles
 	TreeNodeLevelStyle = lipgloss.NewStyle().
@@ -99,6 +106,9 @@ var (
 				Foreground(ColorSuccess).
 				Bold(true)
 )
+
+// toolBullet is the compact glyph that prefixes collapsed tool summary lines.
+const toolBullet = "▸"
 
 // RenderCollapsedToolSummary formats a collapsed group of tool calls into a single compact line.
 func RenderCollapsedToolSummary(tools []ChatEntry) string {
@@ -125,7 +135,8 @@ func RenderCollapsedToolSummary(tools []ChatEntry) string {
 		}
 
 		if t.IsRunning {
-			return fmt.Sprintf("  ⚡ Running tool: %s%s %s",
+			return fmt.Sprintf("  %s Running tool: %s%s %s",
+				toolBullet,
 				lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render(cleanName),
 				cmdStr,
 				ToolRunningBadge.Render("RUNNING"),
@@ -139,7 +150,8 @@ func RenderCollapsedToolSummary(tools []ChatEntry) string {
 			statusBadge = ToolErrorBadge.Render(fmt.Sprintf("EXIT %d", t.ExitCode))
 		}
 
-		return fmt.Sprintf("  ⚡ Tool: %s%s %s %s",
+		return fmt.Sprintf("  %s Tool: %s%s %s %s",
+			toolBullet,
 			lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render(cleanName),
 			cmdStr,
 			statusBadge,
@@ -183,7 +195,8 @@ func RenderCollapsedToolSummary(tools []ChatEntry) string {
 			}
 			cmdStr = lipgloss.NewStyle().Foreground(ColorMuted).Render(fmt.Sprintf(" ($ %s)", cmd))
 		}
-		return fmt.Sprintf("  ⚡ Running tool (%d/%d): %s%s %s %s",
+		return fmt.Sprintf("  %s Running tool (%d/%d): %s%s %s %s",
+			toolBullet,
 			len(tools), len(tools),
 			lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render(runningTool),
 			cmdStr,
@@ -200,7 +213,8 @@ func RenderCollapsedToolSummary(tools []ChatEntry) string {
 	}
 
 	namesList := strings.Join(toolNames, ", ")
-	return fmt.Sprintf("  ⚡ %d tool calls (%s) %s %s",
+	return fmt.Sprintf("  %s %d tool calls (%s) %s %s",
+		toolBullet,
 		len(tools),
 		namesList,
 		statusBadge,
@@ -219,7 +233,7 @@ func RenderToolCard(toolName string, commandOrArgs string, output string, exitCo
 		statusBadge = ToolErrorBadge.Render(fmt.Sprintf("EXIT %d", exitCode))
 	}
 
-	header := fmt.Sprintf("⚡ Tool: %s %s", lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render(toolName), statusBadge)
+	header := fmt.Sprintf("%s Tool: %s %s", toolBullet, lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render(toolName), statusBadge)
 
 	contentLines := []string{header}
 	if commandOrArgs != "" && commandOrArgs != "null" && commandOrArgs != "{}" {
@@ -249,13 +263,11 @@ func RenderToolCard(toolName string, commandOrArgs string, output string, exitCo
 func RenderSubagentCard(role, model, prompt, output string, isRunning bool, width int) string {
 	roleBadge := lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#FFFFFF")).
-		Background(ColorSecondary).
-		Padding(0, 1).
+		Foreground(ColorSecondary).
 		Render(strings.ToUpper(role))
 
 	modelTag := lipgloss.NewStyle().
-		Foreground(ColorPrimary).
+		Foreground(ColorMuted).
 		Italic(true).
 		Render("[" + model + "]")
 
@@ -266,7 +278,7 @@ func RenderSubagentCard(role, model, prompt, output string, isRunning bool, widt
 		statusBadge = ToolSuccessBadge.Render("DONE")
 	}
 
-	header := fmt.Sprintf("🤖 Subagent: %s %s %s", roleBadge, modelTag, statusBadge)
+	header := fmt.Sprintf("◆ Subagent: %s %s %s", roleBadge, modelTag, statusBadge)
 	contentLines := []string{header}
 
 	if prompt != "" {
@@ -318,9 +330,9 @@ func RenderMemoryMinimap(totalEvents int, tailNodesByLevel map[int]int, liveHead
 	parts = append(parts, TreeLiveHeadStyle.Render(fmt.Sprintf("Live:%d", liveHeadCount)))
 
 	if compactorActive {
-		parts = append(parts, ToolRunningBadge.Render("⟡ Compacting"))
+		parts = append(parts, ToolRunningBadge.Render("Compacting"))
 	} else {
-		parts = append(parts, lipgloss.NewStyle().Foreground(ColorMuted).Render("⟡ Idle"))
+		parts = append(parts, lipgloss.NewStyle().Foreground(ColorMuted).Render("Idle"))
 	}
 
 	return strings.Join(parts, " • ")

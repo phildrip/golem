@@ -29,12 +29,14 @@ func (m *mockAgent) Process(ctx context.Context, prompt string) (string, error) 
 
 func TestParseFlags(t *testing.T) {
 	tests := []struct {
-		name          string
-		args          []string
-		wantModel     string
-		wantMem       string
-		wantNoTUI     bool
-		wantTUI       bool
+		name        string
+		args        []string
+		wantModel   string
+		wantMem     string
+		wantNoTUI   bool
+		wantTUI     bool
+		wantNoMouse bool
+
 		wantCompModel string
 		wantCompProv  string
 		wantErr       bool
@@ -72,6 +74,13 @@ func TestParseFlags(t *testing.T) {
 			wantErr:   false,
 		},
 		{
+			name:        "no-mouse flag",
+			args:        []string{"-no-mouse"},
+			wantNoMouse: true,
+			wantErr:     false,
+		},
+
+		{
 			name:          "compactor model and provider flags",
 			args:          []string{"-compactor-model", "gemini-2.5-flash", "-compactor-provider", "gemini"},
 			wantCompModel: "gemini-2.5-flash",
@@ -106,6 +115,10 @@ func TestParseFlags(t *testing.T) {
 			if opts.TUI != tc.wantTUI {
 				t.Errorf("TUI = %v, want %v", opts.TUI, tc.wantTUI)
 			}
+			if opts.NoMouse != tc.wantNoMouse {
+				t.Errorf("NoMouse = %v, want %v", opts.NoMouse, tc.wantNoMouse)
+			}
+
 			if opts.CompactorModel != tc.wantCompModel {
 				t.Errorf("CompactorModel = %q, want %q", opts.CompactorModel, tc.wantCompModel)
 			}
@@ -261,9 +274,9 @@ func TestRunReadlineLoop(t *testing.T) {
 			wantContains: []string{"Ready!", "You: ", "Golem: Hello user!"},
 		},
 		{
-			name:  "quit command breaks loop",
-			input: "quit\n",
-			agent: &mockAgent{},
+			name:         "quit command breaks loop",
+			input:        "quit\n",
+			agent:        &mockAgent{},
 			wantContains: []string{"Ready!", "You: "},
 		},
 		{
@@ -332,4 +345,3 @@ func TestFormatAuthStatus(t *testing.T) {
 		})
 	}
 }
-

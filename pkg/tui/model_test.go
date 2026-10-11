@@ -258,27 +258,27 @@ func TestModel_ShortcutsModalToggling(t *testing.T) {
 
 func TestModel_RenderMinimap(t *testing.T) {
 	tests := []struct {
-		name        string
-		totalEvents int
-		tailLevels  map[int]int
-		liveCount   int
-		compacting  bool
+		name         string
+		totalEvents  int
+		tailLevels   map[int]int
+		liveCount    int
+		compacting   bool
 		wantContains []string
 	}{
 		{
-			name:        "all live head",
-			totalEvents: 3,
-			tailLevels:  map[int]int{},
-			liveCount:   3,
-			compacting:  false,
+			name:         "all live head",
+			totalEvents:  3,
+			tailLevels:   map[int]int{},
+			liveCount:    3,
+			compacting:   false,
 			wantContains: []string{"3 msgs", "Live:3", "Idle"},
 		},
 		{
-			name:        "with fractal tail and compaction active",
-			totalEvents: 42,
-			tailLevels:  map[int]int{0: 20, 1: 10, 2: 4},
-			liveCount:   8,
-			compacting:  true,
+			name:         "with fractal tail and compaction active",
+			totalEvents:  42,
+			tailLevels:   map[int]int{0: 20, 1: 10, 2: 4},
+			liveCount:    8,
+			compacting:   true,
 			wantContains: []string{"42 msgs", "L0:20", "L1:10", "L2:4", "Live:8", "Compacting"},
 		},
 	}
@@ -513,6 +513,50 @@ func TestModel_ViewportAndModalScrolling(t *testing.T) {
 
 	mModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	m = mModel.(Model)
+}
+
+// TestModel_StreamingDoesNotYankScroll verifies that incoming agent chunks keep
+// the view pinned to the bottom when the user is already there, but do NOT pull
+// the user back down after they have scrolled up to read history.
+func TestModel_StreamingDoesNotYankScroll(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := fractal.OpenStore(tmpDir)
+	defer store.Close()
+	view := fractal.NewView(store, fractal.DefaultViewConfig())
+	m := NewModel(nil, store, view)
+
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	m = newM.(Model)
+
+	for i := 0; i < 60; i++ {
+		m.entries = append(m.entries, ChatEntry{Type: TypeUser, Content: "line of message"})
+	}
+	m.renderConversationToViewport()
+	m.viewport.GotoBottom()
+	if !m.viewport.AtBottom() {
+		t.Fatalf("expected viewport at bottom after initial render")
+	}
+
+	// Streaming while pinned to the bottom should follow the tail.
+	newM, _ = m.Update(agentChunkMsg("partial reply"))
+	m = newM.(Model)
+	if !m.viewport.AtBottom() {
+		t.Errorf("expected viewport to follow the tail while pinned, offset=%d", m.viewport.YOffset)
+	}
+
+	// Scroll up to read history.
+	m.viewport.LineUp(20)
+	if m.viewport.AtBottom() {
+		t.Fatalf("precondition failed: expected to be scrolled up")
+	}
+	scrolledOffset := m.viewport.YOffset
+
+	// More streaming must not yank the user back to the bottom.
+	newM, _ = m.Update(agentChunkMsg("more reply text"))
+	m = newM.(Model)
+	if m.viewport.YOffset != scrolledOffset {
+		t.Errorf("streaming yanked scroll from %d to %d", scrolledOffset, m.viewport.YOffset)
+	}
 }
 
 func TestModel_CtrlCAndCtrlD(t *testing.T) {
@@ -1133,6 +1177,43 @@ func TestModel_StreamMsgHandlingLifecycle(t *testing.T) {
 	_ = nextCmd
 }
 
+// TestModel_MouseWheelScrolls verifies that mouse wheel events forwarded to the
+// chat viewport actually scroll it (the TUI enables tea.WithMouseCellMotion).
+func TestModel_MouseWheelScrolls(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := fractal.OpenStore(tmpDir)
+	defer store.Close()
+	view := fractal.NewView(store, fractal.DefaultViewConfig())
+	m := NewModel(nil, store, view)
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	m = newM.(Model)
+
+	for i := 0; i < 60; i++ {
+		m.entries = append(m.entries, ChatEntry{
+			Type:    TypeAgent,
+			Content: fmt.Sprintf("Line of history %d", i),
+		})
+	}
+	m.renderConversationToViewport()
+	m.viewport.GotoBottom()
+	bottom := m.viewport.YOffset
+
+	// Wheel up must scroll towards the top.
+	newM, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+	m = newM.(Model)
+	if m.viewport.YOffset >= bottom {
+		t.Fatalf("wheel up did not scroll: was %d, now %d", bottom, m.viewport.YOffset)
+	}
+
+	// Wheel down must scroll back towards the bottom.
+	scrolledUp := m.viewport.YOffset
+	newM, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+	m = newM.(Model)
+	if m.viewport.YOffset <= scrolledUp {
+		t.Errorf("wheel down did not scroll: was %d, now %d", scrolledUp, m.viewport.YOffset)
+	}
+}
+
 func TestModel_TypingDoesNotScroll(t *testing.T) {
 	tmpDir := t.TempDir()
 	store, _ := fractal.OpenStore(tmpDir)
@@ -1296,6 +1377,3 @@ func TestModel_ExpandToolsToggle(t *testing.T) {
 		t.Errorf("expected expandTools to be true after /tools command")
 	}
 }
-
-
-
