@@ -54,25 +54,9 @@ func TestClient_UnaryGenerateContent(t *testing.T) {
 
 		// Return OpenAI formatted response with a tool call
 		resp := openAIChatResponse{
-			Choices: []struct {
-				Message struct {
-					Role      string           `json:"role"`
-					Content   string           `json:"content"`
-					ToolCalls []openAIToolCall `json:"tool_calls"`
-				} `json:"message"`
-				Delta struct {
-					Role      string           `json:"role"`
-					Content   string           `json:"content"`
-					ToolCalls []openAIToolCall `json:"tool_calls"`
-				} `json:"delta"`
-				FinishReason string `json:"finish_reason"`
-			}{
+			Choices: []openAIChatChoice{
 				{
-					Message: struct {
-						Role      string           `json:"role"`
-						Content   string           `json:"content"`
-						ToolCalls []openAIToolCall `json:"tool_calls"`
-					}{
+					Message: openAIChatMessageResponse{
 						Role:    "assistant",
 						Content: "Let me check that file for you.",
 						ToolCalls: []openAIToolCall{
@@ -259,25 +243,9 @@ func TestClient_OpenCodeSessionAndUserAgentHeaders(t *testing.T) {
 		receivedUA = r.Header.Get("User-Agent")
 		receivedSession = r.Header.Get("x-opencode-session")
 		resp := openAIChatResponse{
-			Choices: []struct {
-				Message struct {
-					Role      string           `json:"role"`
-					Content   string           `json:"content"`
-					ToolCalls []openAIToolCall `json:"tool_calls"`
-				} `json:"message"`
-				Delta struct {
-					Role      string           `json:"role"`
-					Content   string           `json:"content"`
-					ToolCalls []openAIToolCall `json:"tool_calls"`
-				} `json:"delta"`
-				FinishReason string `json:"finish_reason"`
-			}{
+			Choices: []openAIChatChoice{
 				{
-					Message: struct {
-						Role      string           `json:"role"`
-						Content   string           `json:"content"`
-						ToolCalls []openAIToolCall `json:"tool_calls"`
-					}{
+					Message: openAIChatMessageResponse{
 						Role:    "assistant",
 						Content: "ok",
 					},
@@ -739,3 +707,133 @@ func TestClient_RetryHonorsContextCancellation(t *testing.T) {
 		t.Errorf("requests = %d, want the backoff to stop promptly on cancellation", requests)
 	}
 }
+
+func TestClient_ThinkingModelReasoningContentRoundtrip(t *testing.T) {
+	// 1. Streaming test with reasoning_content chunks followed by tool call
+	sseChunks := []string{
+		`data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"Let me check git status"},"finish_reason":null}]}`,
+		`data: {"choices":[{"delta":{"reasoning_content":" to see what changed."},"finish_reason":null}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"shell","arguments":"{\"command\":\"git status\"}"}}]},"finish_reason":null}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, chunk := range sseChunks {
+			_, _ = fmt.Fprintf(w, "%s\n\n", chunk)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient("deepseek-v4.1-flash", server.URL, "test-key", server.Client())
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "check git status"}}},
+		},
+	}
+
+	var gotThoughts []string
+	var finalContent *genai.Content
+	for resp, err := range client.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			t.Fatalf("GenerateContent failed: %v", err)
+		}
+		if resp.Content != nil {
+			if resp.Partial {
+				for _, p := range resp.Content.Parts {
+					if p.Thought {
+						gotThoughts = append(gotThoughts, p.Text)
+					}
+				}
+			} else {
+				finalContent = resp.Content
+			}
+		}
+	}
+
+	joinedThought := strings.Join(gotThoughts, "")
+	if joinedThought != "Let me check git status to see what changed." {
+		t.Errorf("expected joined thought 'Let me check git status to see what changed.', got %q", joinedThought)
+	}
+
+	if finalContent == nil {
+		t.Fatalf("expected non-nil finalContent")
+	}
+
+	// Verify final parts contain the Thought part and the FunctionCall part
+	var hasThoughtPart, hasToolCallPart bool
+	for _, p := range finalContent.Parts {
+		if p.Thought && p.Text == "Let me check git status to see what changed." {
+			hasThoughtPart = true
+		}
+		if p.FunctionCall != nil && p.FunctionCall.Name == "shell" {
+			hasToolCallPart = true
+		}
+	}
+	if !hasThoughtPart {
+		t.Errorf("expected finalContent to contain Thought part")
+	}
+	if !hasToolCallPart {
+		t.Errorf("expected finalContent to contain FunctionCall part")
+	}
+
+	// 2. Next turn: pass finalContent + FunctionResponse back to convertRequest
+	nextReq := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "check git status"}}},
+			finalContent,
+			{
+				Role: "user",
+				Parts: []*genai.Part{
+					{
+						FunctionResponse: &genai.FunctionResponse{
+							Name:     "shell",
+							ID:       "call_abc",
+							Response: map[string]any{"output": "On branch main"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	chatReq, err := client.convertRequest(nextReq, true)
+	if err != nil {
+		t.Fatalf("convertRequest failed: %v", err)
+	}
+
+	// Find the assistant message in chatReq.Messages
+	var assistantMsg *openAIChatMessage
+	for i := range chatReq.Messages {
+		if chatReq.Messages[i].Role == "assistant" {
+			assistantMsg = &chatReq.Messages[i]
+			break
+		}
+	}
+
+	if assistantMsg == nil {
+		t.Fatalf("expected assistant message in chatReq.Messages")
+	}
+
+	if assistantMsg.ReasoningContent == nil {
+		t.Fatalf("expected ReasoningContent to be non-nil in assistant message passed back to API")
+	}
+
+	if *assistantMsg.ReasoningContent != "Let me check git status to see what changed." {
+		t.Errorf("ReasoningContent = %q, want 'Let me check git status to see what changed.'", *assistantMsg.ReasoningContent)
+	}
+
+	// Verify JSON marshaling includes reasoning_content
+	msgJSON, err := json.Marshal(assistantMsg)
+	if err != nil {
+		t.Fatalf("failed to marshal assistantMsg: %v", err)
+	}
+	if !strings.Contains(string(msgJSON), `"reasoning_content":"Let me check git status to see what changed."`) {
+		t.Errorf("marshaled assistant message does not contain reasoning_content: %s", string(msgJSON))
+	}
+}
+

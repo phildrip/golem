@@ -104,10 +104,11 @@ func (c *Client) Name() string {
 
 // OpenAIChatMessage represents a message in the OpenAI chat format.
 type openAIChatMessage struct {
-	Role       string           `json:"role"`
-	Content    string           `json:"content,omitempty"`
-	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string           `json:"tool_call_id,omitempty"`
+	Role             string           `json:"role"`
+	Content          string           `json:"content,omitempty"`
+	ReasoningContent *string          `json:"reasoning_content,omitempty"`
+	ToolCalls        []openAIToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
 }
 
 type openAIToolCall struct {
@@ -141,21 +142,24 @@ type openAIChatRequest struct {
 	Temperature *float64            `json:"temperature,omitempty"`
 }
 
+type openAIChatMessageResponse struct {
+	Role             string           `json:"role"`
+	Content          string           `json:"content"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"`
+	Reasoning        string           `json:"reasoning,omitempty"`
+	Thought          string           `json:"thought,omitempty"`
+	ToolCalls        []openAIToolCall `json:"tool_calls,omitempty"`
+}
+
+type openAIChatChoice struct {
+	Message      openAIChatMessageResponse `json:"message"`
+	Delta        openAIChatMessageResponse `json:"delta"`
+	FinishReason string                    `json:"finish_reason"`
+}
+
 type openAIChatResponse struct {
-	Choices []struct {
-		Message struct {
-			Role      string           `json:"role"`
-			Content   string           `json:"content"`
-			ToolCalls []openAIToolCall `json:"tool_calls"`
-		} `json:"message"`
-		Delta struct {
-			Role      string           `json:"role"`
-			Content   string           `json:"content"`
-			ToolCalls []openAIToolCall `json:"tool_calls"`
-		} `json:"delta"`
-		FinishReason string `json:"finish_reason"`
-	} `json:"choices"`
-	Error *struct {
+	Choices []openAIChatChoice `json:"choices"`
+	Error   *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 	} `json:"error,omitempty"`
@@ -311,6 +315,15 @@ func retryAfter(resp *http.Response, fallback time.Duration) time.Duration {
 	return fallback
 }
 
+func isThinkingModel(modelName string) bool {
+	m := strings.ToLower(modelName)
+	return strings.Contains(m, "deepseek") ||
+		strings.Contains(m, "reasoner") ||
+		strings.Contains(m, "r1") ||
+		strings.Contains(m, "qwq") ||
+		strings.Contains(m, "thinking")
+}
+
 func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChatRequest, error) {
 	chatReq := &openAIChatRequest{
 		Model:    c.modelName,
@@ -346,6 +359,7 @@ func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChat
 		}
 
 		var textBuilder strings.Builder
+		var reasoningBuilder strings.Builder
 		var toolCalls []openAIToolCall
 		var toolResponses []*genai.FunctionResponse
 
@@ -353,7 +367,9 @@ func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChat
 			if part == nil {
 				continue
 			}
-			if part.Text != "" {
+			if part.Thought {
+				reasoningBuilder.WriteString(part.Text)
+			} else if part.Text != "" {
 				textBuilder.WriteString(part.Text)
 			}
 			if part.FunctionCall != nil {
@@ -409,10 +425,20 @@ func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChat
 		}
 
 		// Standard user or assistant message
+		var rcPtr *string
+		if reasoningBuilder.Len() > 0 {
+			rc := reasoningBuilder.String()
+			rcPtr = &rc
+		} else if role == "assistant" && len(toolCalls) > 0 && isThinkingModel(c.modelName) {
+			emptyRC := ""
+			rcPtr = &emptyRC
+		}
+
 		msg := openAIChatMessage{
-			Role:      role,
-			Content:   textBuilder.String(),
-			ToolCalls: toolCalls,
+			Role:             role,
+			Content:          textBuilder.String(),
+			ReasoningContent: rcPtr,
+			ToolCalls:        toolCalls,
 		}
 		chatReq.Messages = append(chatReq.Messages, msg)
 	}
@@ -514,6 +540,20 @@ func (c *Client) handleUnaryResponse(r io.Reader, yield func(*model.LLMResponse,
 	msg := choice.Message
 
 	var parts []*genai.Part
+	reasoning := msg.ReasoningContent
+	if reasoning == "" {
+		reasoning = msg.Reasoning
+	}
+	if reasoning == "" {
+		reasoning = msg.Thought
+	}
+	if reasoning != "" {
+		parts = append(parts, &genai.Part{
+			Text:    reasoning,
+			Thought: true,
+		})
+	}
+
 	if msg.Content != "" {
 		parts = append(parts, &genai.Part{Text: msg.Content})
 	}
@@ -561,6 +601,7 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 	accumulatedTools := make(map[int]*toolAccumulator)
 
 	var accumulatedText strings.Builder
+	var accumulatedReasoning strings.Builder
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data:") {
@@ -589,6 +630,29 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 
 		choice := chunk.Choices[0]
 		delta := choice.Delta
+
+		// Reasoning / thinking tokens streaming
+		reasoningChunk := delta.ReasoningContent
+		if reasoningChunk == "" {
+			reasoningChunk = delta.Reasoning
+		}
+		if reasoningChunk == "" {
+			reasoningChunk = delta.Thought
+		}
+		if reasoningChunk != "" {
+			accumulatedReasoning.WriteString(reasoningChunk)
+			if !yield(&model.LLMResponse{
+				Content: &genai.Content{
+					Role: "model",
+					Parts: []*genai.Part{
+						{Text: reasoningChunk, Thought: true},
+					},
+				},
+				Partial: true,
+			}, nil) {
+				return
+			}
+		}
 
 		// Plain text token streaming
 		if delta.Content != "" {
@@ -639,8 +703,14 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 		}
 	}
 
-	// Finalize tool calls if model produced any
+	// Finalize parts if model produced reasoning or text
 	var finalParts []*genai.Part
+	if accumulatedReasoning.Len() > 0 {
+		finalParts = append(finalParts, &genai.Part{
+			Text:    accumulatedReasoning.String(),
+			Thought: true,
+		})
+	}
 	if accumulatedText.Len() > 0 {
 		finalParts = append(finalParts, &genai.Part{Text: accumulatedText.String()})
 	}

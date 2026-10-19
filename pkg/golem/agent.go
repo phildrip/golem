@@ -936,6 +936,9 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 			if ev != nil && ev.Content != nil {
 				if ev.Partial {
 					for _, part := range ev.Content.Parts {
+						if part.Thought {
+							continue
+						}
 						if part.Text != "" {
 							responseBuilder.WriteString(part.Text)
 							if handler != nil {
@@ -945,6 +948,9 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 					}
 				} else if responseBuilder.Len() == 0 {
 					for _, part := range ev.Content.Parts {
+						if part.Thought {
+							continue
+						}
 						if part.Text != "" {
 							responseBuilder.WriteString(part.Text)
 							if handler != nil {
