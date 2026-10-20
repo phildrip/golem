@@ -1377,3 +1377,279 @@ func TestModel_ExpandToolsToggle(t *testing.T) {
 		t.Errorf("expected expandTools to be true after /tools command")
 	}
 }
+
+// newScrollTestModel returns a model with plenty of conversation history and a
+// sized viewport, scrolled to the bottom.
+func newScrollTestModel(t *testing.T) Model {
+	t.Helper()
+	tmpDir := t.TempDir()
+	store, err := fractal.OpenStore(tmpDir)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	view := fractal.NewView(store, fractal.DefaultViewConfig())
+	m := NewModel(nil, store, view)
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	m = newM.(Model)
+	for i := 0; i < 200; i++ {
+		m.entries = append(m.entries, ChatEntry{
+			Type:    TypeAgent,
+			Content: fmt.Sprintf("Line of history %d", i),
+		})
+	}
+	m.renderConversationToViewport()
+	m.viewport.GotoBottom()
+	return m
+}
+
+// TestModel_WheelScrollIsRateLimited is the regression guard for "my Marathon
+// mouse scrolls insanely fast": a free-spinning wheel delivers dozens of events
+// in one flick, and without a limiter each one jumps several lines.
+func TestModel_WheelScrollIsRateLimited(t *testing.T) {
+	original := wheelRefillInterval
+	wheelRefillInterval = time.Hour // no refill: only the burst may be spent
+	t.Cleanup(func() { wheelRefillInterval = original })
+
+	m := newScrollTestModel(t)
+	start := m.viewport.YOffset
+	if start == 0 {
+		t.Fatal("expected a scrollable conversation")
+	}
+
+	const events = 50
+	for i := 0; i < events; i++ {
+		newM, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+		m = newM.(Model)
+	}
+
+	scrolled := start - m.viewport.YOffset
+	if scrolled <= 0 {
+		t.Fatal("rate limiter swallowed every event; a flick must still scroll")
+	}
+	if scrolled > wheelBurst {
+		t.Errorf("%d wheel events scrolled %d lines, want at most %d (the burst budget)", events, scrolled, wheelBurst)
+	}
+}
+
+// TestModel_WheelScrollRefillsOverTime makes sure the limiter spaces events out
+// instead of dropping them forever: with time passing, later events scroll.
+func TestModel_WheelScrollRefillsOverTime(t *testing.T) {
+	original := wheelRefillInterval
+	wheelRefillInterval = time.Nanosecond
+	t.Cleanup(func() { wheelRefillInterval = original })
+
+	m := newScrollTestModel(t)
+	start := m.viewport.YOffset
+
+	for i := 0; i < 10; i++ {
+		newM, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+		m = newM.(Model)
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	if scrolled := start - m.viewport.YOffset; scrolled != 10 {
+		t.Errorf("scrolled %d lines across 10 spaced events, want 10", scrolled)
+	}
+}
+
+// TestModel_WheelScrollIgnoresNonWheelEvents ensures clicks and motion do not
+// move the buffer (Golem has no clickable UI, and the wheel-only capture is what
+// keeps selection usable).
+func TestModel_WheelScrollIgnoresNonWheelEvents(t *testing.T) {
+	m := newScrollTestModel(t)
+	start := m.viewport.YOffset
+
+	newM, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+	m = newM.(Model)
+	if m.viewport.YOffset != start {
+		t.Errorf("left-click release scrolled the conversation (%d -> %d)", start, m.viewport.YOffset)
+	}
+
+	newM, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	m = newM.(Model)
+	if m.viewport.YOffset != start {
+		t.Errorf("left-click scrolled the conversation (%d -> %d)", start, m.viewport.YOffset)
+	}
+}
+
+// TestModel_CtrlGTogglesMouseCapture covers handing the mouse back to tmux: the
+// key must flip the state and emit the matching bubbletea command both ways.
+func TestModel_CtrlGTogglesMouseCapture(t *testing.T) {
+	m := newScrollTestModel(t)
+	if !m.MouseEnabled() {
+		t.Fatal("mouse capture should default to enabled inside the TUI")
+	}
+
+	newM, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	m = newM.(Model)
+	if m.MouseEnabled() {
+		t.Error("Ctrl+G did not release mouse capture")
+	}
+	// bubbletea keeps these message types unexported, so match on the type name:
+	// DisableMouse() must produce disableMouseMsg (and never an enable*).
+	if cmd == nil {
+		t.Error("Ctrl+G must emit a DisableMouse command")
+	} else if got := fmt.Sprintf("%T", cmd()); got != "tea.disableMouseMsg" {
+		t.Errorf("Ctrl+G emitted %s, want tea.disableMouseMsg", got)
+	}
+	if !strings.Contains(m.statusMessage, "OFF") {
+		t.Errorf("status message = %q, want it to mention mouse capture being off", m.statusMessage)
+	}
+
+	newM, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	m = newM.(Model)
+	if !m.MouseEnabled() {
+		t.Error("second Ctrl+G did not re-enable mouse capture")
+	}
+	if cmd == nil {
+		t.Error("Ctrl+G must emit an EnableMouseCellMotion command")
+	} else if got := fmt.Sprintf("%T", cmd()); got != "tea.enableMouseCellMotionMsg" {
+		t.Errorf("Ctrl+G emitted %s, want tea.enableMouseCellMotionMsg", got)
+	}
+	if !strings.Contains(m.statusMessage, "ON") {
+		t.Errorf("status message = %q, want it to mention mouse capture being on", m.statusMessage)
+	}
+}
+
+// TestModel_SetMouseEnabled covers the --no-mouse wiring: the model must start
+// with capture off, and Ctrl+G must then be able to turn it on.
+func TestModel_SetMouseEnabled(t *testing.T) {
+	m := newScrollTestModel(t)
+	m.SetMouseEnabled(false)
+	if m.MouseEnabled() {
+		t.Fatal("SetMouseEnabled(false) did not take effect")
+	}
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	m = newM.(Model)
+	if !m.MouseEnabled() {
+		t.Error("Ctrl+G did not enable mouse capture after a --no-mouse start")
+	}
+}
+
+// TestModel_StartupLandsOnNewestOutput is the regression guard for "when
+// starting golem I see the start of the last response": the replay is rendered
+// from the top of the log, so the first layout pass must jump to the bottom.
+func TestModel_StartupLandsOnNewestOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := fractal.OpenStore(tmpDir)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	view := fractal.NewView(store, fractal.DefaultViewConfig())
+
+	m := NewModel(nil, store, view)
+	for i := 0; i < 200; i++ {
+		m.entries = append(m.entries, ChatEntry{
+			Type:    TypeAgent,
+			Content: fmt.Sprintf("Replayed line %d", i),
+		})
+	}
+
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	m = newM.(Model)
+	if !m.viewport.AtBottom() {
+		t.Fatalf("startup should show the newest output, YOffset=%d of %d lines",
+			m.viewport.YOffset, m.viewport.TotalLineCount())
+	}
+
+	// A later resize (e.g. terminal drag) must not yank the reader back down.
+	m.viewport.GotoTop()
+	newM, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = newM.(Model)
+	if m.viewport.AtBottom() {
+		t.Fatal("resize after startup must preserve the reader's scroll position")
+	}
+}
+
+// TestModel_HomeEndJumpToConversationEnds covers the answer to "or don't know
+// how to scroll to the end": Home/End go straight to either end of the
+// conversation while the prompt is empty.
+func TestModel_HomeEndJumpToConversationEnds(t *testing.T) {
+	m := newScrollTestModel(t)
+	if !m.viewport.AtBottom() {
+		t.Fatal("test setup should start pinned to the newest output")
+	}
+
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	m = newM.(Model)
+	if m.viewport.YOffset != 0 {
+		t.Fatalf("Home should jump to the top, YOffset=%d", m.viewport.YOffset)
+	}
+
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	m = newM.(Model)
+	if !m.viewport.AtBottom() {
+		t.Fatalf("End should jump to the newest output, YOffset=%d", m.viewport.YOffset)
+	}
+
+	// With a draft in the prompt, Home/End stay textarea keys.
+	m.textarea.SetValue("draft text")
+	before := m.viewport.YOffset
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	m = newM.(Model)
+	if m.viewport.YOffset != before {
+		t.Fatalf("Home with a draft must not scroll the conversation, YOffset=%d want %d", m.viewport.YOffset, before)
+	}
+	m.textarea.Reset()
+}
+
+// TestModel_ScrolledUpShowsWayBack asserts the status bar tells you how to
+// return when newer output is off-screen.
+func TestModel_ScrolledUpShowsWayBack(t *testing.T) {
+	m := newScrollTestModel(t)
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	m = newM.(Model)
+
+	view := m.View()
+	if !strings.Contains(view, "scrolled up") {
+		t.Fatal("scrolled-up view should hint how to reach the newest output")
+	}
+	if !strings.Contains(view, "End: newest") {
+		t.Fatal("scrolled-up hint should name the End key")
+	}
+
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	m = newM.(Model)
+	if strings.Contains(m.View(), "scrolled up") {
+		t.Fatal("hint must disappear once the newest output is visible again")
+	}
+}
+
+// TestModel_StartupReplayShowsNewestTurnEndToEnd drives the real store path:
+// a long conversation is logged, the TUI opens, and the screen must already be
+// showing the most recent turn (the bug was: you saw the top of the last
+// response with no obvious way down).
+func TestModel_StartupReplayShowsNewestTurnEndToEnd(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := fractal.OpenStore(tmpDir)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for i := 0; i < 60; i++ {
+		if _, err := store.AppendEvent(fractal.KindUser, fmt.Sprintf("question %d", i)); err != nil {
+			t.Fatalf("AppendEvent: %v", err)
+		}
+		if _, err := store.AppendEvent(fractal.KindTalk, fmt.Sprintf("answer %d\n%s", i, strings.Repeat("detail line\n", 6))); err != nil {
+			t.Fatalf("AppendEvent: %v", err)
+		}
+	}
+	if _, err := store.AppendEvent(fractal.KindTalk, "FINAL-ANSWER-MARKER"); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	view := fractal.NewView(store, fractal.DefaultViewConfig())
+	m := NewModel(nil, store, view)
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = newM.(Model)
+
+	if !m.viewport.AtBottom() {
+		t.Fatalf("startup viewport should be pinned to the newest output, YOffset=%d", m.viewport.YOffset)
+	}
+	if !strings.Contains(m.View(), "FINAL-ANSWER-MARKER") {
+		t.Fatal("startup screen should show the end of the most recent response")
+	}
+}

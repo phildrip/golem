@@ -36,6 +36,7 @@ func TestParseFlags(t *testing.T) {
 		wantNoTUI   bool
 		wantTUI     bool
 		wantNoMouse bool
+		wantTheme   string
 
 		wantCompModel string
 		wantCompProv  string
@@ -81,6 +82,19 @@ func TestParseFlags(t *testing.T) {
 		},
 
 		{
+			name:      "theme flag",
+			args:      []string{"-theme", "nord"},
+			wantTheme: "nord",
+			wantErr:   false,
+		},
+		{
+			name:      "theme defaults to empty (terminal palette)",
+			args:      []string{},
+			wantTheme: "",
+			wantErr:   false,
+		},
+
+		{
 			name:          "compactor model and provider flags",
 			args:          []string{"-compactor-model", "gemini-2.5-flash", "-compactor-provider", "gemini"},
 			wantCompModel: "gemini-2.5-flash",
@@ -117,6 +131,9 @@ func TestParseFlags(t *testing.T) {
 			}
 			if opts.NoMouse != tc.wantNoMouse {
 				t.Errorf("NoMouse = %v, want %v", opts.NoMouse, tc.wantNoMouse)
+			}
+			if opts.Theme != tc.wantTheme {
+				t.Errorf("Theme = %q, want %q", opts.Theme, tc.wantTheme)
 			}
 
 			if opts.CompactorModel != tc.wantCompModel {
@@ -343,5 +360,43 @@ func TestFormatAuthStatus(t *testing.T) {
 				t.Errorf("formatAuthStatus(%q, %q) = %q, want %q", tc.provider, tc.apiKey, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestShouldCaptureMouse(t *testing.T) {
+	// golem runs in the alternate screen, so a multiplexer pane has no
+	// scrollback to reveal: mouse capture is the default everywhere and Ctrl+G
+	// (or -no-mouse) releases it for copy-mode and native selection.
+	tests := []struct {
+		name string
+		opts CLIOptions
+		want bool
+	}{
+		{name: "bare terminal captures mouse", opts: CLIOptions{}, want: true},
+		{name: "tmux still captures mouse", opts: CLIOptions{}, want: true},
+		{name: "no-mouse flag wins", opts: CLIOptions{NoMouse: true}, want: false},
+		{name: "no-mouse beats -mouse", opts: CLIOptions{NoMouse: true, Mouse: true}, want: false},
+		{name: "-mouse stays explicit", opts: CLIOptions{Mouse: true}, want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldCaptureMouse(tc.opts); got != tc.want {
+				t.Fatalf("shouldCaptureMouse() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseFlags_MouseFlag(t *testing.T) {
+	opts, err := parseFlags([]string{"-mouse"})
+	if err != nil {
+		t.Fatalf("parseFlags(-mouse) error: %v", err)
+	}
+	if !opts.Mouse {
+		t.Fatal("-mouse should set Mouse=true")
+	}
+	if opts.NoMouse {
+		t.Fatal("-mouse must not set NoMouse")
 	}
 }

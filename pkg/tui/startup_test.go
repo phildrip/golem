@@ -232,12 +232,32 @@ func TestNewModelRestoresConversation(t *testing.T) {
 }
 
 func TestCapTextBounds(t *testing.T) {
-	long := strings.Repeat("x", startupMaxEventText+500)
-	got := capText(long)
-	if len(got) <= startupMaxEventText || !strings.Contains(got, "truncated") {
-		t.Errorf("capText did not bound a %d-byte event (got %d bytes)", len(long), len(got))
+	talk := fractal.Event{ID: 42, Kind: fractal.KindTalk, Text: strings.Repeat("x", startupMaxTalkText+500)}
+	got := capText(talk.Text, talk)
+	if len(got) <= startupMaxTalkText || !strings.Contains(got, "truncated") {
+		t.Errorf("capText did not bound a %d-byte turn (got %d bytes)", len(talk.Text), len(got))
 	}
-	if short := capText("ok"); short != "ok" {
+	if !strings.Contains(got, "/zoom 42 1") {
+		t.Errorf("truncated replay must say how to read the rest, got: %q", got[len(got)-80:])
+	}
+
+	echo := fractal.Event{ID: 7, Kind: fractal.KindEcho, Text: strings.Repeat("y", startupMaxToolText+500)}
+	if echoGot := capText(echo.Text, echo); len(echoGot) >= len(echo.Text) {
+		t.Errorf("tool echo should be bounded to %d bytes, got %d", startupMaxToolText, len(echoGot))
+	}
+
+	if short := capText("ok", fractal.Event{Kind: fractal.KindTalk}); short != "ok" {
 		t.Errorf("capText changed a short string: %q", short)
+	}
+}
+
+// TestCapTextKeepsLongAnswerWhole is the regression guard for "I see the start
+// of the last response but can't scroll to the end": a normal-length answer must
+// never be cut by the replay cap.
+func TestCapTextKeepsLongAnswerWhole(t *testing.T) {
+	answer := strings.Repeat("word ", 1200) // ~6000 bytes, a long but ordinary reply
+	ev := fractal.Event{ID: 3, Kind: fractal.KindTalk, Text: answer}
+	if got := capText(answer, ev); got != answer {
+		t.Fatalf("6KB answer was truncated to %d bytes: startup replay must keep the whole reply", len(got))
 	}
 }

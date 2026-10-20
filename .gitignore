@@ -9,3 +9,4 @@
 # Golem local artifacts
 bin/
 .golem/
+/golem-cli

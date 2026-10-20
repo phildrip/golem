@@ -7,105 +7,200 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Theme colors.
+// Themes
 //
-// The palette is adaptive: every colour resolves differently for light and dark
-// terminal backgrounds so the UI stays readable either way, and the tones are
-// muted rather than neon. Body text uses the semantic ColorHighlight tone
-// instead of forcing a hard white, so Golem blends with the user's own theme.
-var (
-	ColorPrimary   lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#5E81AC", Dark: "#88C0D0"} // frost blue (accent)
-	ColorSecondary lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#7C6A9C", Dark: "#B48EAD"} // muted purple
-	ColorSuccess   lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#5F7E4E", Dark: "#A3BE8C"} // sage green
-	ColorWarning   lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#9C7A2E", Dark: "#EBCB8B"} // sand amber
-	ColorDanger    lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#A33A44", Dark: "#BF616A"} // muted red
-	ColorMuted     lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#6A737D", Dark: "#7B8794"} // cool gray
-	ColorHighlight lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#2E3440", Dark: "#E5E9F0"} // body text
-	ColorSurface   lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#E7EAEE", Dark: "#3B4252"} // subtle fill
-	ColorBorder    lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#C2C7D0", Dark: "#4C566A"} // border
-
-	// ColorDarkBg is kept as a legacy alias for the subtle surface fill.
-	ColorDarkBg lipgloss.TerminalColor = ColorSurface
+// Golem ships two palettes:
+//
+//   - ThemeTerminal (default) paints with ANSI colour indexes 1-15 and leaves
+//     body text and fills unset, so the UI inherits the terminal's own colour
+//     scheme and follows its light/dark mode automatically.
+//   - ThemeNord is a fixed, self-contained adaptive palette derived from Nord
+//     that does not depend on the terminal's colours.
+//
+// Both are installed through ApplyTheme, which also rebuilds the component
+// styles, so switching palettes is a single call at startup.
+const (
+	// ThemeTerminal uses the terminal's built-in 16-colour palette.
+	ThemeTerminal = "terminal"
+	// ThemeNord is Golem's bundled adaptive Nord palette.
+	ThemeNord = "nord"
 )
 
-// Component Styles
+// currentTheme records which palette is installed in the Color* variables.
+var currentTheme = ThemeTerminal
+
+// Theme colors. Every value is assigned by ApplyTheme; component styles must be
+// rebuilt with buildStyles after the palette changes.
 var (
+	ColorPrimary   lipgloss.TerminalColor
+	ColorSecondary lipgloss.TerminalColor
+	ColorSuccess   lipgloss.TerminalColor
+	ColorWarning   lipgloss.TerminalColor
+	ColorDanger    lipgloss.TerminalColor
+	ColorMuted     lipgloss.TerminalColor
+	ColorHighlight lipgloss.TerminalColor
+	ColorSurface   lipgloss.TerminalColor
+	ColorBorder    lipgloss.TerminalColor
+
+	// ColorDarkBg is kept as a legacy alias for the subtle surface fill.
+	ColorDarkBg lipgloss.TerminalColor
+)
+
+// Component styles, rebuilt by buildStyles whenever the palette changes.
+var (
+	HeaderTitleStyle      lipgloss.Style
+	HeaderSubStyle        lipgloss.Style
+	StartupHeaderStyle    lipgloss.Style
+	ModalTitleStyle       lipgloss.Style
+	StatusBarModelStyle   lipgloss.Style
+	StatusBarMemoryStyle  lipgloss.Style
+	StatusBarKeyHintStyle lipgloss.Style
+	UserBadgeStyle        lipgloss.Style
+	AgentBadgeStyle       lipgloss.Style
+	ToolCardBox           lipgloss.Style
+	ToolRunningBadge      lipgloss.Style
+	ToolSuccessBadge      lipgloss.Style
+	ToolErrorBadge        lipgloss.Style
+	TreeNodeLevelStyle    lipgloss.Style
+	TreeNodeAddrStyle     lipgloss.Style
+	TreeLiveHeadStyle     lipgloss.Style
+)
+
+func init() {
+	_ = ApplyTheme(ThemeTerminal)
+}
+
+// ApplyTheme installs the named palette and rebuilds every component style.
+// Unknown names return an error and leave the active theme untouched.
+func ApplyTheme(name string) error {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "auto", "default", ThemeTerminal:
+		applyTerminalPalette()
+		currentTheme = ThemeTerminal
+	case ThemeNord:
+		applyNordPalette()
+		currentTheme = ThemeNord
+	default:
+		return fmt.Errorf("unknown theme %q (want %q or %q)", name, ThemeTerminal, ThemeNord)
+	}
+	buildStyles()
+	return nil
+}
+
+// CurrentTheme returns the name of the installed palette.
+func CurrentTheme() string { return currentTheme }
+
+// applyTerminalPalette defers every shade to the terminal's own 16-colour
+// palette. Body text and surface fills are left unset (lipgloss.NoColor) so text
+// keeps the terminal's default foreground and background - this is what makes
+// Golem look native beside the user's shell prompt instead of an RGB island.
+func applyTerminalPalette() {
+	ColorPrimary = lipgloss.Color("6")   // cyan - titles, accents, agent badge
+	ColorSecondary = lipgloss.Color("5") // magenta - subagents, tree addresses
+	ColorSuccess = lipgloss.Color("2")   // green - success, live head
+	ColorWarning = lipgloss.Color("3")   // yellow - running / warning
+	ColorDanger = lipgloss.Color("1")    // red - errors
+	ColorMuted = lipgloss.Color("8")     // bright black - hints, metadata
+	ColorHighlight = lipgloss.NoColor{}  // terminal default foreground
+	ColorSurface = lipgloss.NoColor{}    // no fill: terminal default background
+	ColorBorder = lipgloss.Color("8")    // card and box borders
+	ColorDarkBg = ColorSurface
+}
+
+// applyNordPalette installs the bundled adaptive Nord palette. Every colour
+// resolves differently for light and dark terminal backgrounds so the UI stays
+// readable either way, and the tones are muted rather than neon.
+func applyNordPalette() {
+	ColorPrimary = lipgloss.AdaptiveColor{Light: "#5E81AC", Dark: "#88C0D0"}   // frost blue (accent)
+	ColorSecondary = lipgloss.AdaptiveColor{Light: "#7C6A9C", Dark: "#B48EAD"} // muted purple
+	ColorSuccess = lipgloss.AdaptiveColor{Light: "#5F7E4E", Dark: "#A3BE8C"}   // sage green
+	ColorWarning = lipgloss.AdaptiveColor{Light: "#9C7A2E", Dark: "#EBCB8B"}   // sand amber
+	ColorDanger = lipgloss.AdaptiveColor{Light: "#A33A44", Dark: "#BF616A"}    // muted red
+	ColorMuted = lipgloss.AdaptiveColor{Light: "#6A737D", Dark: "#7B8794"}     // cool gray
+	ColorHighlight = lipgloss.AdaptiveColor{Light: "#2E3440", Dark: "#E5E9F0"} // body text
+	ColorSurface = lipgloss.AdaptiveColor{Light: "#E7EAEE", Dark: "#3B4252"}   // subtle fill
+	ColorBorder = lipgloss.AdaptiveColor{Light: "#C2C7D0", Dark: "#4C566A"}    // border
+	ColorDarkBg = ColorSurface
+}
+
+// buildStyles recreates every component style from the active palette.
+func buildStyles() {
 	// Header & Titles
 	HeaderTitleStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(ColorPrimary).
-				Padding(0, 1)
+		Bold(true).
+		Foreground(ColorPrimary).
+		Padding(0, 1)
 
 	HeaderSubStyle = lipgloss.NewStyle().
-			Foreground(ColorMuted)
+		Foreground(ColorMuted)
 
 	// StartupHeaderStyle renders the replay header above the conversation.
 	StartupHeaderStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(ColorPrimary)
+		Bold(true).
+		Foreground(ColorPrimary)
 
 	// ModalTitleStyle is the shared banner used by the inspector popups.
 	ModalTitleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(ColorPrimary).
-			Background(ColorSurface).
-			Padding(0, 1)
+		Bold(true).
+		Foreground(ColorPrimary).
+		Background(ColorSurface).
+		Padding(0, 1)
 
 	// Status & HUD
 	StatusBarModelStyle = lipgloss.NewStyle().
-				Foreground(ColorHighlight).
-				Background(ColorSurface).
-				Padding(0, 1)
+		Foreground(ColorHighlight).
+		Background(ColorSurface).
+		Padding(0, 1)
 
 	StatusBarMemoryStyle = lipgloss.NewStyle().
-				Foreground(ColorMuted).
-				Padding(0, 1)
+		Foreground(ColorMuted).
+		Padding(0, 1)
 
 	StatusBarKeyHintStyle = lipgloss.NewStyle().
-				Foreground(ColorMuted)
+		Foreground(ColorMuted)
 
 	// User & Agent labels
 	UserBadgeStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(ColorMuted)
+		Bold(true).
+		Foreground(ColorMuted)
 
 	AgentBadgeStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(ColorPrimary)
+		Bold(true).
+		Foreground(ColorPrimary)
 
 	// Tool execution card styles
 	ToolCardBox = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(ColorBorder).
-			Padding(0, 1).
-			MarginTop(0).
-			MarginBottom(0)
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorBorder).
+		Padding(0, 1).
+		MarginTop(0).
+		MarginBottom(0)
 
 	ToolRunningBadge = lipgloss.NewStyle().
-				Foreground(ColorWarning).
-				Bold(true)
+		Foreground(ColorWarning).
+		Bold(true)
 
 	ToolSuccessBadge = lipgloss.NewStyle().
-				Foreground(ColorSuccess).
-				Bold(true)
+		Foreground(ColorSuccess).
+		Bold(true)
 
 	ToolErrorBadge = lipgloss.NewStyle().
-			Foreground(ColorDanger).
-			Bold(true)
+		Foreground(ColorDanger).
+		Bold(true)
 
 	// Memory tree visualization styles
 	TreeNodeLevelStyle = lipgloss.NewStyle().
-				Foreground(ColorPrimary).
-				Bold(true)
+		Foreground(ColorPrimary).
+		Bold(true)
 
 	TreeNodeAddrStyle = lipgloss.NewStyle().
-				Foreground(ColorSecondary).
-				Bold(true)
+		Foreground(ColorSecondary).
+		Bold(true)
 
 	TreeLiveHeadStyle = lipgloss.NewStyle().
-				Foreground(ColorSuccess).
-				Bold(true)
-)
+		Foreground(ColorSuccess).
+		Bold(true)
+}
 
 // toolBullet is the compact glyph that prefixes collapsed tool summary lines.
 const toolBullet = "▸"

@@ -19,8 +19,14 @@ const (
 	// opening golem never copies the whole event log. It is larger than the
 	// replay cap to leave room for the turn window to find 5 user turns.
 	startupEventScanLimit = 500
-	// startupMaxEventText caps a single replayed event so startup stays fast.
-	startupMaxEventText = 2000
+	// startupMaxTalkText caps a replayed user/agent message. It is generous on
+	// purpose: a long answer cut in half is what made opening golem show only
+	// the *start* of the last response with no way to reach the end. Startup
+	// still bounds the work, but the tail you resume on is kept whole.
+	startupMaxTalkText = 20000
+	// startupMaxToolText caps a replayed tool echo. Raw command output is
+	// background noise at startup and stays browsable via /tree.
+	startupMaxToolText = 2000
 )
 
 // buildStartupEntries builds what the TUI shows when it opens: a header line
@@ -85,11 +91,11 @@ func eventsToEntries(events []fractal.Event) []ChatEntry {
 	for _, ev := range events {
 		switch ev.Kind {
 		case fractal.KindUser:
-			entries = append(entries, ChatEntry{Type: TypeUser, Content: capText(ev.Text)})
+			entries = append(entries, ChatEntry{Type: TypeUser, Content: capText(ev.Text, ev)})
 			lastTool = -1
 
 		case fractal.KindTalk:
-			entries = append(entries, ChatEntry{Type: TypeAgent, Content: capText(ev.Text)})
+			entries = append(entries, ChatEntry{Type: TypeAgent, Content: capText(ev.Text, ev)})
 			lastTool = -1
 
 		case fractal.KindTool:
@@ -102,16 +108,16 @@ func eventsToEntries(events []fractal.Event) []ChatEntry {
 
 		case fractal.KindEcho:
 			if lastTool >= 0 && entries[lastTool].IsRunning {
-				entries[lastTool].Content = capText(stripToolPrefix(ev.Text, entries[lastTool].ToolName))
+				entries[lastTool].Content = capText(stripToolPrefix(ev.Text, entries[lastTool].ToolName), ev)
 				entries[lastTool].IsRunning = false
 				entries[lastTool].ExitCode = 0
 			} else {
-				entries = append(entries, ChatEntry{Type: TypeTool, ToolName: "result", Content: capText(ev.Text), IsRunning: false})
+				entries = append(entries, ChatEntry{Type: TypeTool, ToolName: "result", Content: capText(ev.Text, ev), IsRunning: false})
 			}
 			lastTool = -1
 
 		default: // KindWork and any future kind
-			entries = append(entries, ChatEntry{Type: TypeSystem, Content: capText(ev.Text)})
+			entries = append(entries, ChatEntry{Type: TypeSystem, Content: capText(ev.Text, ev)})
 			lastTool = -1
 		}
 	}
@@ -182,12 +188,21 @@ func humanizeAgo(d time.Duration) string {
 	}
 }
 
-// capText bounds a replayed event's display text.
-func capText(s string) string {
-	if len(s) <= startupMaxEventText {
+// capText bounds a replayed event's display text. Conversation turns keep far
+// more text than tool echoes, and a cut is labelled with the /zoom command that
+// restores the rest, so a truncated replay is never a dead end.
+func capText(s string, ev fractal.Event) string {
+	limit := startupMaxTalkText
+	if ev.Kind != fractal.KindUser && ev.Kind != fractal.KindTalk {
+		limit = startupMaxToolText
+	}
+	if len(s) <= limit {
 		return s
 	}
-	return fractal.TruncateUTF8(s, startupMaxEventText) + "... (truncated)"
+	if ev.ID > 0 {
+		return fractal.TruncateUTF8(s, limit) + fmt.Sprintf("\n\n... (truncated at %d chars - /zoom %d 1 for the rest)", limit, ev.ID)
+	}
+	return fractal.TruncateUTF8(s, limit) + fmt.Sprintf("\n\n... (truncated at %d chars)", limit)
 }
 
 // splitToolEvent splits a logged tool event ("<name>: <args>") into name and

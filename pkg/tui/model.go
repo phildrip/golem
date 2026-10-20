@@ -31,6 +31,19 @@ const (
 	TypeSystem
 )
 
+// Wheel scrolling is rate-limited so high-resolution and free-spinning mice
+// (Logitech "Marathon" style wheels emit dozens of events per flick) cannot race
+// through the conversation faster than it can be read.
+const (
+	// wheelBurst is how many wheel events may be honoured back-to-back before
+	// the limiter starts spacing them out.
+	wheelBurst = 3
+)
+
+// wheelRefillInterval is how much wall-clock time buys one more scroll step. It
+// is a variable so tests can pin the rate deterministically.
+var wheelRefillInterval = 20 * time.Millisecond
+
 // ChatEntry represents a single visual item in the conversation history.
 type ChatEntry struct {
 	Type           MessageType
@@ -124,6 +137,19 @@ type Model struct {
 	streamChan         <-chan tea.Msg
 	isBlurred          bool
 	expandTools        bool
+
+	// mouseEnabled tracks whether the terminal has been asked to send mouse
+	// events to Golem. Ctrl+G toggles it so tmux/terminal scrolling and native
+	// text selection are one keypress away.
+	mouseEnabled bool
+	// wheelTokens/wheelLast implement the token bucket used by wheelScrollLines.
+	wheelTokens float64
+	wheelLast   time.Time
+
+	// startupScrolled records that the first layout pass has already jumped the
+	// conversation viewport to the newest output. Opening golem should show where
+	// you left off, not the top of the replayed history.
+	startupScrolled bool
 }
 
 // NewModel constructs a new Bubbletea TUI model for Golem.
@@ -141,10 +167,7 @@ func NewModel(agentInstance *golem.Agent, store *fractal.Store, viewEngine *frac
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(ColorPrimary)
 
-	renderer, _ := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(80),
-	)
+	renderer := newMarkdownRenderer(80)
 
 	var allEvents []fractal.Event
 	if store != nil {
@@ -182,10 +205,47 @@ func NewModel(agentInstance *golem.Agent, store *fractal.Store, viewEngine *frac
 		currentProfile: currentProfile,
 		inputHistory:   initialHistory,
 		historyIndex:   len(initialHistory),
+		mouseEnabled:   true,
 		memoryStats: memoryStatsMsg{
 			tailLevels: make(map[int]int),
 		},
 	}
+}
+
+// SetMouseEnabled tells the model whether mouse capture is active. The CLI calls
+// this once after NewModel so a --no-mouse start is reflected in the status bar
+// and Ctrl+G re-captures in the right direction.
+func (m *Model) SetMouseEnabled(enabled bool) { m.mouseEnabled = enabled }
+
+// MouseEnabled reports whether mouse capture is currently active.
+func (m Model) MouseEnabled() bool { return m.mouseEnabled }
+
+// setStatus shows a transient status line message for a few seconds.
+func (m *Model) setStatus(text string) {
+	m.statusMessage = text
+	m.statusMessageAt = time.Now()
+}
+
+// wheelScrollLines returns how many lines one wheel event may scroll right now.
+// The token bucket keeps ordinary one-notch-per-press wheels responsive (a fresh
+// notch refills the bucket) while capping a free-spinning wheel at roughly 50
+// lines/second instead of thousands.
+func (m *Model) wheelScrollLines() int {
+	now := time.Now()
+	if m.wheelLast.IsZero() {
+		m.wheelTokens = wheelBurst
+	} else {
+		m.wheelTokens += float64(now.Sub(m.wheelLast)) / float64(wheelRefillInterval)
+		if m.wheelTokens > wheelBurst {
+			m.wheelTokens = wheelBurst
+		}
+	}
+	m.wheelLast = now
+	if m.wheelTokens < 1 {
+		return 0
+	}
+	m.wheelTokens--
+	return 1
 }
 
 // Init sets up initial commands for the model.
@@ -223,56 +283,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.spinner, spCmd = m.spinner.Update(msg)
 
 	switch msg := msg.(type) {
+	case tea.MouseMsg:
+		return m.handleMouse(msg), nil
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
-		m.height = msg.Height
-		headerHeight := 4
-		footerHeight := 6
-		verticalMarginHeight := headerHeight + footerHeight
-
-		if !m.ready {
-			m.viewport = viewport.New(msg.Width, msg.Height-verticalMarginHeight)
-			m.viewport.KeyMap = viewport.KeyMap{}
-			m.viewport.YPosition = headerHeight
-			m.treeViewport = viewport.New(msg.Width-10, msg.Height-8)
-			m.treeViewport.KeyMap = viewport.KeyMap{}
-			m.shortcutsViewport = viewport.New(msg.Width-10, msg.Height-8)
-			m.shortcutsViewport.KeyMap = viewport.KeyMap{}
-			m.mcpViewport = viewport.New(msg.Width-10, msg.Height-8)
-			m.mcpViewport.KeyMap = viewport.KeyMap{}
-			m.profileViewport = viewport.New(msg.Width-10, msg.Height-8)
-			m.profileViewport.KeyMap = viewport.KeyMap{}
-			m.ready = true
-		} else {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height - verticalMarginHeight
-			m.viewport.KeyMap = viewport.KeyMap{}
-			m.treeViewport.Width = msg.Width - 10
-			m.treeViewport.Height = msg.Height - 8
-			m.treeViewport.KeyMap = viewport.KeyMap{}
-			m.shortcutsViewport.Width = msg.Width - 10
-			m.shortcutsViewport.Height = msg.Height - 8
-			m.shortcutsViewport.KeyMap = viewport.KeyMap{}
-			m.mcpViewport.Width = msg.Width - 10
-			m.mcpViewport.Height = msg.Height - 8
-			m.mcpViewport.KeyMap = viewport.KeyMap{}
-			m.profileViewport.Width = msg.Width - 10
-			m.profileViewport.Height = msg.Height - 8
-			m.profileViewport.KeyMap = viewport.KeyMap{}
-		}
-
-		m.textarea.SetWidth(msg.Width - 4)
-
-		if m.renderer != nil {
-			m.renderer, _ = glamour.NewTermRenderer(
-				glamour.WithAutoStyle(),
-				glamour.WithWordWrap(msg.Width-6),
-			)
-		}
-
-		m.renderConversationToViewport()
+		height := msg.Height
+		m.height = height
+		m.relayout()
 
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+g" {
+			// Hand the mouse back to the terminal so tmux copy-mode (or the
+			// terminal's own selection) can scroll the pane, then take it back
+			// for in-app wheel scrolling.
+			m.mouseEnabled = !m.mouseEnabled
+			if m.mouseEnabled {
+				m.setStatus("Mouse capture ON • Ctrl+G releases it for tmux scroll/selection")
+				return m, tea.EnableMouseCellMotion
+			}
+			m.setStatus("Mouse capture OFF • tmux can now scroll/copy • Ctrl+G re-enables")
+			return m, tea.DisableMouse
+		}
+
 		if m.showProfileModal {
 			switch msg.Type {
 			case tea.KeyCtrlC:
@@ -505,6 +538,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyPgDown {
 			m.viewport.HalfViewDown()
 			return m, nil
+		}
+		// Home/End jump to either end of the conversation, but only while the
+		// prompt is empty so line-editing still gets its own Home/End.
+		if strings.TrimSpace(m.textarea.Value()) == "" {
+			switch msg.Type {
+			case tea.KeyHome:
+				m.viewport.GotoTop()
+				return m, nil
+			case tea.KeyEnd:
+				m.viewport.GotoBottom()
+				return m, nil
+			}
 		}
 		if msg.String() == "ctrl+o" {
 			wasAtBottom := m.viewport.AtBottom()
@@ -812,6 +857,49 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(tiCmd, vpCmd, spCmd)
 }
 
+// handleMouse routes wheel events to whichever pane is focused, scrolling it at a
+// human-readable rate (see wheelScrollLines). Click and motion events are
+// ignored: Golem has no mouse-clickable UI, and capturing the wheel only is what
+// keeps text selection workable.
+func (m Model) handleMouse(msg tea.MouseMsg) Model {
+	if msg.Action != tea.MouseActionPress {
+		return m
+	}
+	var up bool
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		up = true
+	case tea.MouseButtonWheelDown:
+		up = false
+	default:
+		return m
+	}
+
+	lines := m.wheelScrollLines()
+	if lines == 0 {
+		return m
+	}
+
+	vp := &m.viewport
+	switch {
+	case m.showProfileModal:
+		vp = &m.profileViewport
+	case m.showShortcutsModal:
+		vp = &m.shortcutsViewport
+	case m.showMCPModal:
+		vp = &m.mcpViewport
+	case m.showTreeModal:
+		vp = &m.treeViewport
+	}
+
+	if up {
+		vp.LineUp(lines)
+	} else {
+		vp.LineDown(lines)
+	}
+	return m
+}
+
 // View renders the complete TUI screen.
 func (m Model) View() string {
 	if !m.ready {
@@ -834,7 +922,24 @@ func (m Model) View() string {
 		return m.renderTreeModalView()
 	}
 
-	// 1. Header
+	frame := lipgloss.JoinVertical(
+		lipgloss.Left,
+		m.renderHeader(),
+		m.viewport.View(),
+		m.renderFooter(),
+	)
+
+	// Last line of defence: a single over-wide line makes the terminal wrap it,
+	// which pushes the frame past the pane height (and tmux scrolls the screen).
+	if m.width > 0 {
+		frame = lipgloss.NewStyle().MaxWidth(m.width).Render(frame)
+	}
+	return frame
+}
+
+// renderHeader builds the title bar and memory minimap above the conversation.
+// relayout measures its height, so don't hard-code assumptions about it here.
+func (m Model) renderHeader() string {
 	title := HeaderTitleStyle.Render("GOLEM")
 	profStr := m.currentProfile
 	if profStr == "" {
@@ -853,16 +958,26 @@ func (m Model) View() string {
 	sub := HeaderSubStyle.Render(fmt.Sprintf(" [%s | %s:%s] • Fractal Memory", profStr, provStr, modelStr))
 	minimap := RenderMemoryMinimap(m.memoryStats.totalEvents, m.memoryStats.tailLevels, m.memoryStats.liveCount, false)
 
-	header := lipgloss.JoinVertical(
+	// Both header lines are clipped to the pane: a header that wraps costs a
+	// row and makes the frame taller than the terminal, which tmux answers by
+	// scrolling the whole screen.
+	if avail := m.width - lipgloss.Width(title); m.width > 0 && avail >= 0 {
+		sub = lipgloss.NewStyle().MaxWidth(avail).Render(sub)
+	}
+	if m.width > 0 {
+		minimap = lipgloss.NewStyle().MaxWidth(m.width).Render(minimap)
+	}
+
+	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		lipgloss.JoinHorizontal(lipgloss.Center, title, sub),
 		StatusBarMemoryStyle.Render(minimap),
 	)
+}
 
-	// 2. Viewport
-	body := m.viewport.View()
-
-	// 3. Footer & Input Area
+// renderFooter builds the input box plus the status/key-hint line. relayout
+// measures its height too, so the frame always fits the pane exactly.
+func (m Model) renderFooter() string {
 	inputBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(ColorBorder).
@@ -877,22 +992,34 @@ func (m Model) View() string {
 		val := m.textarea.Value()
 		if strings.HasPrefix(val, "/") {
 			statusLine = m.renderSlashCommandHelp(val)
+		} else if !m.viewport.AtBottom() {
+			// Scrolled up with the newest output off-screen: say how to get back.
+			hints := hintLine(m.width-4,
+				"↑ scrolled up (End: newest)", "PgUp/PgDn: Scroll", "Home: Top", "Ctrl+O: Tools")
+			statusLine = StatusBarKeyHintStyle.Render("[" + hints + "]")
 		} else {
-			statusLine = StatusBarKeyHintStyle.Render("[Enter: Send • ↑/↓: History • Ctrl+O: Tools • Ctrl+K: Shortcuts • Ctrl+C: Clear • Ctrl+D: Exit]")
+			// Ordered by importance: a narrow terminal keeps the scrolling and
+			// mouse-escape hints and drops the rest.
+			budget := m.width - 4
+			badge := ""
+			if !m.mouseEnabled {
+				badge = "[MOUSE OFF] "
+				budget -= lipgloss.Width(badge)
+			}
+			hints := hintLine(budget,
+				"Enter: Send", "PgUp/PgDn: Scroll", "Ctrl+O: Tools", "Ctrl+G: Mouse",
+				"Home/End: Top/Newest", "↑/↓: History", "Ctrl+K: Shortcuts", "Ctrl+C: Clear", "Ctrl+D: Exit")
+			statusLine = StatusBarKeyHintStyle.Render("[" + hints + "]")
+			if badge != "" {
+				statusLine = lipgloss.NewStyle().Foreground(ColorWarning).Render(badge) + statusLine
+			}
 		}
 	}
 
-	footer := lipgloss.JoinVertical(
+	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		inputBox,
 		statusLine,
-	)
-
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		header,
-		body,
-		footer,
 	)
 }
 
@@ -958,6 +1085,106 @@ func (m *Model) renderConversationToViewport() {
 	}
 
 	m.viewport.SetContent(sb.String())
+}
+
+// relayout recomputes the entire screen layout for the current terminal size.
+// Bubbletea delivers a WindowSizeMsg whenever the window changes size — a tmux
+// pane split, a terminal drag, a font change — so everything is rebuilt here:
+// header/footer are measured, short lines below the footer change the body
+// height, the markdown renderer is re-created at the new width (otherwise the
+// conversation stays wrapped for the old pane), and the conversation is
+// re-rendered while keeping the reader where they were.
+func (m *Model) relayout() {
+	if m.width <= 0 || m.height <= 0 {
+		return
+	}
+
+	// Measure the chrome instead of assuming it: a wrapped header or a
+	// two-line status line otherwise pushes the frame past the pane height and
+	// makes tmux scroll the whole screen.
+	headerH := lipgloss.Height(m.renderHeader())
+	footerH := lipgloss.Height(m.renderFooter())
+	bodyH := m.height - headerH - footerH
+	if bodyH < 1 {
+		bodyH = 1
+	}
+	modalW := max(20, m.width-10)
+	modalH := max(5, m.height-8)
+
+	if !m.ready {
+		m.viewport = viewport.New(m.width, bodyH)
+		m.treeViewport = viewport.New(modalW, modalH)
+		m.shortcutsViewport = viewport.New(modalW, modalH)
+		m.mcpViewport = viewport.New(modalW, modalH)
+		m.profileViewport = viewport.New(modalW, modalH)
+		m.ready = true
+	}
+
+	// Remember the reading position before the content re-wraps: after a width
+	// change the same YOffset points at a different line, so a raw offset would
+	// silently move the reader.
+	wasAtBottom := !m.startupScrolled || m.viewport.AtBottom()
+	prevOffset := m.viewport.YOffset
+	prevMax := max(0, m.viewport.TotalLineCount()-m.viewport.Height)
+
+	m.viewport.Width = m.width
+	m.viewport.Height = bodyH
+	m.viewport.YPosition = headerH
+	m.viewport.KeyMap = viewport.KeyMap{}
+	// Wheel events are consumed by handleMouse so the scroll rate can be
+	// limited; letting the viewports also handle them would double-count.
+	m.viewport.MouseWheelEnabled = false
+
+	for _, vp := range []*viewport.Model{&m.treeViewport, &m.shortcutsViewport, &m.mcpViewport, &m.profileViewport} {
+		vp.Width = modalW
+		vp.Height = modalH
+		vp.KeyMap = viewport.KeyMap{}
+		vp.MouseWheelEnabled = false
+	}
+
+	m.textarea.SetWidth(max(20, m.width-4))
+	m.renderer = newMarkdownRenderer(m.width - 6)
+
+	m.renderConversationToViewport()
+
+	switch {
+	case wasAtBottom:
+		// Pinned to the newest output stays pinned. This also covers the first
+		// layout pass, which must land on the end of the restored conversation.
+		m.viewport.GotoBottom()
+	case prevMax > 0 && prevOffset > 0:
+		// Scrolled up: keep the same relative position in the transcript.
+		newMax := max(0, m.viewport.TotalLineCount()-m.viewport.Height)
+		m.viewport.SetYOffset((prevOffset*newMax + prevMax/2) / prevMax)
+	default:
+		m.viewport.GotoTop()
+	}
+	m.startupScrolled = true
+}
+
+// hintLine joins as many key hints as fit within width, so a narrow terminal
+// drops the least important hints instead of cutting the footer mid-word.
+func hintLine(width int, hints ...string) string {
+	if width <= 0 {
+		return strings.Join(hints, " • ")
+	}
+	var b strings.Builder
+	used := 0
+	for i, h := range hints {
+		add := lipgloss.Width(h)
+		if i > 0 {
+			add += lipgloss.Width(" • ")
+		}
+		if used > 0 && used+add > width {
+			break
+		}
+		if i > 0 {
+			b.WriteString(" • ")
+		}
+		b.WriteString(h)
+		used += add
+	}
+	return b.String()
 }
 
 // renderAndFollow re-renders the conversation and, if the viewport is already at
@@ -1333,7 +1560,8 @@ func (m Model) generateShortcutsVisual() string {
 				{"Ctrl+↓ / Shift+↓", "Scroll down", "Scrolls conversation viewport down by 2 lines"},
 				{"PgUp / Ctrl+U", "Half page up", "Scrolls conversation viewport up by half a page (when blurred)"},
 				{"PgDn / Ctrl+D", "Half page down", "Scrolls conversation viewport down by half a page (when blurred)"},
-				{"Mouse wheel", "Scroll", "Scrolls the conversation (disable capture with --no-mouse)"},
+				{"Mouse wheel", "Scroll", "Scrolls the conversation; rate-limited so free-spinning wheels stay readable"},
+				{"Ctrl+G", "Mouse capture on/off", "Release the mouse to tmux/terminal for pane scrolling and copy-mode"},
 			},
 		},
 		{

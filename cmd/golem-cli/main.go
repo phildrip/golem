@@ -35,6 +35,8 @@ type CLIOptions struct {
 	NoTUI             bool
 	TUI               bool
 	NoMouse           bool
+	Mouse             bool
+	Theme             string
 	Serve             bool
 	WebPort           int
 	Import            string
@@ -60,6 +62,8 @@ func parseFlags(args []string) (CLIOptions, error) {
 	noTuiFlag := fs.Bool("no-tui", false, "Disable rich TUI and fall back to standard readline CLI")
 	tuiFlag := fs.Bool("tui", false, "Force enable rich TUI even if terminal detection is ambiguous")
 	noMouseFlag := fs.Bool("no-mouse", false, "Disable mouse capture in the TUI (restores native terminal/tmux text selection)")
+	mouseFlag := fs.Bool("mouse", false, "Force mouse capture inside tmux/screen (in-app wheel scrolling instead of pane copy-mode)")
+	themeFlag := fs.String("theme", "", "TUI palette: 'terminal' (default, uses your terminal's own colours) or 'nord' (bundled, adaptive)")
 	serveFlag := fs.Bool("serve", false, "Launch realtime Web UI multiplexer server")
 	webFlag := fs.Bool("web", false, "Launch realtime Web UI multiplexer server (alias for -serve)")
 	portFlag := fs.Int("port", 8080, "Port for realtime Web UI server (default: 8080)")
@@ -82,6 +86,8 @@ func parseFlags(args []string) (CLIOptions, error) {
 		NoTUI:             *noTuiFlag,
 		TUI:               *tuiFlag,
 		NoMouse:           *noMouseFlag,
+		Mouse:             *mouseFlag,
+		Theme:             *themeFlag,
 		Serve:             *serveFlag || *webFlag,
 		WebPort:           *portFlag,
 		Import:            *importFlag,
@@ -93,6 +99,18 @@ func parseFlags(args []string) (CLIOptions, error) {
 // determineUseTUI decides whether to activate the full-screen Bubbletea TUI.
 func determineUseTUI(isTTY, forceTUI, disableTUI bool) bool {
 	return (forceTUI || isTTY) && !disableTUI
+}
+
+// shouldCaptureMouse decides whether the TUI grabs the mouse at startup.
+//
+// Capture is the default everywhere, including inside tmux/screen: golem is a
+// full-screen (alternate-screen) app, so the pane has no scrollback for the
+// multiplexer copy-mode to reveal - releasing the mouse there only makes the
+// wheel do nothing. With capture on, the wheel scrolls golem's own conversation
+// viewport (rate-limited). Ctrl+G hands the mouse back to tmux/terminal for
+// copy-mode and native selection, and -no-mouse starts with it released.
+func shouldCaptureMouse(opts CLIOptions) bool {
+	return !opts.NoMouse
 }
 
 // buildConfig merges default settings, stored config file, and flag overrides.
@@ -317,19 +335,29 @@ func main() {
 	}
 
 	if useTUI {
+		// Palette selection: -theme wins, then $GOLEM_THEME, then the default
+		// "terminal" palette, which inherits the user's own terminal scheme.
+		theme := strings.TrimSpace(opts.Theme)
+		if theme == "" {
+			theme = strings.TrimSpace(os.Getenv("GOLEM_THEME"))
+		}
+		if err := tui.ApplyTheme(theme); err != nil {
+			log.Printf("TUI theme: %v — falling back to %q", err, tui.CurrentTheme())
+		}
+
 		programOpts := []tea.ProgramOption{
 			tea.WithAltScreen(),
 			tea.WithReportFocus(),
 		}
-		// Enable in-app mouse wheel scrolling unless the user opts out (tmux
-		// users sometimes prefer native pane copy/selection over mouse capture).
-		if !opts.NoMouse {
+		// In-app mouse wheel scrolling is the default; Ctrl+G releases the mouse
+		// for tmux copy-mode / native selection, -no-mouse starts released.
+		captureMouse := shouldCaptureMouse(opts)
+		if captureMouse {
 			programOpts = append(programOpts, tea.WithMouseCellMotion())
 		}
-		p := tea.NewProgram(
-			tui.NewModel(agentInstance, agentInstance.Store(), agentInstance.View()),
-			programOpts...,
-		)
+		model := tui.NewModel(agentInstance, agentInstance.Store(), agentInstance.View())
+		model.SetMouseEnabled(captureMouse)
+		p := tea.NewProgram(model, programOpts...)
 		if _, err := p.Run(); err != nil {
 			log.Fatalf("Error running Golem TUI: %v", err)
 		}

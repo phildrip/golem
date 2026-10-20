@@ -99,7 +99,7 @@ The Web UI cockpit renders the live agent hierarchy, the message traffic between
 - `shell` — run commands, capture stdout/stderr and exit code.
 
 **Interfaces**
-- **TUI** (Bubble Tea): streaming chat, collapsible tool-call cards (`Ctrl+O`), memory-tree explorer (`Ctrl+T`), shortcuts popup (`Ctrl+K`), MCP panel, profile switcher, slash commands.
+- **TUI** (Bubble Tea): streaming chat, collapsible tool-call cards (`Ctrl+O`), memory-tree explorer (`Ctrl+T`), shortcuts popup (`Ctrl+K`), MCP panel, profile switcher, slash commands. Colours come from your terminal's own palette by default (`-theme nord` for the bundled palette), the wheel scroll rate is rate-limited so free-spinning mice stay readable, and the conversation opens on the newest output (`End` jumps there, `Home` to the top, `PgUp`/`PgDn` page). `Ctrl+G` hands the mouse to tmux/your terminal for copy-mode and native selection; golem keeps the wheel for its own scrolling even inside tmux, because a full-screen app leaves the pane no scrollback for copy-mode to reveal.
 - **Readline CLI** for piping and non-interactive use.
 - **Web UI cockpit** (`-serve` / `-web`): parallel session tabs over WebSocket, swarm hierarchy view, and a fractal memory explorer. The SvelteKit SPA is embedded into the Go binary.
 
@@ -192,7 +192,9 @@ Example `~/.golem/config.json`:
 | `-import pick\|latest\|<id>` | Import past session history |
 | `-no-tui` / `-tui` | Force plain CLI / force TUI |
 | `-serve` / `-web` / `-port <n>` | Web UI cockpit (default port 8080) |
-| `-no-mouse` | Disable in-TUI mouse capture (restores native terminal/tmux text selection) |
+| `-no-mouse` | Start with in-TUI mouse capture off (restores native terminal/tmux text selection; toggle at runtime with `Ctrl+G`) |
+| `-mouse` | Explicitly keep in-TUI mouse capture on, including inside tmux/screen (this is already the default; scroll keys always work regardless) |
+| `-theme terminal\|nord` | TUI palette: `terminal` (default, inherits your terminal's colours and light/dark mode) or `nord` (bundled, adaptive). Also readable from `$GOLEM_THEME` |
 
 ## Architecture
 
