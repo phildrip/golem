@@ -879,6 +879,20 @@ func (a *Agent) Process(ctx context.Context, input string) (string, error) {
 
 // ProcessStream handles a user turn with streaming chunks and live tool notifications.
 func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamHandler) (string, error) {
+	return a.ProcessStreamImages(ctx, input, nil, handler)
+}
+
+// ProcessStreamImages is ProcessStream with images attached to the turn. The
+// prompt text (which carries the TUI's image chips) is what gets logged to
+// fractal memory; the image bytes ride along with this turn's model request only.
+func (a *Agent) ProcessStreamImages(ctx context.Context, input string, images []ImageInput, handler StreamHandler) (string, error) {
+	// Build the turn content first: a bad attachment must fail before the turn is
+	// logged, so memory never records a prompt that was never sent.
+	content, err := buildUserContent(input, images)
+	if err != nil {
+		return "", errors.Wrap(err, "preparing image input")
+	}
+
 	a.activeHandlerMu.Lock()
 	a.activeHandler = handler
 	a.activeHandlerMu.Unlock()
@@ -903,8 +917,7 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 	// Sync view
 	a.view.Sync()
 
-	// 2. Prepare GenAI content input
-	content := genai.Text(input)[0]
+	// 2. Content was prepared above (text + any inline images).
 
 	// 3. Execute ADK runner with retry for transient server spikes (503 / 429)
 	var finalResponse string

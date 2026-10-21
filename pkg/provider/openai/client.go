@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -104,11 +105,53 @@ func (c *Client) Name() string {
 
 // OpenAIChatMessage represents a message in the OpenAI chat format.
 type openAIChatMessage struct {
-	Role             string           `json:"role"`
-	Content          string           `json:"content,omitempty"`
+	Role string `json:"role"`
+	// Content is either a plain string or, for a turn that carries images, a
+	// content-parts array (OpenAI-compatible multimodal wire format).
+	Content          any              `json:"content,omitempty"`
 	ReasoningContent *string          `json:"reasoning_content,omitempty"`
 	ToolCalls        []openAIToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string           `json:"tool_call_id,omitempty"`
+}
+
+// openAIContentPart is one element of a multimodal content array.
+type openAIContentPart struct {
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	ImageURL *openAIImageURL `json:"image_url,omitempty"`
+}
+
+// openAIImageURL carries an image as an inline data URL.
+type openAIImageURL struct {
+	URL string `json:"url"`
+}
+
+// imageDataURL encodes image bytes as a data: URL, which is what every
+// OpenAI-compatible vision API accepts for inline images.
+func imageDataURL(mimeType string, data []byte) string {
+	if mimeType == "" {
+		mimeType = "image/png"
+	}
+	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
+}
+
+// multimodalContent builds the content-parts array for a turn with images. The
+// text comes first so providers keep the ordering they expect.
+func multimodalContent(text string, images []*genai.Blob) []openAIContentPart {
+	parts := make([]openAIContentPart, 0, len(images)+1)
+	if text != "" {
+		parts = append(parts, openAIContentPart{Type: "text", Text: text})
+	}
+	for _, blob := range images {
+		if blob == nil || len(blob.Data) == 0 {
+			continue
+		}
+		parts = append(parts, openAIContentPart{
+			Type:     "image_url",
+			ImageURL: &openAIImageURL{URL: imageDataURL(blob.MIMEType, blob.Data)},
+		})
+	}
+	return parts
 }
 
 type openAIToolCall struct {
@@ -362,6 +405,7 @@ func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChat
 		var reasoningBuilder strings.Builder
 		var toolCalls []openAIToolCall
 		var toolResponses []*genai.FunctionResponse
+		var images []*genai.Blob
 
 		for _, part := range content.Parts {
 			if part == nil {
@@ -390,6 +434,9 @@ func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChat
 			}
 			if part.FunctionResponse != nil {
 				toolResponses = append(toolResponses, part.FunctionResponse)
+			}
+			if part.InlineData != nil && len(part.InlineData.Data) > 0 {
+				images = append(images, part.InlineData)
 			}
 		}
 
@@ -436,9 +483,15 @@ func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChat
 
 		msg := openAIChatMessage{
 			Role:             role,
-			Content:          textBuilder.String(),
 			ReasoningContent: rcPtr,
 			ToolCalls:        toolCalls,
+		}
+		if len(images) > 0 && role == "user" {
+			// A user turn with images goes out as a content-parts array; there is
+			// no way to express an inline image in a plain string.
+			msg.Content = multimodalContent(textBuilder.String(), images)
+		} else if text := textBuilder.String(); text != "" {
+			msg.Content = text
 		}
 		chatReq.Messages = append(chatReq.Messages, msg)
 	}

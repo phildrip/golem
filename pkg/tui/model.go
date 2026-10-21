@@ -60,6 +60,12 @@ type ChatEntry struct {
 // Custom Bubbletea Messages
 type agentChunkMsg string
 
+// attachMsg carries the result of a clipboard grab (or a rejected image file).
+type attachMsg struct {
+	attachment Attachment
+	err        error
+}
+
 type toolStartMsg struct {
 	toolName string
 	command  string
@@ -150,6 +156,9 @@ type Model struct {
 	// conversation viewport to the newest output. Opening golem should show where
 	// you left off, not the top of the replayed history.
 	startupScrolled bool
+
+	// attachments are images waiting to ride along with the next turn.
+	attachments []Attachment
 }
 
 // NewModel constructs a new Bubbletea TUI model for Golem.
@@ -304,6 +313,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.setStatus("Mouse capture OFF • tmux can now scroll/copy • Ctrl+G re-enables")
 			return m, tea.DisableMouse
+		}
+
+		if msg.String() == "ctrl+v" {
+			// Grab a clipboard image. When the clipboard holds no image the key
+			// falls through to the textarea's own text paste (see attachMsg).
+			return m, m.grabClipboardImageCmd()
+		}
+
+		if msg.String() == "ctrl+x" && len(m.attachments) > 0 {
+			m.attachments = nil
+			m.setStatus("Attachments cleared")
+			return m, nil
 		}
 
 		if m.showProfileModal {
@@ -703,9 +724,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			input := strings.TrimSpace(m.textarea.Value())
-			if input == "" {
+
+			// A drag & drop, or a typed path, attaches its image files here so
+			// both routes behave exactly like a clipboard grab.
+			for _, path := range imagePathsIn(input) {
+				m.attachImagePath(path)
+			}
+
+			if input == "" && len(m.attachments) == 0 {
 				m.textarea.Reset()
 				return m, nil
+			}
+			if input == "" {
+				input = defaultImagePrompt
 			}
 
 			// Record into prompt history if non-empty and not identical to last entry
@@ -716,19 +747,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.currentDraft = ""
 
 			// Handle slash commands
-			if strings.HasPrefix(input, "/") {
+			if strings.HasPrefix(input, "/") && len(m.attachments) == 0 {
 				m.textarea.Reset()
 				return m.handleSlashCommand(input)
 			}
 
-			// Normal turn submission
+			// Normal turn submission. The chips are part of the logged text: the
+			// image bytes are not, so this is what the transcript keeps.
+			message := composeTurnText(input, m.attachments)
+			images := imagesForTurn(m.attachments)
+			m.attachments = nil
+
 			m.textarea.Reset()
 			m.isLoading = true
 			m.streamingReply = ""
 
 			m.entries = append(m.entries, ChatEntry{
 				Type:    TypeUser,
-				Content: input,
+				Content: message,
 			})
 			m.renderConversationToViewport()
 			m.viewport.GotoBottom()
@@ -736,7 +772,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ctx, cancel := context.WithCancel(context.Background())
 			m.cancelTurn = cancel
 
-			turnCmd := m.runAgentTurnCmd(ctx, input)
+			turnCmd := m.runAgentTurnCmd(ctx, message, images)
 
 			return m, tea.Batch(
 				turnCmd,
@@ -745,6 +781,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.textarea, tiCmd = m.textarea.Update(msg)
+
+	case attachMsg:
+		if msg.err != nil {
+			if errors.Is(msg.err, errNoClipboardImage) {
+				// No image on the clipboard: the key still means "paste", so hand
+				// it to the textarea and let it paste text.
+				m.textarea, tiCmd = m.textarea.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
+				return m, tiCmd
+			}
+			m.setStatus("Attach failed: " + msg.err.Error())
+			return m, nil
+		}
+		if err := m.addAttachment(msg.attachment); err != nil {
+			m.setStatus("Attach failed: " + err.Error())
+			return m, nil
+		}
+		m.setStatus(fmt.Sprintf("Attached %s • Ctrl+V: another • Ctrl+X: clear",
+			msg.attachment.Chip(len(m.attachments))))
+		return m, nil
 
 	case agentChunkMsg:
 		m.streamingReply += string(msg)
@@ -1008,7 +1063,8 @@ func (m Model) renderFooter() string {
 			}
 			hints := hintLine(budget,
 				"Enter: Send", "PgUp/PgDn: Scroll", "Ctrl+O: Tools", "Ctrl+G: Mouse",
-				"Home/End: Top/Newest", "↑/↓: History", "Ctrl+K: Shortcuts", "Ctrl+C: Clear", "Ctrl+D: Exit")
+				"Ctrl+V: Image", "Home/End: Top/Newest", "↑/↓: History", "Ctrl+K: Shortcuts",
+				"Ctrl+C: Clear", "Ctrl+D: Exit")
 			statusLine = StatusBarKeyHintStyle.Render("[" + hints + "]")
 			if badge != "" {
 				statusLine = lipgloss.NewStyle().Foreground(ColorWarning).Render(badge) + statusLine
@@ -1016,11 +1072,27 @@ func (m Model) renderFooter() string {
 		}
 	}
 
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		inputBox,
-		statusLine,
-	)
+	rows := make([]string, 0, 3)
+	if line := m.renderAttachmentLine(); line != "" {
+		rows = append(rows, line)
+	}
+	rows = append(rows, inputBox, statusLine)
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
+
+// renderAttachmentLine shows the images waiting to be sent, just above the input
+// box, with their chips and the keys that manage them.
+func (m Model) renderAttachmentLine() string {
+	if len(m.attachments) == 0 {
+		return ""
+	}
+	chips := lipgloss.NewStyle().Foreground(ColorSuccess).Render(attachmentsChipLine(m.attachments))
+	hint := lipgloss.NewStyle().Foreground(ColorMuted).Render("Ctrl+V: add • Ctrl+X: clear")
+	line := chips + " " + hint
+	if m.width > 0 {
+		line = lipgloss.NewStyle().MaxWidth(m.width - 2).Render(line)
+	}
+	return line
 }
 
 // renderConversationToViewport re-renders formatted conversation history into the viewport.
@@ -1036,7 +1108,7 @@ func (m *Model) renderConversationToViewport() {
 		switch entry.Type {
 		case TypeUser:
 			sb.WriteString(UserBadgeStyle.Render("YOU") + "\n")
-			sb.WriteString(lipgloss.NewStyle().Foreground(ColorHighlight).Render(entry.Content) + "\n\n")
+			sb.WriteString(renderUserContent(entry.Content) + "\n\n")
 
 		case TypeAgent:
 			sb.WriteString(AgentBadgeStyle.Render("GOLEM") + "\n")
@@ -1286,7 +1358,7 @@ func listenStreamCmd(msgChan <-chan tea.Msg) tea.Cmd {
 }
 
 // runAgentTurnCmd launches an agent turn in a background goroutine with streaming.
-func (m *Model) runAgentTurnCmd(ctx context.Context, input string) tea.Cmd {
+func (m *Model) runAgentTurnCmd(ctx context.Context, input string, images []golem.ImageInput) tea.Cmd {
 	msgChan := make(chan tea.Msg, 2048)
 	m.streamChan = msgChan
 	bridge := &tuiStreamBridge{
@@ -1308,7 +1380,7 @@ func (m *Model) runAgentTurnCmd(ctx context.Context, input string) tea.Cmd {
 			}
 		}()
 
-		reply, err := m.agent.ProcessStream(ctx, input, bridge)
+		reply, err := m.agent.ProcessStreamImages(ctx, input, images, bridge)
 		select {
 		case <-ctx.Done():
 		case msgChan <- agentDoneMsg{
