@@ -40,6 +40,16 @@ const (
 	wheelBurst = 3
 )
 
+// The draft box starts at a single line so the conversation gets every row the
+// pane can spare, and grows only while there is something to show.
+const (
+	// inputMinRows is the resting height of the prompt.
+	inputMinRows = 1
+	// inputMaxRows caps the growth: past this the textarea scrolls its own
+	// content instead of squeezing the transcript out of the pane.
+	inputMaxRows = 10
+)
+
 // wheelRefillInterval is how much wall-clock time buys one more scroll step. It
 // is a variable so tests can pin the rate deterministically.
 var wheelRefillInterval = 20 * time.Millisecond
@@ -181,7 +191,7 @@ func NewModel(agentInstance *golem.Agent, store *fractal.Store, viewEngine *frac
 	ta.Prompt = "> "
 	ta.CharLimit = 4000
 	ta.SetWidth(80)
-	ta.SetHeight(3)
+	ta.SetHeight(inputMinRows)
 	ta.ShowLineNumbers = false
 
 	sp := spinner.New()
@@ -280,6 +290,20 @@ func (m Model) Init() tea.Cmd {
 
 // Update handles incoming messages and terminal events.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	// Every path through update can change the draft (typing, paste, history
+	// recall, submit), so the box height is reconciled once here instead of at
+	// each return site.
+	if mm, ok := next.(Model); ok {
+		mm.syncInputHeight()
+		next = mm
+	}
+	return next, cmd
+}
+
+// update is the real message loop; Update wraps it so the draft box can be
+// resized after any branch, including the ones that return early.
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		tiCmd tea.Cmd
 		vpCmd tea.Cmd
@@ -623,6 +647,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+		if msg.String() == "ctrl+j" {
+			// Readline-style newline: break the draft instead of sending it. The
+			// box grows to show the extra line (see Update).
+			m.textarea.InsertString("\n")
+			m.resetSlashState()
+			return m, nil
+		}
 		if msg.String() == "ctrl+o" {
 			wasAtBottom := m.viewport.AtBottom()
 			m.expandTools = !m.expandTools
@@ -770,6 +801,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case tea.KeyEnter:
+			if msg.Alt {
+				// Alt+Enter breaks the line; bare Enter sends the turn.
+				m.textarea.InsertString("\n")
+				m.resetSlashState()
+				return m, nil
+			}
 			if m.isLoading {
 				return m, nil
 			}
@@ -1242,6 +1279,73 @@ func (m *Model) renderConversationToViewport() {
 	m.viewport.SetContent(sb.String())
 }
 
+// inputRowBudget is the tallest the draft box may get: a third of the pane,
+// and always at least one line.
+func (m Model) inputRowBudget() int {
+	if m.height <= 0 {
+		return inputMaxRows
+	}
+	return max(inputMinRows, min(inputMaxRows, m.height/3))
+}
+
+// inputTargetRows is how tall the draft box wants to be for what it holds now.
+func (m Model) inputTargetRows() int {
+	return max(inputMinRows, min(m.inputRows(), m.inputRowBudget()))
+}
+
+// inputRows counts the rows the draft needs once word-wrapped to the textarea's
+// width. Enter sends, so multi-line drafts mostly arrive by paste or with
+// Alt+Enter; the box grows to show them instead of hiding all but the last row.
+func (m Model) inputRows() int {
+	width := m.textarea.Width()
+	if width < 1 {
+		width = 1
+	}
+	rows := 0
+	for _, line := range strings.Split(m.textarea.Value(), "\n") {
+		rows += wrappedRows(line, width)
+	}
+	return max(inputMinRows, rows)
+}
+
+// wrappedRows counts the display rows one logical line occupies at width, using
+// the same greedy word wrap the textarea applies.
+func wrappedRows(line string, width int) int {
+	if width < 1 {
+		width = 1
+	}
+	rows, used := 1, 0
+	for _, word := range strings.Fields(line) {
+		w := lipgloss.Width(word)
+		if used > 0 && used+1+w <= width {
+			used += 1 + w
+			continue
+		}
+		if used > 0 {
+			rows++
+			used = 0
+		}
+		used = w
+		for used > width {
+			rows++
+			used -= width
+		}
+	}
+	return rows
+}
+
+// syncInputHeight grows or shrinks the draft box to fit its content and re-flows
+// the frame, because the conversation gives up (or wins back) those rows.
+func (m *Model) syncInputHeight() {
+	if !m.ready {
+		return
+	}
+	if m.textarea.Height() == m.inputTargetRows() {
+		return
+	}
+	m.relayout()
+}
+
 // relayout recomputes the entire screen layout for the current terminal size.
 // Bubbletea delivers a WindowSizeMsg whenever the window changes size — a tmux
 // pane split, a terminal drag, a font change — so everything is rebuilt here:
@@ -1253,6 +1357,12 @@ func (m *Model) relayout() {
 	if m.width <= 0 || m.height <= 0 {
 		return
 	}
+
+	// Size the prompt before anything is measured: it grows and shrinks with
+	// its content, and the footer measurement below has to see the real height
+	// or the conversation would be laid out for a box that no longer exists.
+	m.textarea.SetWidth(max(20, m.width-4))
+	m.textarea.SetHeight(m.inputTargetRows())
 
 	// Measure the chrome instead of assuming it: a wrapped header or a
 	// two-line status line otherwise pushes the frame past the pane height and
@@ -1298,7 +1408,6 @@ func (m *Model) relayout() {
 		vp.MouseWheelEnabled = false
 	}
 
-	m.textarea.SetWidth(max(20, m.width-4))
 	m.renderer = newMarkdownRenderer(m.width - 6)
 
 	m.renderConversationToViewport()
