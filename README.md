@@ -99,13 +99,21 @@ The Web UI cockpit renders the live agent hierarchy, the message traffic between
 - `shell` — run commands, capture stdout/stderr and exit code.
 
 **Interfaces**
-- **TUI** (Bubble Tea): streaming chat, collapsible tool-call cards (`Ctrl+O`), memory-tree explorer (`Ctrl+T`), shortcuts popup (`Ctrl+K`), MCP panel, profile switcher, slash commands. Colours come from your terminal's own palette by default (`-theme nord` for the bundled palette), the wheel scroll rate is rate-limited so free-spinning mice stay readable, and the conversation opens on the newest output (`End` jumps there, `Home` to the top, `PgUp`/`PgDn` page). `Ctrl+G` hands the mouse to tmux/your terminal for copy-mode and native selection; golem keeps the wheel for its own scrolling even inside tmux, because a full-screen app leaves the pane no scrollback for copy-mode to reveal.
+- **TUI** (Bubble Tea): streaming chat, collapsible tool-call cards (`Ctrl+O`), memory-tree explorer (`Ctrl+T`), shortcuts popup (`Ctrl+K`), MCP panel, profile switcher, slash commands with a live completion popup (`/` then `Tab`, `↑`/`↓`, `Enter`). Colours come from your terminal's own palette by default (`-theme nord` for the bundled palette), the wheel scroll rate is rate-limited so free-spinning mice stay readable, and the conversation opens on the newest output (`End` jumps there, `Home` to the top, `PgUp`/`PgDn` page). `Ctrl+G` hands the mouse to tmux/your terminal for copy-mode and native selection; golem keeps the wheel for its own scrolling even inside tmux, because a full-screen app leaves the pane no scrollback for copy-mode to reveal.
 - **Images in the TUI**: `Ctrl+V` grabs a clipboard image — golem reads the clipboard itself (Wayland `wl-paste`, X11 `xclip`, macOS `pngpaste`), so tmux/terminal paste bindings don't matter — and dropping or typing an image path (`/tmp/shot.png`) attaches that file instead. `Ctrl+X` clears the queue. Attached images ride along with that turn as inline data for vision models; the transcript keeps the text chip (`[img 1: shot.png 1440x900 212KB]`) and the bytes are copied to `<memory-dir>/attachments/`, because fractal memory is a text log. The model is asked to say what it took from each image, so the picture stays recoverable from the text transcript after a restart.
 - **Readline CLI** for piping and non-interactive use.
 - **Web UI cockpit** (`-serve` / `-web`): parallel session tabs over WebSocket, swarm hierarchy view, and a fractal memory explorer. The SvelteKit SPA is embedded into the Go binary.
 
+**Slash commands (TUI)**
+- Type `/` and the command palette opens above the prompt as you type: `Tab` completes the highlighted command, `↑`/`↓` move the highlight, `Enter` takes it, `Esc` dismisses. Once the command is complete (or arguments start) `Enter` runs it.
+- `/model` opens a **model picker** with the provider's own model list (OpenAI-compatible providers are asked for `/models`; Gemini is asked for `generativelanguage.googleapis.com`). The list is fetched live, falls back to a bundled shortlist when the provider is unreachable (the modal says which), marks the current model, and switches on `Enter` — no restart, same provider, credentials and memory mounts. `↑`/`↓` (or `j`/`k`) choose, `PgUp`/`PgDn` page, `Esc`/`q` closes.
+- `/model <name>` skips the picker and switches straight to a named model **after checking the name against the provider's list**: an exact match wins, a unique prefix is accepted (`/model deepseek-v4.1-f`), and anything else is refused with the closest real names (`Did you mean: …`) instead of leaving you on a model that fails mid-conversation. When the provider cannot be reached the name cannot be verified, so the switch still happens and says so.
+- `/profile [name]` inspects profiles, or switches profile — and with it provider, model, memory dir and compactor settings.
+- `/remember`, `/tree` (`/memory`), `/zoom <id> <n>`, `/compact`, `/clear`, `/tools`, `/mcp`, `/shortcuts`, `/help`, `/exit`.
+
 **Models & providers**
 - Gemini (default), plus any **OpenAI-compatible** endpoint: OpenCode Go, OpenAI, OpenRouter, or a local server via `--base-url`.
+- Switch model at runtime from the `/model` picker (or with `/model <name>` / `-model <name>` at startup); switch provider + model + memory together with a profile.
 - Dedicated provider/model for the background compactor.
 
 **MCP**
@@ -184,7 +192,7 @@ Example `~/.golem/config.json`:
 | --- | --- |
 | `-profile <name>` | Use a named profile |
 | `-provider <gemini\|opencode\|openai\|openrouter>` | Select the model provider |
-| `-model <name>` | Override the model |
+| `-model <name>` | Override the model (in the TUI, `/model` picks from the provider list and switches live) |
 | `-base-url <url>` | Custom OpenAI-compatible endpoint |
 | `-api-key <key>` | Provider API key |
 | `-memory-dir <dir>` | Where the fractal store lives |

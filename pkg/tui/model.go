@@ -133,6 +133,11 @@ type Model struct {
 	showProfileModal   bool
 	profileContent     string
 	profileViewport    viewport.Model
+	showModelModal     bool
+	modelCatalog       golem.ModelCatalog
+	modelSelection     int
+	modelViewport      viewport.Model
+	modelCatalogAt     time.Time
 	currentProfile     string
 	inputHistory       []string
 	historyIndex       int
@@ -159,6 +164,13 @@ type Model struct {
 
 	// attachments are images waiting to ride along with the next turn.
 	attachments []Attachment
+
+	// slashSel is the highlighted row of the slash-command completion popup,
+	// slashDismissed remembers an explicit Esc so typing does not reopen it, and
+	// slashQuerySeen tracks the token the popup state belongs to.
+	slashSel       int
+	slashDismissed bool
+	slashQuerySeen string
 }
 
 // NewModel constructs a new Bubbletea TUI model for Golem.
@@ -277,7 +289,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Only forward non-key events (e.g. mouse wheel, window events) to viewports so typing in
 	// the textarea never triggers viewport pager scrolling (space, d, u, j, k, etc.).
 	if _, isKey := msg.(tea.KeyMsg); !isKey {
-		if m.showProfileModal {
+		if m.showModelModal {
+			m.modelViewport, vpCmd = m.modelViewport.Update(msg)
+		} else if m.showProfileModal {
 			m.profileViewport, vpCmd = m.profileViewport.Update(msg)
 		} else if m.showTreeModal {
 			m.treeViewport, vpCmd = m.treeViewport.Update(msg)
@@ -302,6 +316,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.relayout()
 
 	case tea.KeyMsg:
+		if m.showModelModal {
+			return m.handleModelModalKey(msg)
+		}
+
 		if msg.String() == "ctrl+g" {
 			// Hand the mouse back to the terminal so tmux copy-mode (or the
 			// terminal's own selection) can scroll the pane, then take it back
@@ -543,6 +561,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Keep the popup in step with the prompt: the previous key may have
+		// submitted, cleared (Ctrl+C) or replayed history, none of which go
+		// through the textarea path that also resyncs below.
+		m.resetSlashState()
+
+		// Slash-command completion popup. While the prompt is still a bare
+		// command token, the arrows pick a row, Tab accepts it and Esc closes it.
+		if m.slashMenuVisible() {
+			matches := matchSlashCommands(m.textarea.Value())
+			switch msg.Type {
+			case tea.KeyUp:
+				if len(matches) > 0 {
+					m.slashSel = (m.slashSelectedIndex(matches) - 1 + len(matches)) % len(matches)
+				}
+				return m, nil
+			case tea.KeyDown:
+				if len(matches) > 0 {
+					m.slashSel = (m.slashSelectedIndex(matches) + 1) % len(matches)
+				}
+				return m, nil
+			case tea.KeyTab:
+				return m.acceptSlashCompletion(), nil
+			case tea.KeyEsc:
+				m.slashDismissed = true
+				return m, nil
+			case tea.KeyEnter:
+				// Enter takes the highlighted row: with the popup open the
+				// prompt is an incomplete command, so submitting it would only
+				// produce an "unknown command" entry.
+				return m.acceptSlashCompletion(), nil
+			}
+		}
+
 		// Non-modal scrolling shortcuts for conversation viewport
 		if msg.String() == "ctrl+up" || msg.String() == "shift+up" {
 			m.viewport.LineUp(2)
@@ -781,6 +832,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.textarea, tiCmd = m.textarea.Update(msg)
+		m.resetSlashState()
 
 	case attachMsg:
 		if msg.err != nil {
@@ -894,13 +946,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.FocusMsg:
 		m.isBlurred = false
-		if !m.showTreeModal && !m.showShortcutsModal && !m.showMCPModal && !m.showProfileModal {
+		if !m.showTreeModal && !m.showShortcutsModal && !m.showMCPModal && !m.showProfileModal && !m.showModelModal {
 			tiCmd = m.textarea.Focus()
 		}
 
 	case tea.BlurMsg:
 		m.isBlurred = true
 		m.textarea.Blur()
+
+	case modelListMsg:
+		m.openModelPicker(msg.catalog)
+
+	case modelSwitchedMsg:
+		if msg.haveCatalog {
+			// Warm the cache so the next typed switch needs no round-trip.
+			m.modelCatalog = msg.catalog
+			m.modelCatalogAt = time.Now()
+		}
+		info := m.modelSwitchMessage(msg)
+		m.entries = append(m.entries, ChatEntry{Type: TypeSystem, Content: info})
+		m.renderConversationToViewport()
+		m.viewport.GotoBottom()
+		m.setStatus(info)
 
 	case memoryStatsMsg:
 		m.memoryStats = msg
@@ -937,6 +1004,8 @@ func (m Model) handleMouse(msg tea.MouseMsg) Model {
 
 	vp := &m.viewport
 	switch {
+	case m.showModelModal:
+		vp = &m.modelViewport
 	case m.showProfileModal:
 		vp = &m.profileViewport
 	case m.showShortcutsModal:
@@ -961,6 +1030,10 @@ func (m Model) View() string {
 		return "Initializing Golem TUI..."
 	}
 
+	if m.showModelModal {
+		return m.renderModelModalView()
+	}
+
 	if m.showProfileModal {
 		return m.renderProfileModalView()
 	}
@@ -977,12 +1050,20 @@ func (m Model) View() string {
 		return m.renderTreeModalView()
 	}
 
-	frame := lipgloss.JoinVertical(
-		lipgloss.Left,
-		m.renderHeader(),
-		m.viewport.View(),
-		m.renderFooter(),
-	)
+	// The completion popup is drawn over the bottom of the conversation and the
+	// body is trimmed by exactly its height, so the frame keeps fitting the pane
+	// (an over-tall frame makes tmux scroll the screen).
+	body := m.viewport.View()
+	menuRows := m.renderSlashMenuRows()
+	if len(menuRows) > 0 {
+		body = truncateLines(body, m.viewport.Height-len(menuRows))
+	}
+
+	parts := []string{m.renderHeader(), body}
+	parts = append(parts, menuRows...)
+	parts = append(parts, m.renderFooter())
+
+	frame := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
 	// Last line of defence: a single over-wide line makes the terminal wrap it,
 	// which pushes the frame past the pane height (and tmux scrolls the screen).
@@ -1045,7 +1126,9 @@ func (m Model) renderFooter() string {
 		statusLine = lipgloss.NewStyle().Foreground(ColorSuccess).Render(m.statusMessage)
 	} else {
 		val := m.textarea.Value()
-		if strings.HasPrefix(val, "/") {
+		if m.slashMenuVisible() {
+			statusLine = m.slashMenuHint()
+		} else if strings.HasPrefix(val, "/") {
 			statusLine = m.renderSlashCommandHelp(val)
 		} else if !m.viewport.AtBottom() {
 			// Scrolled up with the newest output off-screen: say how to get back.
@@ -1189,6 +1272,7 @@ func (m *Model) relayout() {
 		m.shortcutsViewport = viewport.New(modalW, modalH)
 		m.mcpViewport = viewport.New(modalW, modalH)
 		m.profileViewport = viewport.New(modalW, modalH)
+		m.modelViewport = viewport.New(modalW, modalH)
 		m.ready = true
 	}
 
@@ -1207,7 +1291,7 @@ func (m *Model) relayout() {
 	// limited; letting the viewports also handle them would double-count.
 	m.viewport.MouseWheelEnabled = false
 
-	for _, vp := range []*viewport.Model{&m.treeViewport, &m.shortcutsViewport, &m.mcpViewport, &m.profileViewport} {
+	for _, vp := range []*viewport.Model{&m.treeViewport, &m.shortcutsViewport, &m.mcpViewport, &m.profileViewport, &m.modelViewport} {
 		vp.Width = modalW
 		vp.Height = modalH
 		vp.KeyMap = viewport.KeyMap{}
@@ -1232,6 +1316,12 @@ func (m *Model) relayout() {
 		m.viewport.GotoTop()
 	}
 	m.startupScrolled = true
+
+	// A resize while the picker is open must keep the highlighted model on
+	// screen; the modal viewport just changed height.
+	if m.showModelModal {
+		m.syncModelPicker()
+	}
 }
 
 // hintLine joins as many key hints as fit within width, so a narrow terminal
@@ -1502,42 +1592,41 @@ func (m *Model) generateTreeVisual() string {
 	return sb.String()
 }
 
-// renderSlashCommandHelp generates dynamic status-bar assistance as the user types slash commands.
+// renderSlashCommandHelp renders the status-bar palette hints as the user types
+// slash commands. It reads the same table as the completion popup, so the two
+// can never disagree.
 func (m Model) renderSlashCommandHelp(input string) string {
-	type cmdHelp struct {
-		cmd  string
-		desc string
-	}
-	commands := []cmdHelp{
-		{"/profile", "Inspect configured profiles or switch active profile"},
-		{"/remember", "Record preference or decision into profile memory"},
-		{"/tree", "Inspect fractal memory hierarchy"},
-		{"/zoom", "Inspect memory node (/zoom [target] <id> <n>)"},
-		{"/compact", "Trigger memory compaction fold"},
-		{"/clear", "Clear chat viewport (disk memory preserved)"},
-		{"/tools", "Toggle expanded/collapsed tool call cards (Ctrl+O)"},
-		{"/mcp", "Inspect active MCP servers, tools & configs"},
-		{"/shortcuts", "Show keyboard shortcuts & controls cheat sheet"},
-		{"/help", "Show full command reference"},
-		{"/exit", "Exit Golem"},
-	}
+	primary := lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true)
+	muted := lipgloss.NewStyle().Foreground(ColorMuted)
+	warn := lipgloss.NewStyle().Foreground(ColorWarning)
+	secondary := lipgloss.NewStyle().Foreground(ColorSecondary)
 
-	cleanInput := strings.ToLower(strings.TrimSpace(input))
-	var matches []string
-	for _, c := range commands {
-		cmdName := strings.Split(c.cmd, " ")[0]
-		if strings.HasPrefix(cmdName, cleanInput) || strings.HasPrefix(c.cmd, cleanInput) {
-			matches = append(matches, fmt.Sprintf("%s %s",
-				lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render(c.cmd),
-				lipgloss.NewStyle().Foreground(ColorMuted).Render("("+c.desc+")"),
-			))
+	// Arguments are being typed: confirm the command and its shape instead of
+	// claiming the whole line is unknown.
+	if _, ok := slashQuery(input); !ok {
+		fields := strings.Fields(strings.TrimSpace(input))
+		if len(fields) == 0 {
+			return ""
 		}
+		typed := strings.ToLower(fields[0])
+		for _, c := range slashCommands() {
+			if c.isCommand(typed) {
+				return secondary.Render("Args: ") + primary.Render(c.Label()) + " " + muted.Render("("+c.Desc+")")
+			}
+		}
+		return warn.Render(fmt.Sprintf("Unknown command: %s (type /help for options)", fields[0]))
 	}
 
+	matches := matchSlashCommands(input)
 	if len(matches) == 0 {
-		return lipgloss.NewStyle().Foreground(ColorWarning).Render(fmt.Sprintf("Unknown command: %s (type /help for options)", input))
+		return warn.Render(fmt.Sprintf("Unknown command: %s (type /help for options)", input))
 	}
-	return lipgloss.NewStyle().Foreground(ColorSecondary).Render("Palette: ") + strings.Join(matches, "  •  ")
+
+	rendered := make([]string, 0, len(matches))
+	for _, c := range matches {
+		rendered = append(rendered, fmt.Sprintf("%s %s", primary.Render(c.Label()), muted.Render("("+c.Desc+")")))
+	}
+	return secondary.Render("Palette: ") + strings.Join(rendered, "  \u2022  ")
 }
 
 // renderTreeModalView renders the overlay modal when Ctrl+T or /tree is active.
@@ -1623,6 +1712,9 @@ func (m Model) generateShortcutsVisual() string {
 				{"Ctrl+C", "Clear line / Interrupt", "Interrupts running turn; if idle, clears line; if line empty, exits"},
 				{"Ctrl+D", "Exit / Forward Delete", "Exits when prompt is empty & idle; forward-deletes char when typing"},
 				{"Ctrl+O", "Toggle tool cards", "Expand / collapse tool call cards in chat (collapsed by default)"},
+				{"Tab", "Complete / command", "While typing \"/\" completes the highlighted slash command"},
+				{"↑ / ↓ (menu)", "Choose command", "Moves the slash-command completion highlight"},
+				{"Esc (menu)", "Dismiss menu", "Closes the slash-command completion popup"},
 			},
 		},
 		{
@@ -1879,6 +1971,37 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 	cmd := strings.ToLower(parts[0])
 
 	switch cmd {
+	case "/model", "/models":
+		// "/model" alone (or "/model list") opens the picker with the provider's
+		// live catalogue; "/model <name>" switches straight away.
+		if len(parts) == 1 || strings.EqualFold(parts[1], "list") {
+			if m.agent == nil {
+				m.entries = append(m.entries, ChatEntry{
+					Type:    TypeSystem,
+					Content: "No active agent to list models for.",
+				})
+				m.renderConversationToViewport()
+				return m, nil
+			}
+			m.setStatus("Loading models from " + m.agent.Config().Provider + "…")
+			return m, m.loadModelCatalogCmd()
+		}
+
+		if m.agent == nil {
+			m.entries = append(m.entries, ChatEntry{
+				Type:    TypeSystem,
+				Content: "No active agent to switch models on.",
+			})
+			m.renderConversationToViewport()
+			return m, nil
+		}
+
+		requested := strings.TrimSpace(input[len(parts[0]):])
+		// Validate the name against the provider catalogue first: switching to
+		// a model that does not exist only fails later, mid-conversation.
+		m.setStatus("Checking " + requested + "…")
+		return m, m.resolveModelCmd(requested)
+
 	case "/profile", "/profiles":
 		if len(parts) == 1 {
 			m.textarea.Blur()
@@ -2065,6 +2188,7 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 
 	case "/help":
 		helpText := `Available Slash Commands:
+/model [name]   - Pick from the live list, or switch to a validated <name>
 /profile [name] - View configured profiles or switch active profile
 /remember <text>- Record key preference or decision into profile memory
 /tree, /memory  - Visualize the fractal memory binary tree hierarchy

@@ -1079,6 +1079,54 @@ func (a *Agent) SwitchProfile(ctx context.Context, profileName string) (config.P
 	}
 
 	// 1. Re-instantiate LLM client and hot-swap active model on dynModel
+	newModel, err := a.newPrimaryModel(ctx)
+	if err != nil {
+		return prof, err
+	}
+	if a.dynModel != nil && newModel != nil {
+		a.dynModel.Switch(newModel)
+	}
+	if a.modelFactory != nil {
+		a.modelFactory.UpdateDefaults(a.cfg.ModelName, a.cfg.Provider, a.cfg.BaseURL, a.cfg.APIKey, a.cfg.FileConfig)
+	}
+
+	// 2. Mount target profile memory if configured and unmount previous dynamic profile memory
+	if name != "" && name != "default" && a.memoryMgr != nil {
+		profDir := prof.MemoryDir
+		if profDir == "" {
+			profDir, _ = config.ProfileMemoryDir(name)
+		}
+		if profDir != "" && profDir != a.cfg.StorageDir {
+			if a.currentProfileMount != "" && a.currentProfileMount != name {
+				_ = a.memoryMgr.Unmount(a.currentProfileMount)
+				a.currentProfileMount = ""
+			}
+			if _, exists := a.memoryMgr.GetStore(name); !exists {
+				if profStore, err := fractal.OpenStore(profDir); err == nil {
+					viewCfg := fractal.ViewConfig{
+						ViewBudgetBytes: a.cfg.ViewBudgetBytes,
+						LiveHeadCount:   a.cfg.LiveHeadCount,
+					}
+					profView := fractal.NewView(profStore, viewCfg)
+					a.memoryMgr.Mount(name, profStore, profView, true)
+					a.currentProfileMount = name
+				}
+			} else {
+				a.currentProfileMount = name
+			}
+		}
+	} else if a.memoryMgr != nil && a.currentProfileMount != "" {
+		_ = a.memoryMgr.Unmount(a.currentProfileMount)
+		a.currentProfileMount = ""
+	}
+
+	return prof, nil
+}
+
+// newPrimaryModel instantiates the ADK model client for the active provider and
+// credentials in a.cfg. It is used both when switching profiles and when
+// switching the model on the running agent.
+func (a *Agent) newPrimaryModel(ctx context.Context) (model.LLM, error) {
 	var newModel model.LLM
 	if a.cfg.Provider == config.ProviderGemini {
 		attempts := int32(5)
@@ -1128,7 +1176,7 @@ func (a *Agent) SwitchProfile(ctx context.Context, profileName string) (config.P
 
 		gm, err := gemini.NewModel(ctx, a.cfg.ModelName, clientCfg)
 		if err != nil {
-			return prof, errors.Wrapf(err, "initializing gemini model %s for profile switch", a.cfg.ModelName)
+			return nil, errors.Wrapf(err, "initializing gemini model %s", a.cfg.ModelName)
 		}
 		newModel = gm
 	} else {
@@ -1136,45 +1184,33 @@ func (a *Agent) SwitchProfile(ctx context.Context, profileName string) (config.P
 		cli.SetSessionID(a.sessionID)
 		newModel = cli
 	}
+	return newModel, nil
+}
 
+// SwitchModel hot-swaps the active LLM while keeping the current provider,
+// credentials, base URL and memory mounts. It is what the TUI's /model command
+// calls, so a model change does not need a restart.
+func (a *Agent) SwitchModel(ctx context.Context, modelName string) (Config, error) {
+	name := strings.TrimSpace(modelName)
+	if name == "" {
+		return a.cfg, errors.New("model name must not be empty")
+	}
+
+	prev := a.cfg.ModelName
+	a.cfg.ModelName = name
+
+	newModel, err := a.newPrimaryModel(ctx)
+	if err != nil {
+		a.cfg.ModelName = prev
+		return a.cfg, err
+	}
 	if a.dynModel != nil && newModel != nil {
 		a.dynModel.Switch(newModel)
 	}
 	if a.modelFactory != nil {
 		a.modelFactory.UpdateDefaults(a.cfg.ModelName, a.cfg.Provider, a.cfg.BaseURL, a.cfg.APIKey, a.cfg.FileConfig)
 	}
-
-	// 2. Mount target profile memory if configured and unmount previous dynamic profile memory
-	if name != "" && name != "default" && a.memoryMgr != nil {
-		profDir := prof.MemoryDir
-		if profDir == "" {
-			profDir, _ = config.ProfileMemoryDir(name)
-		}
-		if profDir != "" && profDir != a.cfg.StorageDir {
-			if a.currentProfileMount != "" && a.currentProfileMount != name {
-				_ = a.memoryMgr.Unmount(a.currentProfileMount)
-				a.currentProfileMount = ""
-			}
-			if _, exists := a.memoryMgr.GetStore(name); !exists {
-				if profStore, err := fractal.OpenStore(profDir); err == nil {
-					viewCfg := fractal.ViewConfig{
-						ViewBudgetBytes: a.cfg.ViewBudgetBytes,
-						LiveHeadCount:   a.cfg.LiveHeadCount,
-					}
-					profView := fractal.NewView(profStore, viewCfg)
-					a.memoryMgr.Mount(name, profStore, profView, true)
-					a.currentProfileMount = name
-				}
-			} else {
-				a.currentProfileMount = name
-			}
-		}
-	} else if a.memoryMgr != nil && a.currentProfileMount != "" {
-		_ = a.memoryMgr.Unmount(a.currentProfileMount)
-		a.currentProfileMount = ""
-	}
-
-	return prof, nil
+	return a.cfg, nil
 }
 
 // Store returns the underlying fractal event and node store.

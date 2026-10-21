@@ -615,3 +615,44 @@ func TestClipHeadTail(t *testing.T) {
 		t.Errorf("short string changed: %q", short)
 	}
 }
+
+func TestAgentSwitchModelKeepsProvider(t *testing.T) {
+	cfg := Config{
+		Provider:        "opencode",
+		BaseURL:         "https://api.opencode.ai/v1",
+		ModelName:       "deepseek-chat",
+		APIKey:          "opencode-test-key",
+		StorageDir:      t.TempDir(),
+		LiveHeadCount:   4,
+		ViewBudgetBytes: 1024,
+	}
+
+	ctx := context.Background()
+	agent, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("New agent failed: %v", err)
+	}
+	defer agent.Close()
+
+	updated, err := agent.SwitchModel(ctx, "qwen3-coder-plus")
+	if err != nil {
+		t.Fatalf("SwitchModel failed: %v", err)
+	}
+	if updated.ModelName != "qwen3-coder-plus" {
+		t.Errorf("cfg.ModelName = %q, want qwen3-coder-plus", updated.ModelName)
+	}
+	if updated.Provider != "opencode" {
+		t.Errorf("switching models must keep the provider, got %q", updated.Provider)
+	}
+	if got := agent.dynModel.Name(); got != "qwen3-coder-plus" {
+		t.Errorf("active model is %q, want qwen3-coder-plus", got)
+	}
+
+	// An empty name must not silently wipe the configured model.
+	if _, err := agent.SwitchModel(ctx, "  "); err == nil {
+		t.Error("expected an error for an empty model name")
+	}
+	if got := agent.Config().ModelName; got != "qwen3-coder-plus" {
+		t.Errorf("failed switch changed the model to %q", got)
+	}
+}
