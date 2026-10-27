@@ -71,6 +71,7 @@ func slashCommands() []slashCommand {
 		{Name: "/clear", Desc: "Clear the chat viewport (disk memory kept)"},
 		{Name: "/tools", Desc: "Toggle expanded tool cards (Ctrl+O)", Aliases: []string{"/expand"}},
 		{Name: "/mcp", Desc: "Inspect MCP servers, tools and configs"},
+		{Name: "/audit", Desc: "Show recent sandbox decisions (allow/deny/confirm)"},
 		{Name: "/shortcuts", Desc: "Show the keyboard cheat sheet", Aliases: []string{"/keys"}},
 		{Name: "/help", Desc: "Show the full command reference"},
 		{Name: "/exit", Desc: "Exit Golem", Aliases: []string{"/quit"}},

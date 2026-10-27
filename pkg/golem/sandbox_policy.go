@@ -1,6 +1,12 @@
 package golem
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/pkg/errors"
+	"github.com/user/golem/pkg/approval"
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/sandbox"
 )
@@ -27,4 +33,56 @@ func (a *Agent) SandboxPolicy() *sandbox.Policy {
 		return nil
 	}
 	return a.sandbox
+}
+
+// AuditLogPath is the decision log this profile will write, for the banner. An
+// empty result means the log is in-memory only.
+func AuditLogPath(sb *config.SandboxConfig, memoryDir string) string {
+	return resolveAuditPath(sb, memoryDir)
+}
+
+// resolveAuditPath turns the profile's audit setting into a file path, or ""
+// for an in-memory-only log. "off" disables the file; empty means the default
+// beside the memory store, so every session leaves a trail without asking.
+func resolveAuditPath(sb *config.SandboxConfig, memoryDir string) string {
+	setting := ""
+	if sb != nil {
+		setting = strings.TrimSpace(sb.Audit)
+	}
+	switch setting {
+	case "off", "none", "disabled":
+		return ""
+	case "":
+		if memoryDir == "" {
+			return ""
+		}
+		return filepath.Join(memoryDir, "sandbox-audit.jsonl")
+	default:
+		if strings.HasPrefix(setting, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				return filepath.Join(home, setting[2:])
+			}
+		}
+		return setting
+	}
+}
+
+// installAuditor makes the process-wide decision log available to every tool.
+//
+// The log is process-wide on purpose - one policy decision point means one
+// audit log - so a second Agent (the web server creates one per session)
+// reuses the installed auditor instead of opening the file again.
+func installAuditor(sb *config.SandboxConfig, memoryDir string) error {
+	path := resolveAuditPath(sb, memoryDir)
+	if existing := approval.CurrentAuditor(); existing != nil {
+		if path == "" || existing.Path() == path {
+			return nil
+		}
+	}
+	auditor, err := approval.NewAuditor(path, 500)
+	if err != nil {
+		return errors.Wrapf(err, "opening the sandbox audit log at %s", path)
+	}
+	approval.SetAuditor(auditor)
+	return nil
 }

@@ -2313,6 +2313,15 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "/audit":
+		m.entries = append(m.entries, ChatEntry{
+			Type:    TypeSystem,
+			Content: m.renderAuditLog(20),
+		})
+		m.renderConversationToViewport()
+		m.viewport.GotoBottom()
+		return m, nil
+
 	case "/shortcuts", "/keys":
 		m.textarea.Blur()
 		m.showShortcutsModal = true
@@ -2331,6 +2340,7 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 /clear          - Clear viewport chat history (disk storage untouched)
 /tools          - Toggle expanded/collapsed tool call cards (or Ctrl+O)
 /mcp            - Inspect active MCP servers, tools count, and configs
+/audit          - Show the last 20 sandbox decisions (allow/deny/confirm)
 /shortcuts      - Display interactive keyboard shortcuts cheat sheet
 /help           - Display this help message
 /exit, /quit    - Exit Golem`

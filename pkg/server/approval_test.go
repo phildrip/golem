@@ -155,3 +155,67 @@ func TestApprovalRouteWithoutPendingCall(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// TestSandboxAuditEndpoint covers the read side of the audit log: the cockpit can
+// show what the policy allowed and refused, and says when it is disabled.
+func TestSandboxAuditEndpoint(t *testing.T) {
+	tempDir := t.TempDir()
+	srv := NewServer(ServerConfig{
+		Port: 0,
+		BaseAgentCfg: golem.Config{
+			Provider:        "opencode",
+			BaseURL:         "http://127.0.0.1:1",
+			ModelName:       "test-model",
+			APIKey:          "test-key",
+			StorageDir:      tempDir,
+			WorkspaceDir:    tempDir,
+			LiveHeadCount:   4,
+			ViewBudgetBytes: 1024,
+		},
+	})
+	go srv.hub.Run()
+	defer srv.Shutdown(context.Background())
+	testServer := httptest.NewServer(srv.httpServer.Handler)
+	defer testServer.Close()
+
+	approval.SetAuditor(nil)
+	client := testServer.Client()
+	resp, err := client.Get(testServer.URL + "/api/sandbox/audit")
+	if err != nil {
+		t.Fatalf("GET audit: %v", err)
+	}
+	var state struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	resp.Body.Close()
+	if state.Enabled {
+		t.Fatal("expected the audit log to be reported disabled")
+	}
+
+	auditor, err := approval.NewAuditor("", 10)
+	if err != nil {
+		t.Fatalf("NewAuditor: %v", err)
+	}
+	approval.SetAuditor(auditor)
+	t.Cleanup(func() { approval.SetAuditor(nil) })
+	auditor.Record(approval.Record{Tool: "shell", Verdict: "deny", Rule: "privilege-escalation", Action: "sudo ls"})
+
+	resp, err = client.Get(testServer.URL + "/api/sandbox/audit")
+	if err != nil {
+		t.Fatalf("GET audit: %v", err)
+	}
+	defer resp.Body.Close()
+	var full struct {
+		Enabled bool              `json:"enabled"`
+		Records []approval.Record `json:"records"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&full); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !full.Enabled || len(full.Records) != 1 || full.Records[0].Action != "sudo ls" {
+		t.Fatalf("audit payload = %+v", full)
+	}
+}

@@ -73,6 +73,8 @@ type Request struct {
 // an adk_request_confirmation event and the transport asks the user. The
 // resumed pass re-runs the tool with ToolConfirmation() set.
 func Gate(ctx Approver, mode Mode, toolName string, d sandbox.Decision, action string) error {
+	note(mode, toolName, d, action)
+
 	switch d.Verdict {
 	case sandbox.Allow:
 		return nil
@@ -92,8 +94,10 @@ func Gate(ctx Approver, mode Mode, toolName string, d sandbox.Decision, action s
 
 	if conf := ctx.ToolConfirmation(); conf != nil {
 		if conf.Confirmed {
+			note(mode, toolName, sandbox.Decision{Verdict: sandbox.Allow, Rule: "user-approved"}, action)
 			return nil
 		}
+		note(mode, toolName, sandbox.Decision{Verdict: sandbox.Deny, Rule: "user-rejected"}, action)
 		return &sandbox.BlockedError{
 			Tool:    toolName,
 			Verdict: sandbox.Deny,

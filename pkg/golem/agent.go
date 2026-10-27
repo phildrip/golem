@@ -495,6 +495,13 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 	webCfg := config.ResolveWebConfig(cfg.FileConfig.Web)
 
+	// The decision log is process-wide: every tool call the policy looked at
+	// lands here, allowed calls included.
+	if err := installAuditor(cfg.FileConfig.Sandbox, cfg.StorageDir); err != nil {
+		memoryMgr.Close()
+		return nil, err
+	}
+
 	// The user's own turn is interactive: the policy may ask them to approve.
 	hostTools, err := newToolSet(workDir, sandboxPolicy, webCfg, approval.Interactive)
 	if err != nil {

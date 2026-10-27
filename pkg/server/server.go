@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/user/golem/pkg/approval"
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/importer"
@@ -448,6 +449,24 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 			return
 		}
 		writeJSON(w, http.StatusOK, res)
+	})
+
+	// Sandbox decision log: what the policy allowed, refused and asked about.
+	mux.HandleFunc("/api/sandbox/audit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		auditor := approval.CurrentAuditor()
+		if auditor == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "records": []approval.Record{}})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled": true,
+			"path":    auditor.Path(),
+			"records": auditor.Recent(200),
+		})
 	})
 
 	// Profile management endpoints

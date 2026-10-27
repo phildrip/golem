@@ -106,6 +106,7 @@ The Web UI cockpit renders the live agent hierarchy, the message traffic between
 - `allow_write` adds writable directories and `read_only` adds readable ones. The defaults are `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/opt`, `/usr/local` and `$GOROOT` readable; the workspace, `/tmp`, `/dev/null`, `$GOPATH`, `$GOCACHE` and the usual build caches writable. `$HOME` and `/proc` are deliberately *not* granted — `/proc` would hand the command the agent's own environment.
 - `sandbox.mode: "off"` restores the pre-sandbox behaviour exactly (nothing is checked). `allow_net` optionally pins the hosts `web_fetch`/`web_search` may reach.
 - The startup banner prints the effective mode, so a profile that accidentally says `off` is visible before the first tool call.
+- **Audit log**: every decision the policy takes — allow, deny and confirm, plus your answer to a prompt — is recorded with the exact command, the rule that fired and whether anyone was there to ask. The last 500 stay in memory (`/audit` in the TUI, `GET /api/sandbox/audit` in the cockpit) and each one is appended to `<memory-dir>/sandbox-audit.jsonl` (mode 0600) so the trail survives a restart. `sandbox.audit` sets the path, or `"off"` keeps it in memory only. Allowed calls are in the log too: "what did it do" is only answerable if the permitted calls are there.
 
 **Interfaces**
 - **TUI** (Bubble Tea): streaming chat, collapsible tool-call cards (`Ctrl+O`), memory-tree explorer (`Ctrl+T`), shortcuts popup (`Ctrl+K`), MCP panel, profile switcher, slash commands with a live completion popup (`/` then `Tab`, `↑`/`↓`, `Enter`). Colours come from your terminal's own palette by default (`-theme nord` for the bundled palette), the wheel scroll rate is rate-limited so free-spinning mice stay readable, and the conversation opens on the newest output (`End` jumps there, `Home` to the top, `PgUp`/`PgDn` page). `Ctrl+G` hands the mouse to tmux/your terminal for copy-mode and native selection; golem keeps the wheel for its own scrolling even inside tmux, because a full-screen app leaves the pane no scrollback for copy-mode to reveal. The prompt starts as a single line and grows as you add to it (up to a third of the pane, then it scrolls its own draft) — `Enter` sends, `Alt+Enter` or `Ctrl+J` starts a new line.
@@ -200,7 +201,8 @@ Example `~/.golem/config.json`:
         "allow_write": ["~/scratch"],
         "read_only": ["/srv/datasets"],
         "allow_net": ["example.com"],
-        "require_confirm": ["shell"]
+        "require_confirm": ["shell"],
+        "audit": "~/golem-audit.jsonl"
       }
     }
   },

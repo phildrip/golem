@@ -171,3 +171,38 @@ func wrapPlain(text string, width int) string {
 func awaitingApproval(err error) bool {
 	return errors.Is(err, golem.ErrAwaitingApproval)
 }
+
+// renderAuditLog formats the most recent sandbox decisions. The audit log is the
+// answer to "what did it actually do", so allowed calls are in it too.
+func (m Model) renderAuditLog(limit int) string {
+	auditor := approval.CurrentAuditor()
+	if auditor == nil {
+		return "Sandbox audit log is not enabled."
+	}
+	records := auditor.Recent(limit)
+	if len(records) == 0 {
+		return "No sandbox decisions recorded yet."
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Sandbox decisions (last %d):\n", len(records))
+	for _, r := range records {
+		action := r.Action
+		if len([]rune(action)) > 60 {
+			action = string([]rune(action)[:60]) + "…"
+		}
+		line := fmt.Sprintf("%s  %-7s %-14s %s", r.Time.Format("15:04:05"), r.Verdict, r.Tool, action)
+		if r.Rule != "" {
+			line += "  [" + r.Rule + "]"
+		}
+		if r.Unattended {
+			line += "  (unattended)"
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	if path := auditor.Path(); path != "" {
+		fmt.Fprintf(&b, "\nlog: %s", path)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}

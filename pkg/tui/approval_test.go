@@ -127,3 +127,46 @@ func TestApprovalPromptFitsThePane(t *testing.T) {
 		}
 	}
 }
+
+// TestAuditCommandShowsRecentDecisions covers /audit: the transcript gets the
+// decisions, allowed calls included, and says so when the log is empty.
+func TestAuditCommandShowsRecentDecisions(t *testing.T) {
+	auditor, err := approval.NewAuditor("", 10)
+	if err != nil {
+		t.Fatalf("NewAuditor: %v", err)
+	}
+	approval.SetAuditor(auditor)
+	t.Cleanup(func() { approval.SetAuditor(nil) })
+
+	m := newSlashTestModel(t, 100, 30)
+	next, _ := m.handleSlashCommand("/audit")
+	m = next.(Model)
+	last := m.entries[len(m.entries)-1]
+	if !strings.Contains(last.Content, "No sandbox decisions") {
+		t.Fatalf("empty log message = %q", last.Content)
+	}
+
+	auditor.Record(approval.Record{Tool: "shell", Verdict: "deny", Rule: "privilege-escalation", Action: "sudo ls"})
+	auditor.Record(approval.Record{Tool: "write_file", Verdict: "allow", Action: "write_file notes.md"})
+
+	next, _ = m.handleSlashCommand("/audit")
+	m = next.(Model)
+	last = m.entries[len(m.entries)-1]
+	for _, want := range []string{"sudo ls", "deny", "write_file notes.md", "allow", "privilege-escalation"} {
+		if !strings.Contains(last.Content, want) {
+			t.Fatalf("/audit output missing %q:\n%s", want, last.Content)
+		}
+	}
+}
+
+// TestAuditCommandWithoutAnAuditor keeps /audit honest instead of empty.
+func TestAuditCommandWithoutAnAuditor(t *testing.T) {
+	approval.SetAuditor(nil)
+	m := newSlashTestModel(t, 100, 30)
+	next, _ := m.handleSlashCommand("/audit")
+	m = next.(Model)
+	last := m.entries[len(m.entries)-1]
+	if !strings.Contains(last.Content, "not enabled") {
+		t.Fatalf("message = %q", last.Content)
+	}
+}

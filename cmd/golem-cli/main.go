@@ -420,6 +420,11 @@ func main() {
 	fmt.Printf("Model: %s | Memory: %s | Workspace: %s\n", cfg.ModelName, cfg.StorageDir, workDir)
 	fmt.Println(formatAuthStatus(cfg.Provider, cfg.APIKey))
 	fmt.Println(formatSandboxStatus(cfg.FileConfig.Sandbox))
+	if auditPath := golem.AuditLogPath(cfg.FileConfig.Sandbox, cfg.StorageDir); auditPath != "" {
+		fmt.Printf("Audit: %s\n", auditPath)
+	} else {
+		fmt.Println("Audit: in-memory only (sandbox.audit: \"off\")")
+	}
 
 	if opts.Serve {
 		webCfg, err := resolveWebServerConfig(opts, serverCfg)
