@@ -22,6 +22,7 @@ import (
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/importer"
+	"github.com/user/golem/pkg/sandbox"
 	"github.com/user/golem/pkg/tools"
 )
 
@@ -441,6 +442,16 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		if cleanTarget == ".." || strings.HasPrefix(cleanTarget, ".."+string(filepath.Separator)) || filepath.IsAbs(cleanTarget) {
 			writeError(w, http.StatusBadRequest, "invalid relative file path for workspace")
 			return
+		}
+
+		// The same policy the agent's tools obey. A human is clicking, so a
+		// Confirm verdict is already answered by the click itself; a Deny still
+		// refuses, because the profile said so.
+		if policy := s.patchPolicy(); policy != nil {
+			if d := policy.CheckWrite(filepath.Join(s.WorkspaceDir(), cleanTarget)); d.Verdict == sandbox.Deny {
+				writeError(w, http.StatusForbidden, "blocked by sandbox: "+d.Reason)
+				return
+			}
 		}
 
 		res, err := tools.PatchFileWithHashline(s.WorkspaceDir(), cleanTarget, req.Op, req.Anchor, req.Content, req.DryRun)
