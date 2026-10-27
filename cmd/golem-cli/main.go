@@ -21,6 +21,7 @@ import (
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/importer"
+	"github.com/user/golem/pkg/sandbox"
 	"github.com/user/golem/pkg/server"
 	"github.com/user/golem/pkg/tui"
 )
@@ -382,6 +383,7 @@ func main() {
 	fmt.Printf("Golem AI Agent (ADK v2 + %s:%s + Fractal Memory)\n", providerLabel, modelLabel)
 	fmt.Printf("Model: %s | Memory: %s | Workspace: %s\n", cfg.ModelName, cfg.StorageDir, workDir)
 	fmt.Println(formatAuthStatus(cfg.Provider, cfg.APIKey))
+	fmt.Println(formatSandboxStatus(cfg.FileConfig.Sandbox))
 
 	if opts.Serve {
 		webCfg, err := resolveWebServerConfig(opts, serverCfg)
@@ -492,6 +494,35 @@ func main() {
 	if err := runReadlineLoop(ctx, agentInstance, scanner, os.Stdout); err != nil {
 		log.Printf("Readline error: %v", err)
 	}
+}
+
+// formatSandboxStatus summarises the tool policy layer in the startup banner, so
+// a misconfigured profile is visible before the first tool call rather than
+// after it.
+func formatSandboxStatus(sb *config.SandboxConfig) string {
+	resolved := config.ResolveSandboxConfig(sb)
+	mode := sandbox.Mode(resolved.Mode)
+	if mode == sandbox.ModeOff {
+		return "Sandbox: OFF - tools run unconfined"
+	}
+	label := "Sandbox: policy - dangerous shell shapes denied, writes confined to the workspace"
+	if mode == sandbox.ModeBwrap {
+		label = "Sandbox: bwrap - OS isolation"
+	}
+	var extra []string
+	if len(resolved.AllowWrite) > 0 {
+		extra = append(extra, fmt.Sprintf("+%d allow_write", len(resolved.AllowWrite)))
+	}
+	if len(resolved.AllowNet) > 0 {
+		extra = append(extra, fmt.Sprintf("allow_net %d host(s)", len(resolved.AllowNet)))
+	}
+	if len(resolved.RequireConfirm) > 0 {
+		extra = append(extra, "confirm: "+strings.Join(resolved.RequireConfirm, ","))
+	}
+	if len(extra) > 0 {
+		label += " | " + strings.Join(extra, " | ")
+	}
+	return label
 }
 
 // formatAuthStatus produces a user-facing authentication summary string based on the active provider.

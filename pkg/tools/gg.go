@@ -468,21 +468,29 @@ func runBuiltinGrep(searchRoot, pattern, filePattern string, maxResults int) ([]
 }
 
 // NewFindFilesTool returns an ADK tool exposing gg fast file finding.
-func NewFindFilesTool(baseDir string) (tool.Tool, error) {
+func NewFindFilesTool(baseDir string, opts ...Option) (tool.Tool, error) {
+	o := newOptions(opts)
 	return functiontool.New(functiontool.Config{
 		Name:        "find_files",
 		Description: "Fast file finder (gg) for rapidly locating files by name, extension, glob, or path across the workspace. Uses pure Go inverted index and fuzzy matching with fallback to git/walk.",
 	}, func(ctx agent.Context, args FindFilesArgs) (FindFilesResult, error) {
+		if err := o.checkRead("find_files", args.Directory); err != nil {
+			return FindFilesResult{}, err
+		}
 		return FindFiles(baseDir, args.Directory, args.Query, args.MaxResults)
 	})
 }
 
 // NewGrepFilesTool returns an ADK tool exposing gg content searching.
-func NewGrepFilesTool(baseDir string) (tool.Tool, error) {
+func NewGrepFilesTool(baseDir string, opts ...Option) (tool.Tool, error) {
+	o := newOptions(opts)
 	return functiontool.New(functiontool.Config{
 		Name:        "grep_files",
 		Description: "Fast content search (gg grep) across workspace files. Returns matching file paths, line numbers, and content excerpts using pure Go SIMD/regex searcher.",
 	}, func(ctx agent.Context, args GrepFilesArgs) (GrepFilesResult, error) {
+		if err := o.checkRead("grep_files", args.Directory); err != nil {
+			return GrepFilesResult{}, err
+		}
 		return GrepFiles(baseDir, args.Directory, args.Pattern, args.FilePattern, args.MaxResults)
 	})
 }

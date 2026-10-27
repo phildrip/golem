@@ -73,12 +73,17 @@ func ReadFile(baseDir, path string) (string, error) {
 }
 
 // NewReadFileTool returns an ADK tool for reading files with an optional baseDir sandbox.
-func NewReadFileTool(baseDir string) (tool.Tool, error) {
+func NewReadFileTool(baseDir string, opts ...Option) (tool.Tool, error) {
+	o := newOptions(opts)
 	t, err := functiontool.New(functiontool.Config{
 		Name:        "read_file",
 		Description: "Reads and returns the complete text content of a file at the given relative or absolute path within the workspace.",
 	}, func(ctx agent.Context, args ReadFileArgs) (ReadFileResult, error) {
+		if err := o.checkRead("read_file", args.FilePath); err != nil {
+			return ReadFileResult{}, err
+		}
 		content, err := ReadFile(baseDir, args.FilePath)
+
 		if err != nil {
 			return ReadFileResult{}, errors.Wrap(err, "reading file")
 		}
@@ -118,11 +123,15 @@ func WriteFile(baseDir, path string, content string) error {
 }
 
 // NewWriteFileTool returns an ADK tool for writing files with an optional baseDir sandbox.
-func NewWriteFileTool(baseDir string) (tool.Tool, error) {
+func NewWriteFileTool(baseDir string, opts ...Option) (tool.Tool, error) {
+	o := newOptions(opts)
 	t, err := functiontool.New(functiontool.Config{
 		Name:        "write_file",
 		Description: "Writes content to a file at the specified path within the workspace, creating it if needed or overwriting if it exists.",
 	}, func(ctx agent.Context, args WriteFileArgs) (WriteFileResult, error) {
+		if err := o.checkWrite("write_file", args.FilePath); err != nil {
+			return WriteFileResult{}, err
+		}
 		if err := WriteFile(baseDir, args.FilePath, args.Content); err != nil {
 			return WriteFileResult{}, errors.Wrap(err, "writing file")
 		}
@@ -181,11 +190,15 @@ func ReplaceStringWithRegex(baseDir, path string, pattern string, replacement st
 }
 
 // NewReplaceRegexTool returns an ADK tool for replacing content with regex with an optional baseDir sandbox.
-func NewReplaceRegexTool(baseDir string) (tool.Tool, error) {
+func NewReplaceRegexTool(baseDir string, opts ...Option) (tool.Tool, error) {
+	o := newOptions(opts)
 	t, err := functiontool.New(functiontool.Config{
 		Name:        "replace_regex",
 		Description: "Replaces occurrences of a regex pattern with replacement text in a specified file within the workspace.",
 	}, func(ctx agent.Context, args ReplaceRegexArgs) (ReplaceRegexResult, error) {
+		if err := o.checkWrite("replace_regex", args.FilePath); err != nil {
+			return ReplaceRegexResult{}, err
+		}
 		matched, err := ReplaceStringWithRegex(baseDir, args.FilePath, args.Pattern, args.Replacement)
 		if err != nil {
 			return ReplaceRegexResult{}, errors.Wrap(err, "replacing regex in file")

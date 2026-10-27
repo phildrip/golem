@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+
+	"github.com/user/golem/pkg/sandbox"
 )
 
 // Provider constants
@@ -61,6 +63,25 @@ type WebConfig struct {
 	MaxFetch int    `json:"max_fetch_bytes,omitempty"`
 }
 
+// SandboxConfig configures the policy layer every tool consults before it
+// touches the host. Mode off reproduces pre-sandbox behaviour; policy denies
+// dangerous shapes and writes outside the workspace; bwrap is reserved for
+// OS-level isolation.
+type SandboxConfig struct {
+	// Mode is off, policy or bwrap (default policy).
+	Mode string `json:"mode,omitempty"`
+	// AllowWrite lists extra writable paths; the workspace is always writable.
+	AllowWrite []string `json:"allow_write,omitempty"`
+	// AllowNet lists hosts web_fetch may reach; empty means no allowlist.
+	AllowNet []string `json:"allow_net,omitempty"`
+	// RequireConfirm lists tools that always need human approval, e.g. ["shell"].
+	RequireConfirm []string `json:"require_confirm,omitempty"`
+	// EnvAllow overrides the environment allowlist for shell commands.
+	EnvAllow []string `json:"env_allow,omitempty"`
+	// ShellTimeout is a Go duration string for shell commands (default 120s).
+	ShellTimeout string `json:"shell_timeout,omitempty"`
+}
+
 // ServerConfig configures the -serve HTTP/WebSocket listener.
 //
 // Host defaults to loopback. Token is the bearer credential required on /api/*
@@ -85,6 +106,7 @@ type ProfileConfig struct {
 	MountedMemories []MountedMemoryConfig `json:"mounted_memories,omitempty"`
 	Compactor       *CompactorConfig      `json:"compactor,omitempty"`
 	Web             *WebConfig            `json:"web,omitempty"`
+	Sandbox         *SandboxConfig        `json:"sandbox,omitempty"`
 }
 
 // ProviderConfig stores credentials and endpoint for an individual model provider.
@@ -107,6 +129,7 @@ type FileConfig struct {
 	Providers       map[string]ProviderConfig `json:"providers,omitempty"`
 	Compactor       *CompactorConfig          `json:"compactor,omitempty"`
 	Web             *WebConfig                `json:"web,omitempty"`
+	Sandbox         *SandboxConfig            `json:"sandbox,omitempty"`
 	Server          *ServerConfig             `json:"server,omitempty"`
 }
 
@@ -584,6 +607,33 @@ func MergeConfigs(userCfg, wsCfg FileConfig) FileConfig {
 		}
 	}
 
+	if wsCfg.Sandbox != nil {
+		if merged.Sandbox == nil {
+			merged.Sandbox = &SandboxConfig{}
+		} else {
+			clone := *merged.Sandbox
+			merged.Sandbox = &clone
+		}
+		if wsCfg.Sandbox.Mode != "" {
+			merged.Sandbox.Mode = wsCfg.Sandbox.Mode
+		}
+		if len(wsCfg.Sandbox.AllowWrite) > 0 {
+			merged.Sandbox.AllowWrite = append([]string(nil), wsCfg.Sandbox.AllowWrite...)
+		}
+		if len(wsCfg.Sandbox.AllowNet) > 0 {
+			merged.Sandbox.AllowNet = append([]string(nil), wsCfg.Sandbox.AllowNet...)
+		}
+		if len(wsCfg.Sandbox.RequireConfirm) > 0 {
+			merged.Sandbox.RequireConfirm = append([]string(nil), wsCfg.Sandbox.RequireConfirm...)
+		}
+		if len(wsCfg.Sandbox.EnvAllow) > 0 {
+			merged.Sandbox.EnvAllow = append([]string(nil), wsCfg.Sandbox.EnvAllow...)
+		}
+		if wsCfg.Sandbox.ShellTimeout != "" {
+			merged.Sandbox.ShellTimeout = wsCfg.Sandbox.ShellTimeout
+		}
+	}
+
 	return merged
 }
 
@@ -676,6 +726,11 @@ func ResolveActiveProfile(flagProfile string, fileCfg FileConfig) (string, Profi
 		prof.Web = fileCfg.Web
 	}
 
+	// Inherit sandbox config from top-level if profile doesn't specify one
+	if prof.Sandbox == nil && fileCfg.Sandbox != nil {
+		prof.Sandbox = fileCfg.Sandbox
+	}
+
 	return name, prof
 }
 
@@ -707,7 +762,27 @@ func (c FileConfig) ApplyProfile(profileName string, prof ProfileConfig) FileCon
 	if prof.Web != nil {
 		updated.Web = prof.Web
 	}
+	if prof.Sandbox != nil {
+		updated.Sandbox = prof.Sandbox
+	}
 	return updated
+}
+
+// ResolveSandboxConfig returns the effective sandbox config. A missing block
+// defaults to mode policy, which is the safe default: accidents are contained
+// unless the user explicitly asks for off.
+func ResolveSandboxConfig(sb *SandboxConfig) SandboxConfig {
+	var out SandboxConfig
+	if sb != nil {
+		out = *sb
+	}
+	if strings.TrimSpace(out.Mode) == "" {
+		out.Mode = string(sandbox.ModePolicy)
+	}
+	if strings.TrimSpace(out.ShellTimeout) == "" {
+		out.ShellTimeout = "120s"
+	}
+	return out
 }
 
 // ResolveWebConfig returns the effective web config, applying provider defaults

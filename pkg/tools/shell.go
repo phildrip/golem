@@ -51,18 +51,24 @@ func ExecuteShellCommand(ctx context.Context, command string) (ShellResult, erro
 	}, nil
 }
 
-// NewShellTool creates a new ADK Tool for executing shell commands.
-func NewShellTool() (tool.Tool, error) {
+// NewShellTool creates a new ADK Tool for executing shell commands. With a
+// sandbox policy attached every command is checked before it runs.
+func NewShellTool(opts ...Option) (tool.Tool, error) {
+	o := newOptions(opts)
 	t, err := functiontool.New(functiontool.Config{
 		Name:        "shell",
 		Description: "Executes a shell command on the host system using bash. Returns stdout, stderr, and the exit code.",
 	}, func(ctx agent.Context, args ShellArgs) (ShellResult, error) {
+		if err := o.policy.CheckShell(args.Command, o.policy.Workspace()).Err("shell"); err != nil {
+			return ShellResult{}, err
+		}
 		res, err := ExecuteShellCommand(ctx, args.Command)
 		if err != nil {
 			return ShellResult{}, errors.Wrap(err, "shell tool execution")
 		}
 		return res, nil
 	})
+
 	if err != nil {
 		return nil, errors.Wrap(err, "creating shell function tool")
 	}

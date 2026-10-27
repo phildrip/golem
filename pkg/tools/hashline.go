@@ -478,31 +478,45 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 }
 
 // NewHashlineReadTool creates the ADK tool for hash-anchored file reading.
-func NewHashlineReadTool(baseDir string) (tool.Tool, error) {
+func NewHashlineReadTool(baseDir string, opts ...Option) (tool.Tool, error) {
+	o := newOptions(opts)
 	return functiontool.New(functiontool.Config{
 		Name:        "hashline_read",
 		Description: "Reads a file with stable content-hashed line anchors (e.g. '42:a3'). Use before hashline_patch to prevent edit collision and hallucinated line modifications.",
 	}, func(ctx agent.Context, args HashlineReadArgs) (HashlineReadResult, error) {
+		if err := o.checkRead("hashline_read", args.FilePath); err != nil {
+			return HashlineReadResult{}, err
+		}
 		return ReadFileWithHashlines(baseDir, args.FilePath, args.StartLine, args.LineCount)
 	})
 }
 
 // NewHashlineFindBlockTool creates the ADK tool for locating structural code blocks around anchors.
-func NewHashlineFindBlockTool(baseDir string) (tool.Tool, error) {
+func NewHashlineFindBlockTool(baseDir string, opts ...Option) (tool.Tool, error) {
+	o := newOptions(opts)
 	return functiontool.New(functiontool.Config{
 		Name:        "hashline_find_block",
 		Description: "Finds the enclosing syntactic code block (function, struct, class, if/for block) around a line:hash anchor. Useful before SWAP.BLK or DEL.BLK.",
 	}, func(ctx agent.Context, args HashlineFindBlockArgs) (HashlineFindBlockResult, error) {
+		if err := o.checkRead("hashline_find_block", args.FilePath); err != nil {
+			return HashlineFindBlockResult{}, err
+		}
 		return FindBlockWithHashline(baseDir, args.FilePath, args.Anchor)
 	})
 }
 
 // NewHashlinePatchTool creates the ADK tool for hash-anchored file patching.
-func NewHashlinePatchTool(baseDir string) (tool.Tool, error) {
+func NewHashlinePatchTool(baseDir string, opts ...Option) (tool.Tool, error) {
+	o := newOptions(opts)
 	return functiontool.New(functiontool.Config{
 		Name:        "hashline_patch",
 		Description: "Applies a robust content-hashed patch ('SWAP', 'DEL', 'INS.PRE', 'INS.POST', 'SWAP.BLK', 'DEL.BLK', 'INS.BLK.PRE', 'INS.BLK.POST') using verified anchors like '42:a3', range '42:a3..45:f1', or block anchor. Rejects stale edits if lines changed.",
 	}, func(ctx agent.Context, args HashlinePatchArgs) (HashlinePatchResult, error) {
+		if !args.DryRun {
+			if err := o.checkWrite("hashline_patch", args.FilePath); err != nil {
+				return HashlinePatchResult{}, err
+			}
+		}
 		return PatchFileWithHashline(baseDir, args.FilePath, args.Op, args.Anchor, args.Content, args.DryRun)
 	})
 }

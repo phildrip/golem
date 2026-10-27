@@ -16,6 +16,7 @@ import (
 	"github.com/user/golem/pkg/mcp"
 	"github.com/user/golem/pkg/memory/fractal"
 	"github.com/user/golem/pkg/provider/openai"
+	"github.com/user/golem/pkg/sandbox"
 	"github.com/user/golem/pkg/subagent"
 	"github.com/user/golem/pkg/swarm"
 	"github.com/user/golem/pkg/tools"
@@ -118,6 +119,7 @@ type Agent struct {
 	dynModel            *dynamicModel
 	modelFactory        *subagent.ModelFactory
 	currentProfileMount string
+	sandbox             *sandbox.Policy
 }
 
 // dynamicModel is a thread-safe proxy implementing model.LLM that allows hot-swapping the active LLM client.
@@ -477,25 +479,36 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 
 	// 4. Initialize Tools (sandboxed to current working directory)
 	workDir, _ := os.Getwd()
-	shellTool, err := tools.NewShellTool()
+
+	// One policy decision point for every tool that can touch the host. It is
+	// compiled from the profile's sandbox block; an empty block means mode
+	// policy, so accidents are contained by default.
+	sandboxPolicy, err := sandbox.New(sandboxConfig(cfg.FileConfig.Sandbox), workDir)
+	if err != nil {
+		store.Close()
+		return nil, errors.Wrap(err, "compiling sandbox policy")
+	}
+	policyOpt := tools.WithPolicy(sandboxPolicy)
+
+	shellTool, err := tools.NewShellTool(policyOpt)
 	if err != nil {
 		store.Close()
 		return nil, errors.Wrap(err, "creating shell tool")
 	}
 
-	readFileTool, err := tools.NewReadFileTool(workDir)
+	readFileTool, err := tools.NewReadFileTool(workDir, policyOpt)
 	if err != nil {
 		store.Close()
 		return nil, errors.Wrap(err, "creating read_file tool")
 	}
 
-	writeFileTool, err := tools.NewWriteFileTool(workDir)
+	writeFileTool, err := tools.NewWriteFileTool(workDir, policyOpt)
 	if err != nil {
 		store.Close()
 		return nil, errors.Wrap(err, "creating write_file tool")
 	}
 
-	replaceRegexTool, err := tools.NewReplaceRegexTool(workDir)
+	replaceRegexTool, err := tools.NewReplaceRegexTool(workDir, policyOpt)
 	if err != nil {
 		store.Close()
 		return nil, errors.Wrap(err, "creating replace_regex tool")
@@ -519,31 +532,31 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		return nil, errors.Wrap(err, "creating remember tool")
 	}
 
-	findFilesTool, err := tools.NewFindFilesTool(workDir)
+	findFilesTool, err := tools.NewFindFilesTool(workDir, policyOpt)
 	if err != nil {
 		memoryMgr.Close()
 		return nil, errors.Wrap(err, "creating find_files tool")
 	}
 
-	grepFilesTool, err := tools.NewGrepFilesTool(workDir)
+	grepFilesTool, err := tools.NewGrepFilesTool(workDir, policyOpt)
 	if err != nil {
 		memoryMgr.Close()
 		return nil, errors.Wrap(err, "creating grep_files tool")
 	}
 
-	hashlineReadTool, err := tools.NewHashlineReadTool(workDir)
+	hashlineReadTool, err := tools.NewHashlineReadTool(workDir, policyOpt)
 	if err != nil {
 		memoryMgr.Close()
 		return nil, errors.Wrap(err, "creating hashline_read tool")
 	}
 
-	hashlineFindBlockTool, err := tools.NewHashlineFindBlockTool(workDir)
+	hashlineFindBlockTool, err := tools.NewHashlineFindBlockTool(workDir, policyOpt)
 	if err != nil {
 		memoryMgr.Close()
 		return nil, errors.Wrap(err, "creating hashline_find_block tool")
 	}
 
-	hashlinePatchTool, err := tools.NewHashlinePatchTool(workDir)
+	hashlinePatchTool, err := tools.NewHashlinePatchTool(workDir, policyOpt)
 	if err != nil {
 		memoryMgr.Close()
 		return nil, errors.Wrap(err, "creating hashline_patch tool")
@@ -551,12 +564,12 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 
 	// 4b. Web tools: web_search (Google CSE, optional) and web_fetch.
 	webCfg := config.ResolveWebConfig(cfg.FileConfig.Web)
-	webSearchTool, err := web.NewWebSearchTool(web.NewGoogleCSE(webCfg.APIKey, webCfg.CX, webCfg.BaseURL))
+	webSearchTool, err := web.NewWebSearchTool(web.NewGoogleCSE(webCfg.APIKey, webCfg.CX, webCfg.BaseURL), web.WithPolicy(sandboxPolicy))
 	if err != nil {
 		store.Close()
 		return nil, errors.Wrap(err, "creating web_search tool")
 	}
-	webFetchTool, err := web.NewWebFetchTool(web.NewFetcher(int64(webCfg.MaxFetch)))
+	webFetchTool, err := web.NewWebFetchTool(web.NewFetcher(int64(webCfg.MaxFetch)), web.WithPolicy(sandboxPolicy))
 	if err != nil {
 		store.Close()
 		return nil, errors.Wrap(err, "creating web_fetch tool")
@@ -780,6 +793,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		workerCancel:     workerCancel,
 		dynModel:         dynModel,
 		modelFactory:     modelFactory,
+		sandbox:          sandboxPolicy,
 	}
 
 	// Start background compactor loop if configured or for trigger events

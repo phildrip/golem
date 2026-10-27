@@ -35,6 +35,13 @@ type SearchProvider interface {
 	Search(ctx context.Context, query string, opts SearchOptions) ([]SearchResult, error)
 }
 
+// endpointNamer is implemented by providers that talk to a single known host.
+// web_search consults the sandbox allow_net against it, so a locked-down
+// profile cannot reach an unexpected backend either.
+type endpointNamer interface {
+	Endpoint() string
+}
+
 // GoogleCSE implements SearchProvider against the Google Programmable Search
 // (Custom Search JSON) API.
 type GoogleCSE struct {
@@ -59,6 +66,9 @@ func NewGoogleCSE(apiKey, cx, baseURL string) *GoogleCSE {
 
 // Name implements SearchProvider.
 func (g *GoogleCSE) Name() string { return "google_cse" }
+
+// Endpoint returns the search API URL, for the sandbox allow_net check.
+func (g *GoogleCSE) Endpoint() string { return g.BaseURL }
 
 // Configured reports whether the API key and CSE id are present.
 func (g *GoogleCSE) Configured() bool { return g.APIKey != "" && g.CX != "" }

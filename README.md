@@ -98,6 +98,12 @@ The Web UI cockpit renders the live agent hierarchy, the message traffic between
 - `find_files` and `grep_files` — a fast pure-Go file index and SIMD/regex content search.
 - `shell` — run commands, capture stdout/stderr and exit code.
 
+**Sandbox**
+- Every tool that can touch the host — `shell`, the file tools, `hashline_patch`, `web_fetch` and `web_search` — asks one policy layer first (`pkg/sandbox`), so there is exactly one place to reason about what the agent may do.
+- The default mode is `policy`: dangerous shell shapes are refused with a tool error the model can route around (`rm -rf ~`, `git checkout .`, `git reset --hard`, `git clean -fdx`, `sudo`, `curl … | sh`, `mkfs`, `dd of=/dev/…`, `chmod 777 /`, `shutdown`/`reboot`), and writes are confined to the workspace, with `allow_write` adding directories. `git push --force` and `git branch -D` come back as *confirm*; until the interactive approval gate lands that is reported as a refusal with the reason attached.
+- `sandbox.mode: "off"` restores the pre-sandbox behaviour exactly (nothing is checked). `allow_net` optionally pins the hosts `web_fetch`/`web_search` may reach. `bwrap` is reserved for OS-level isolation.
+- The startup banner prints the effective mode, so a profile that accidentally says `off` is visible before the first tool call.
+
 **Interfaces**
 - **TUI** (Bubble Tea): streaming chat, collapsible tool-call cards (`Ctrl+O`), memory-tree explorer (`Ctrl+T`), shortcuts popup (`Ctrl+K`), MCP panel, profile switcher, slash commands with a live completion popup (`/` then `Tab`, `↑`/`↓`, `Enter`). Colours come from your terminal's own palette by default (`-theme nord` for the bundled palette), the wheel scroll rate is rate-limited so free-spinning mice stay readable, and the conversation opens on the newest output (`End` jumps there, `Home` to the top, `PgUp`/`PgDn` page). `Ctrl+G` hands the mouse to tmux/your terminal for copy-mode and native selection; golem keeps the wheel for its own scrolling even inside tmux, because a full-screen app leaves the pane no scrollback for copy-mode to reveal. The prompt starts as a single line and grows as you add to it (up to a third of the pane, then it scrolls its own draft) — `Enter` sends, `Alt+Enter` or `Ctrl+J` starts a new line.
 - **Images in the TUI**: `Ctrl+V` grabs a clipboard image — golem reads the clipboard itself (Wayland `wl-paste`, X11 `xclip`, macOS `pngpaste`), so tmux/terminal paste bindings don't matter — and dropping or typing an image path (`/tmp/shot.png`) attaches that file instead. `Ctrl+X` clears the queue. Attached images ride along with that turn as inline data for vision models; the transcript keeps the text chip (`[img 1: shot.png 1440x900 212KB]`) and the bytes are copied to `<memory-dir>/attachments/`, because fractal memory is a text log. The model is asked to say what it took from each image, so the picture stays recoverable from the text transcript after a restart.
@@ -184,6 +190,11 @@ Example `~/.golem/config.json`:
       "compactor": {
         "provider": "opencode",
         "model": "deepseek-chat"
+      },
+      "sandbox": {
+        "mode": "policy",
+        "allow_write": ["~/scratch"],
+        "allow_net": ["example.com"]
       }
     }
   },
@@ -196,7 +207,7 @@ Example `~/.golem/config.json`:
 }
 ```
 
-`server.token` is written automatically the first time you run `-serve`; delete it to get a fresh one (every authorised device will have to paste it again). `allow_origins` is only needed when a reverse proxy rewrites the `Host` header — `tailscale serve` does not.
+`sandbox.mode` defaults to `policy` when the block is absent (see **Sandbox** above for what that denies). `server.token` is written automatically the first time you run `-serve`; delete it to get a fresh one (every authorised device will have to paste it again). `allow_origins` is only needed when a reverse proxy rewrites the `Host` header — `tailscale serve` does not.
 
 ### Common flags
 
