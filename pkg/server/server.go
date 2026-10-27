@@ -357,6 +357,54 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 			} else {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			}
+		case "approval":
+			switch r.Method {
+			case http.MethodGet:
+				// Re-render a prompt nobody answered yet, e.g. after a reconnect.
+				sess, ok := s.sessions.GetSession(sessionID)
+				if !ok {
+					writeError(w, http.StatusNotFound, "session not found")
+					return
+				}
+				req, pending := sess.Agent.PendingApproval()
+				if !pending {
+					writeJSON(w, http.StatusOK, map[string]any{"pending": false})
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{
+					"pending": true,
+					"call_id": req.CallID,
+					"tool":    req.Tool,
+					"hint":    req.Hint,
+					"action":  req.Action,
+					"reason":  req.Reason,
+				})
+			case http.MethodPost:
+				r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+				var req ApprovalRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					writeError(w, http.StatusBadRequest, "invalid request body")
+					return
+				}
+				sess, acquired := s.sessions.TryAcquireTurn(sessionID)
+				if !acquired {
+					if sess == nil {
+						writeError(w, http.StatusNotFound, "session not found")
+					} else {
+						writeError(w, http.StatusConflict, "session is currently executing a turn")
+					}
+					return
+				}
+				go func(sessCtx context.Context, callID string, approved bool) {
+					defer s.sessions.ReleaseTurn(sessionID)
+					turnCtx, cancel := context.WithTimeout(sessCtx, 10*time.Minute)
+					defer cancel()
+					_, _ = s.sessions.SendApproval(turnCtx, sessionID, callID, approved)
+				}(sess.ctx, req.CallID, req.Approved)
+				writeJSON(w, http.StatusAccepted, map[string]string{"status": "processing"})
+			default:
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			}
 		case "memory":
 			if r.Method == http.MethodGet {
 				sess, ok := s.sessions.GetSession(sessionID)

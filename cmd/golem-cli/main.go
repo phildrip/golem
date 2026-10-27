@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-isatty"
+	"github.com/user/golem/pkg/approval"
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/importer"
@@ -201,6 +203,41 @@ type streamableAgent interface {
 	ProcessStream(ctx context.Context, prompt string, handler golem.StreamHandler) (string, error)
 }
 
+// approvableAgent is the readline transport's view of the sandbox confirmation
+// flow: a turn that stopped for a human can be answered here, because this
+// transport has the human on the same goroutine and nothing else to do.
+type approvableAgent interface {
+	streamableAgent
+	PendingApproval() (approval.Request, bool)
+	RespondToApproval(ctx context.Context, callID string, approved bool, handler golem.StreamHandler) (string, error)
+}
+
+// streamTurnWithApprovals runs one turn and, when the sandbox stops it for a
+// human, asks on the terminal and resumes the same turn with the answer.
+func streamTurnWithApprovals(ctx context.Context, agent AgentProcessor, sa streamableAgent, input string, bridge *cliStreamBridge, scanner *bufio.Scanner, out io.Writer) error {
+	_, err := sa.ProcessStream(ctx, input, bridge)
+	for errors.Is(err, golem.ErrAwaitingApproval) {
+		approver, ok := agent.(approvableAgent)
+		if !ok {
+			return fmt.Errorf("this turn needs an approval, but the agent cannot take one")
+		}
+		req, ok := approver.PendingApproval()
+		if !ok {
+			return fmt.Errorf("the turn stopped for approval but no call is pending")
+		}
+		fmt.Fprintf(out, "\n\n[Approval needed] %s\n", req.Hint)
+		fmt.Fprint(out, "Run it? [y/N]: ")
+		approved := false
+		if scanner.Scan() {
+			answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
+			approved = answer == "y" || answer == "yes"
+		}
+		fmt.Fprint(out, "\nGolem: ")
+		_, err = approver.RespondToApproval(ctx, req.CallID, approved, bridge)
+	}
+	return err
+}
+
 // runReadlineLoop executes non-TUI line-based conversation with Golem.
 func runReadlineLoop(ctx context.Context, agent AgentProcessor, scanner *bufio.Scanner, out io.Writer) error {
 	fmt.Fprintln(out, "Ready! Type your message, or 'exit' / 'quit' to end.")
@@ -222,8 +259,7 @@ func runReadlineLoop(ctx context.Context, agent AgentProcessor, scanner *bufio.S
 		if sa, ok := agent.(streamableAgent); ok {
 			fmt.Fprint(out, "\nGolem: ")
 			bridge := &cliStreamBridge{out: out}
-			_, err := sa.ProcessStream(ctx, input, bridge)
-			if err != nil {
+			if err := streamTurnWithApprovals(ctx, agent, sa, input, bridge, scanner, out); err != nil {
 				fmt.Fprintf(out, "\nError: %v\n\n", err)
 			} else {
 				fmt.Fprintln(out)

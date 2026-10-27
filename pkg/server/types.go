@@ -17,30 +17,33 @@ const (
 	WSEventSessionActive  WSEventType = "session_active"
 
 	// Message and streaming
-	WSEventUserPrompt     WSEventType = "user_prompt"
-	WSEventAgentChunk     WSEventType = "agent_chunk"
-	WSEventAgentDone      WSEventType = "agent_done"
+	WSEventUserPrompt WSEventType = "user_prompt"
+	WSEventAgentChunk WSEventType = "agent_chunk"
+	WSEventAgentDone  WSEventType = "agent_done"
 
 	// Tool execution
-	WSEventToolStart      WSEventType = "tool_start"
-	WSEventToolDone       WSEventType = "tool_done"
+	WSEventToolStart WSEventType = "tool_start"
+	WSEventToolDone  WSEventType = "tool_done"
 
 	// Swarm / Subagent lifecycle
-	WSEventSubagentStart  WSEventType = "subagent_start"
-	WSEventSubagentTool   WSEventType = "subagent_tool"
-	WSEventSubagentDone   WSEventType = "subagent_done"
-	WSEventSwarmMessage   WSEventType = "swarm_message"
-	WSEventSwarmLock      WSEventType = "swarm_lock"
+	WSEventSubagentStart WSEventType = "subagent_start"
+	WSEventSubagentTool  WSEventType = "subagent_tool"
+	WSEventSubagentDone  WSEventType = "subagent_done"
+	WSEventSwarmMessage  WSEventType = "swarm_message"
+	WSEventSwarmLock     WSEventType = "swarm_lock"
 
 	// Memory synchronization
-	WSEventMemoryAdded    WSEventType = "memory_added"
+	WSEventMemoryAdded WSEventType = "memory_added"
 
 	// Patch proposals
-	WSEventPatchProposed  WSEventType = "patch_proposed"
-	WSEventPatchApplied   WSEventType = "patch_applied"
+	WSEventPatchProposed WSEventType = "patch_proposed"
+	WSEventPatchApplied  WSEventType = "patch_applied"
 
 	// Profile configuration
 	WSEventProfileChanged WSEventType = "profile_changed"
+
+	// Human-in-the-Loop sandbox confirmation
+	WSEventApprovalRequest WSEventType = "approval_request"
 )
 
 // WSEvent is the standard JSON envelope transmitted over WebSockets.
@@ -69,6 +72,13 @@ type CreateSessionRequest struct {
 // SendMessageRequest is the payload for submitting a prompt to a session.
 type SendMessageRequest struct {
 	Prompt string `json:"prompt"`
+}
+
+// ApprovalRequest is the answer to a sandbox confirmation prompt: the call the
+// user was shown and their decision.
+type ApprovalRequest struct {
+	CallID   string `json:"call_id"`
+	Approved bool   `json:"approved"`
 }
 
 // PatchRequest defines a hashline patch execution request via REST.

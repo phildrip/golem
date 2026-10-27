@@ -956,5 +956,3 @@ func TestSessionManager_SessionIDPropagation(t *testing.T) {
 		t.Errorf("expected sess.Agent.SessionID() to match %q, got %q", sess.ID, sess.Agent.SessionID())
 	}
 }
-
-

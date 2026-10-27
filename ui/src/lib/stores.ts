@@ -15,6 +15,9 @@ export const swarmLocks = writable<Record<string, ResourceLock[]>>({});
 export const isGenerating = writable<Record<string, boolean>>({});
 export const serverConnected = writable<boolean>(false);
 
+// Sandbox confirmations waiting for a human, per session.
+export const pendingApprovals = writable<Record<string, import('./types').ApprovalPrompt | null>>({});
+
 // Active profile & profiles catalog
 export const activeProfile = writable<string>('default');
 export const profilesList = writable<Record<string, ProfileConfig>>({});

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/user/golem/pkg/approval"
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/importer"
 	"github.com/user/golem/pkg/memory/fractal"
@@ -348,6 +349,49 @@ func (sm *SessionManager) SendPrompt(ctx context.Context, sessionID, prompt stri
 	}
 
 	response, err := sess.Agent.ProcessStream(ctx, prompt, handler)
+	if errors.Is(err, golem.ErrAwaitingApproval) {
+		// The sandbox stopped the turn for a human. The prompt itself has
+		// already been broadcast; the client answers it with SendApproval, so
+		// this is not an error the UI should render.
+		_ = sm.hub.Broadcast(WSEventAgentDone, sessionID, map[string]any{
+			"awaiting_approval": true,
+		})
+		return "", err
+	}
+	if err != nil {
+		_ = sm.hub.Broadcast(WSEventAgentDone, sessionID, map[string]any{
+			"error": err.Error(),
+		})
+		return "", err
+	}
+
+	_ = sm.hub.Broadcast(WSEventAgentDone, sessionID, map[string]any{
+		"response": response,
+	})
+	return response, nil
+}
+
+// SendApproval answers a pending sandbox confirmation and resumes the turn it
+// paused. A second confirmation in the same turn returns ErrAwaitingApproval
+// again and is broadcast like the first.
+func (sm *SessionManager) SendApproval(ctx context.Context, sessionID, callID string, approved bool) (string, error) {
+	sess, ok := sm.GetSession(sessionID)
+	if !ok {
+		return "", errors.Errorf("session %s not found", sessionID)
+	}
+
+	handler := &sessionStreamAdapter{
+		sessionID: sessionID,
+		hub:       sm.hub,
+	}
+
+	response, err := sess.Agent.RespondToApproval(ctx, callID, approved, handler)
+	if errors.Is(err, golem.ErrAwaitingApproval) {
+		_ = sm.hub.Broadcast(WSEventAgentDone, sessionID, map[string]any{
+			"awaiting_approval": true,
+		})
+		return "", err
+	}
 	if err != nil {
 		_ = sm.hub.Broadcast(WSEventAgentDone, sessionID, map[string]any{
 			"error": err.Error(),
@@ -372,6 +416,16 @@ func (a *sessionStreamAdapter) OnChunk(token string) {
 	_ = a.hub.Broadcast(WSEventAgentChunk, a.sessionID, map[string]string{
 		"token": token,
 		"delta": token,
+	})
+}
+
+func (a *sessionStreamAdapter) OnApprovalRequest(req approval.Request) {
+	_ = a.hub.Broadcast(WSEventApprovalRequest, a.sessionID, map[string]any{
+		"call_id": req.CallID,
+		"tool":    req.Tool,
+		"hint":    req.Hint,
+		"action":  req.Action,
+		"reason":  req.Reason,
 	})
 }
 

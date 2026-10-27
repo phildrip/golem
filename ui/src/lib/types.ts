@@ -14,7 +14,18 @@ export type WSEventType =
 	| 'patch_proposed'
 	| 'patch_applied'
 	| 'swarm_message'
-	| 'swarm_lock';
+	| 'swarm_lock'
+	| 'approval_request';
+
+// ApprovalPrompt is a sandbox confirmation waiting for a human: the exact
+// command or patch, plus why the policy asked.
+export interface ApprovalPrompt {
+	call_id: string;
+	tool: string;
+	hint: string;
+	action: string;
+	reason?: string;
+}
 
 export interface SwarmMessage {
 	id: string;

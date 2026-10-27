@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/user/golem/pkg/approval"
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/memory/fractal"
@@ -144,20 +145,26 @@ type Model struct {
 	profileContent     string
 	profileViewport    viewport.Model
 	showModelModal     bool
-	modelCatalog       golem.ModelCatalog
-	modelSelection     int
-	modelViewport      viewport.Model
-	modelCatalogAt     time.Time
-	currentProfile     string
-	inputHistory       []string
-	historyIndex       int
-	currentDraft       string
-	statusMessage      string
-	statusMessageAt    time.Time
-	cancelTurn         context.CancelFunc
-	streamChan         <-chan tea.Msg
-	isBlurred          bool
-	expandTools        bool
+
+	// Sandbox confirmation state: the call waiting for a human answer and the
+	// context of the paused turn that answer resumes.
+	showApprovalModal bool
+	pendingApproval   *approval.Request
+	turnCtx           context.Context
+	modelCatalog      golem.ModelCatalog
+	modelSelection    int
+	modelViewport     viewport.Model
+	modelCatalogAt    time.Time
+	currentProfile    string
+	inputHistory      []string
+	historyIndex      int
+	currentDraft      string
+	statusMessage     string
+	statusMessageAt   time.Time
+	cancelTurn        context.CancelFunc
+	streamChan        <-chan tea.Msg
+	isBlurred         bool
+	expandTools       bool
 
 	// mouseEnabled tracks whether the terminal has been asked to send mouse
 	// events to Golem. Ctrl+G toggles it so tmux/terminal scrolling and native
@@ -340,6 +347,10 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.relayout()
 
 	case tea.KeyMsg:
+		if m.showApprovalModal {
+			return m.handleApprovalKey(msg)
+		}
+
 		if m.showModelModal {
 			return m.handleModelModalKey(msg)
 		}
@@ -890,6 +901,10 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			msg.attachment.Chip(len(m.attachments))))
 		return m, nil
 
+	case approvalRequestMsg:
+		m.openApprovalPrompt(msg.req)
+		return m, nil
+
 	case agentChunkMsg:
 		m.streamingReply += string(msg)
 		m.renderAndFollow()
@@ -942,6 +957,11 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderAndFollow()
 
 	case agentDoneMsg:
+		if awaitingApproval(msg.err) {
+			// The turn is paused on a sandbox confirmation, not finished: the
+			// prompt is already open and answering it resumes this same turn.
+			return m, nil
+		}
 		if !m.isLoading {
 			// Already canceled or interrupted by Ctrl+C
 			return m, nil
@@ -1065,6 +1085,10 @@ func (m Model) handleMouse(msg tea.MouseMsg) Model {
 func (m Model) View() string {
 	if !m.ready {
 		return "Initializing Golem TUI..."
+	}
+
+	if m.showApprovalModal {
+		return m.renderApprovalModalView()
 	}
 
 	if m.showModelModal {
@@ -1560,6 +1584,7 @@ func listenStreamCmd(msgChan <-chan tea.Msg) tea.Cmd {
 func (m *Model) runAgentTurnCmd(ctx context.Context, input string, images []golem.ImageInput) tea.Cmd {
 	msgChan := make(chan tea.Msg, 2048)
 	m.streamChan = msgChan
+	m.turnCtx = ctx
 	bridge := &tuiStreamBridge{
 		ctx:     ctx,
 		msgChan: msgChan,

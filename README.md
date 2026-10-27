@@ -100,7 +100,8 @@ The Web UI cockpit renders the live agent hierarchy, the message traffic between
 
 **Sandbox**
 - Every tool that can touch the host — `shell`, the file tools, `hashline_patch`, `web_fetch` and `web_search` — asks one policy layer first (`pkg/sandbox`), so there is exactly one place to reason about what the agent may do.
-- The default mode is `policy`: dangerous shell shapes are refused with a tool error the model can route around (`rm -rf ~`, `git checkout .`, `git reset --hard`, `git clean -fdx`, `sudo`, `curl … | sh`, `mkfs`, `dd of=/dev/…`, `chmod 777 /`, `shutdown`/`reboot`), and writes are confined to the workspace, with `allow_write` adding directories. `git push --force` and `git branch -D` come back as *confirm*; until the interactive approval gate lands that is reported as a refusal with the reason attached.
+- The default mode is `policy`: dangerous shell shapes are refused with a tool error the model can route around (`rm -rf ~`, `git checkout .`, `git reset --hard`, `git clean -fdx`, `sudo`, `curl … | sh`, `mkfs`, `dd of=/dev/…`, `chmod 777 /`, `shutdown`/`reboot`), and writes are confined to the workspace, with `allow_write` adding directories. `git push --force` and `git branch -D` come back as *confirm* rather than *deny*.
+- **Approval (`require_confirm`)**: list a tool there (`require_confirm: ["shell"]`) and every call to it stops for a human, whatever the command looks like. The prompt shows the exact command line or patch being approved, never a summary, plus the policy's reason. The turn pauses on the ADK Human-in-the-Loop flow (`adk_request_confirmation`); *yes* runs the call and the model carries on, *no* returns a tool error the model can route around. Each transport renders it its own way: a TUI modal (`y` run it, `n`/`Esc` refuse), an amber banner with **Run it**/**Refuse** in the web cockpit (the pending prompt survives a reconnect, because the server can hand it out again), and a `Run it? [y/N]` line in readline mode. Subagents run their tool set *unattended*: they never prompt, and a call that would need approval is refused instead — a delegate cannot approve on your behalf.
 - `sandbox.mode: "isolation"` enforces the same intent with the kernel instead of with a string check. Shell commands run under [Landlock](https://landlock.io), which golem applies to itself and which survives `exec`, so the command sees only the workspace, the toolchain and the system trees, cannot write outside them, and cannot reach the network unless `network` is `"host"`. It needs no root, no user namespaces, no `bwrap`/`nsjail` and no daemon: `pkg/sandbox` re-executes the golem binary as the confinement shim, so the whole sandbox is inside the binary you built. Where the kernel has Landlock ABI 6 or newer the command also cannot signal anything outside the sandbox, so a prompt-injected model cannot kill the agent that spawned it. The banner prints the ABI and what it enforces, and a kernel without Landlock is a startup error rather than a silent downgrade to policy.
 - `allow_write` adds writable directories and `read_only` adds readable ones. The defaults are `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/opt`, `/usr/local` and `$GOROOT` readable; the workspace, `/tmp`, `/dev/null`, `$GOPATH`, `$GOCACHE` and the usual build caches writable. `$HOME` and `/proc` are deliberately *not* granted — `/proc` would hand the command the agent's own environment.
 - `sandbox.mode: "off"` restores the pre-sandbox behaviour exactly (nothing is checked). `allow_net` optionally pins the hosts `web_fetch`/`web_search` may reach.
@@ -198,7 +199,8 @@ Example `~/.golem/config.json`:
         "network": "none",
         "allow_write": ["~/scratch"],
         "read_only": ["/srv/datasets"],
-        "allow_net": ["example.com"]
+        "allow_net": ["example.com"],
+        "require_confirm": ["shell"]
       }
     }
   },

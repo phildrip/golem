@@ -118,7 +118,13 @@ type Agent struct {
 	dynModel            *dynamicModel
 	modelFactory        *subagent.ModelFactory
 	currentProfileMount string
-	sandbox             *sandbox.Policy
+
+	// Human-in-the-Loop state: the confirmation waiting for an answer and the
+	// session the answer resumes (see RespondToApproval).
+	approvalMu      sync.Mutex
+	pendingApproval *approval.Request
+	pendingSession  string
+	sandbox         *sandbox.Policy
 }
 
 // dynamicModel is a thread-safe proxy implementing model.LLM that allows hot-swapping the active LLM client.
@@ -848,6 +854,12 @@ func (a *Agent) ProcessStream(ctx context.Context, input string, handler StreamH
 // prompt text (which carries the TUI's image chips) is what gets logged to
 // fractal memory; the image bytes ride along with this turn's model request only.
 func (a *Agent) ProcessStreamImages(ctx context.Context, input string, images []ImageInput, handler StreamHandler) (string, error) {
+	// One turn at a time: a call waiting for approval belongs to the turn that
+	// raised it, and starting another would orphan the prompt.
+	if pending, ok := a.PendingApproval(); ok {
+		return "", fmt.Errorf("a tool call (%s) is still waiting for approval; answer it before starting a new turn", pending.Tool)
+	}
+
 	// Build the turn content first: a bad attachment must fail before the turn is
 	// logged, so memory never records a prompt that was never sent.
 	content, err := buildUserContent(input, images)
@@ -881,84 +893,18 @@ func (a *Agent) ProcessStreamImages(ctx context.Context, input string, images []
 
 	// 2. Content was prepared above (text + any inline images).
 
-	// 3. Execute ADK runner with retry for transient server spikes (503 / 429)
-	var finalResponse string
-	maxRetries := 3
-	backoff := 2 * time.Second
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		var responseBuilder strings.Builder
-		var runErr error
-
-		// Generate a fresh session ID per turn to ensure stateless runner execution.
-		// Persistent memory is solely owned and injected via Fractal Memory view.
-		turnSessionID := fmt.Sprintf("turn-%d", time.Now().UnixNano())
-
-		runCtx := ctx
-		if a.sessionID != "" {
-			runCtx = openai.WithSessionID(runCtx, a.sessionID)
-		}
-
-		eventsSeq := a.runner.Run(runCtx, a.userID, turnSessionID, content, agent.RunConfig{
-			StreamingMode: agent.StreamingModeSSE,
-		})
-		for ev, err := range eventsSeq {
-			if err != nil {
-				runErr = err
-				break
-			}
-
-			if ev != nil && ev.Content != nil {
-				if ev.Partial {
-					for _, part := range ev.Content.Parts {
-						if part.Thought {
-							continue
-						}
-						if part.Text != "" {
-							responseBuilder.WriteString(part.Text)
-							if handler != nil {
-								handler.OnChunk(part.Text)
-							}
-						}
-					}
-				} else if responseBuilder.Len() == 0 {
-					for _, part := range ev.Content.Parts {
-						if part.Thought {
-							continue
-						}
-						if part.Text != "" {
-							responseBuilder.WriteString(part.Text)
-							if handler != nil {
-								handler.OnChunk(part.Text)
-							}
-						}
-					}
-				}
-			}
-		}
-
-		if runErr == nil {
-			finalResponse = responseBuilder.String()
-			break
-		}
-
-		// Only restart a turn from scratch when nothing has executed yet. Once a
-		// tool has run, a restart would re-execute its side effects and discard
-		// all work, so surface the error (with any partial text) instead.
-		if shouldRestartTurn(runErr, attempt, maxRetries, a.turnToolCallCount()) {
-			if a.cfg.OnRetry != nil {
-				a.cfg.OnRetry(attempt, maxRetries, backoff)
-			}
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-time.After(backoff):
-				backoff *= 2
-				continue
-			}
-		}
-
-		return responseBuilder.String(), errors.Wrap(runErr, "running adk agent")
+	// 3. Run the model, retrying transient server spikes (503 / 429).
+	turnSessionID := fmt.Sprintf("turn-%d", time.Now().UnixNano())
+	finalResponse, err := a.streamPass(ctx, turnSessionID, content, handler)
+	if err != nil {
+		return "", err
+	}
+	if pending := a.pendingApprovalRequest(); pending != nil {
+		// The policy wants a human. The turn stays open: the answer resumes it
+		// through RespondToApproval, which re-runs the runner on this same
+		// session so the ADK can re-dispatch the held call.
+		a.setPendingApproval(turnSessionID, pending)
+		return "", ErrAwaitingApproval
 	}
 
 	// 4. Log agent response to fractal store

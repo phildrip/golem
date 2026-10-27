@@ -9,6 +9,7 @@
 	import PatchInspector from '$lib/components/PatchInspector.svelte';
 	import ImportModal from '$lib/components/ImportModal.svelte';
 	import ProfileModal from '$lib/components/ProfileModal.svelte';
+	import ApprovalBanner from '$lib/components/ApprovalBanner.svelte';
 	import { realtime, getProfiles } from '$lib/client';
 	import { fetchAuthStatus, login } from '$lib/auth';
 	import {
@@ -20,6 +21,7 @@
 		patches,
 		swarmMessages,
 		swarmLocks,
+		pendingApprovals,
 		isGenerating,
 		serverConnected,
 		activeProfile,
@@ -27,7 +29,7 @@
 		userConfigPath,
 		workspaceConfigPath
 	} from '$lib/stores';
-	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal, SwarmMessage, ResourceLock, SwarmLockEvent, ProfilesResponse } from '$lib/types';
+	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal, SwarmMessage, ResourceLock, SwarmLockEvent, ProfilesResponse, ApprovalPrompt } from '$lib/types';
 
 	let activeSession = $derived(
 		$sessions.find((s) => s.id === $activeSessionId) || null
@@ -59,6 +61,10 @@
 
 	let currentGenerating = $derived(
 		$activeSessionId ? Boolean($isGenerating[$activeSessionId]) : false
+	);
+
+	let currentApproval = $derived(
+		$activeSessionId ? ($pendingApprovals[$activeSessionId] ?? null) : null
 	);
 
 	let showMemoryExplorer = $state(false);
@@ -126,6 +132,7 @@
 				fetchProfiles();
 				if ($activeSessionId) {
 					fetchSessionMemory($activeSessionId);
+					void refreshPendingApproval($activeSessionId);
 				}
 			} else {
 				// Clear stuck generation states on disconnect
@@ -237,6 +244,42 @@
 	}
 
 	const ALLOWED_OPS = new Set(['SWAP', 'DEL', 'INS_PRE', 'INS_POST', 'SWAP.BLK', 'DEL.BLK', 'INS.BLK.PRE', 'INS.BLK.POST']);
+
+	// answerApproval delivers the user's decision on a sandbox confirmation and
+	// resumes the paused turn server-side.
+	async function answerApproval(approved: boolean) {
+		const sessId = $activeSessionId;
+		const prompt = currentApproval;
+		if (!sessId || !prompt) return;
+
+		$pendingApprovals = { ...$pendingApprovals, [sessId]: null };
+
+		const res = await fetch(`/api/sessions/${sessId}/approval`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ call_id: prompt.call_id, approved })
+		});
+		if (!res.ok) {
+			// Put the prompt back: the answer never reached the agent.
+			$pendingApprovals = { ...$pendingApprovals, [sessId]: prompt };
+			$isGenerating = { ...$isGenerating, [sessId]: false };
+		}
+	}
+
+	// refreshPendingApproval re-renders a prompt that outlived a reconnect.
+	async function refreshPendingApproval(sessId: string) {
+		try {
+			const res = await fetch(`/api/sessions/${sessId}/approval`);
+			if (!res.ok) return;
+			const data = (await res.json()) as { pending?: boolean } & ApprovalPrompt;
+			$pendingApprovals = {
+				...$pendingApprovals,
+				[sessId]: data.pending ? data : null
+			};
+		} catch {
+			// Offline: the next event or reload will resync.
+		}
+	}
 
 	async function applyPatch(patch: PatchProposal) {
 		if (!ALLOWED_OPS.has(patch.op)) {
@@ -417,8 +460,14 @@
 			}
 
 			case 'agent_done': {
+				const payload = event.payload as { response?: string; error?: string; awaiting_approval?: boolean };
+				if (payload.awaiting_approval) {
+					// Paused on a confirmation, not finished: the banner is up and
+					// answering it resumes this same turn.
+					$isGenerating = { ...$isGenerating, [sessId]: true };
+					break;
+				}
 				$isGenerating = { ...$isGenerating, [sessId]: false };
-				const payload = event.payload as { response?: string; error?: string };
 				if (payload.error) {
 					const msg = getOrCreateAssistantMessage(sessId, event.timestamp);
 					if (msg.content) {
@@ -435,6 +484,14 @@
 					}
 				}
 				fetchSessionMemory(sessId);
+				break;
+			}
+
+			case 'approval_request': {
+				// The sandbox stopped the turn: a tool call is waiting for a human.
+				const payload = event.payload as ApprovalPrompt;
+				$pendingApprovals = { ...$pendingApprovals, [sessId]: payload };
+				$isGenerating = { ...$isGenerating, [sessId]: true };
 				break;
 			}
 
@@ -692,6 +749,13 @@
 				messages={currentMessages}
 				isGenerating={currentGenerating}
 			/>
+			{#if currentApproval}
+				<ApprovalBanner
+					prompt={currentApproval}
+					onApprove={() => answerApproval(true)}
+					onDeny={() => answerApproval(false)}
+				/>
+			{/if}
 			<PromptInput
 				disabled={currentGenerating}
 				onSubmit={submitPrompt}
