@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -38,7 +40,11 @@ type CLIOptions struct {
 	Mouse             bool
 	Theme             string
 	Serve             bool
+	WebHost           string
 	WebPort           int
+	WebPortSet        bool
+	WebToken          string
+	NoWebAuth         bool
 	Import            string
 	CompactorModel    string
 	CompactorProvider string
@@ -67,6 +73,9 @@ func parseFlags(args []string) (CLIOptions, error) {
 	serveFlag := fs.Bool("serve", false, "Launch realtime Web UI multiplexer server")
 	webFlag := fs.Bool("web", false, "Launch realtime Web UI multiplexer server (alias for -serve)")
 	portFlag := fs.Int("port", 8080, "Port for realtime Web UI server (default: 8080)")
+	hostFlag := fs.String("host", "", "Interface to bind the web server to (default 127.0.0.1; use your tailscale IP or 0.0.0.0 to reach it from a phone)")
+	tokenFlag := fs.String("token", "", "Web auth token (default: generated once and stored in config.json)")
+	noWebAuthFlag := fs.Bool("no-web-auth", false, "Disable web auth entirely (only safe when bound to loopback)")
 	importFlag := fs.String("import", "", "Import past chat history: 'pick' (interactive), 'latest', or path/UUID")
 	compactorModelFlag := fs.String("compactor-model", "", "Dedicated model for background fractal memory compaction (e.g. gemini-2.5-flash, gpt-4o-mini)")
 	compactorProviderFlag := fs.String("compactor-provider", "", "Dedicated provider for compactor: gemini, opencode, openai, openrouter")
@@ -74,6 +83,11 @@ func parseFlags(args []string) (CLIOptions, error) {
 	if err := fs.Parse(args); err != nil {
 		return CLIOptions{}, err
 	}
+
+	// Track which flags the user actually set, so a config-file value can win
+	// over a flag default without winning over an explicit flag.
+	setFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 
 	return CLIOptions{
 		Profile:           *profileFlag,
@@ -89,7 +103,11 @@ func parseFlags(args []string) (CLIOptions, error) {
 		Mouse:             *mouseFlag,
 		Theme:             *themeFlag,
 		Serve:             *serveFlag || *webFlag,
+		WebHost:           *hostFlag,
 		WebPort:           *portFlag,
+		WebPortSet:        setFlags["port"],
+		WebToken:          *tokenFlag,
+		NoWebAuth:         *noWebAuthFlag,
 		Import:            *importFlag,
 		CompactorModel:    *compactorModelFlag,
 		CompactorProvider: *compactorProviderFlag,
@@ -221,6 +239,87 @@ func runReadlineLoop(ctx context.Context, agent AgentProcessor, scanner *bufio.S
 	return scanner.Err()
 }
 
+// webServerConfig is the resolved listen/token configuration for -serve.
+type webServerConfig struct {
+	host         string
+	port         int
+	token        string
+	tokenPath    string
+	allowOrigins []string
+	loopback     bool
+}
+
+// displayURL renders the address a human should open. A wildcard bind is shown
+// as localhost because that is where it is reachable from the same machine.
+func (w webServerConfig) displayURL() string {
+	host := w.host
+	if host == "0.0.0.0" || host == "::" || host == "" {
+		host = "localhost"
+	}
+	return fmt.Sprintf("http://%s", net.JoinHostPort(host, strconv.Itoa(w.port)))
+}
+
+// isLoopbackHost reports whether host binds only the loopback interface.
+func isLoopbackHost(host string) bool {
+	if host == "" || host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// resolveWebServerConfig merges flags, the config file [server] block and
+// generated defaults, and persists a token on first use.
+func resolveWebServerConfig(opts CLIOptions, cfg config.ServerConfig) (webServerConfig, error) {
+	out := webServerConfig{
+		host:         opts.WebHost,
+		port:         opts.WebPort,
+		allowOrigins: cfg.AllowOrigins,
+	}
+	if out.host == "" {
+		out.host = cfg.Host
+	}
+	if out.host == "" {
+		out.host = server.DefaultListenHost
+	}
+	if !opts.WebPortSet && cfg.Port > 0 {
+		out.port = cfg.Port
+	}
+	if out.port <= 0 {
+		out.port = 8080
+	}
+	out.loopback = isLoopbackHost(out.host)
+
+	token := opts.WebToken
+	if token == "" {
+		token = cfg.Token
+	}
+	if token == "" && !opts.NoWebAuth {
+		path := opts.ConfigPath
+		if path == "" {
+			var err error
+			if path, err = config.DefaultPath(); err != nil {
+				return out, err
+			}
+		}
+		// Re-read so a token generated here is written to the on-disk file rather
+		// than to the profile-mangled copy already merged in memory.
+		fresh, err := config.Load(path)
+		if err != nil {
+			return out, err
+		}
+		if token, err = config.EnsureWebToken(&fresh, path); err != nil {
+			return out, err
+		}
+		out.tokenPath = path
+	}
+	if opts.NoWebAuth {
+		token = ""
+	}
+	out.token = token
+	return out, nil
+}
+
 func main() {
 	opts, err := parseFlags(os.Args[1:])
 	if err != nil {
@@ -232,6 +331,13 @@ func main() {
 	fileCfg, err := config.LoadAll(workDir, opts.ConfigPath)
 	if err != nil {
 		log.Printf("Note: could not load config file: %v", err)
+	}
+
+	// The [server] block is top-level, so capture it before ApplyProfile replaces
+	// the top-level provider fields with the active profile's.
+	serverCfg := config.ServerConfig{}
+	if fileCfg.Server != nil {
+		serverCfg = *fileCfg.Server
 	}
 
 	// Resolve active profile
@@ -278,11 +384,30 @@ func main() {
 	fmt.Println(formatAuthStatus(cfg.Provider, cfg.APIKey))
 
 	if opts.Serve {
-		fmt.Printf("\n🚀 Launching Golem Realtime Multiplexer Server on http://localhost:%d\n", opts.WebPort)
+		webCfg, err := resolveWebServerConfig(opts, serverCfg)
+		if err != nil {
+			log.Fatalf("Web server config: %v", err)
+		}
+
+		fmt.Printf("\n🚀 Golem Realtime Multiplexer on %s\n", webCfg.displayURL())
+		if webCfg.token != "" {
+			fmt.Printf("   Web auth token: %s\n", webCfg.token)
+			if webCfg.tokenPath != "" {
+				fmt.Printf("   (stored in %s; open the URL on your phone and paste it once)\n", webCfg.tokenPath)
+			}
+		} else {
+			fmt.Printf("   ⚠️  Web auth DISABLED (-no-web-auth): any client that can reach this port can drive this agent\n")
+		}
+		if !webCfg.loopback {
+			fmt.Printf("   ⚠️  Bound to %s, not loopback: reachable from other hosts\n", webCfg.host)
+		}
 		fmt.Printf("Web UI Cockpit active with parallel session tabs, swarm hierarchy, and fractal memory explorer.\n\n")
 
 		srv := server.NewServer(server.ServerConfig{
-			Port:         opts.WebPort,
+			Host:         webCfg.host,
+			Port:         webCfg.port,
+			Token:        webCfg.token,
+			AllowOrigins: webCfg.allowOrigins,
 			BaseAgentCfg: cfg,
 			StaticFS:     server.GetEmbeddedUIFS(),
 		})

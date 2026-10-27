@@ -2,6 +2,8 @@ package config
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -59,6 +61,18 @@ type WebConfig struct {
 	MaxFetch int    `json:"max_fetch_bytes,omitempty"`
 }
 
+// ServerConfig configures the -serve HTTP/WebSocket listener.
+//
+// Host defaults to loopback. Token is the bearer credential required on /api/*
+// and /ws; it is generated on first use and persisted here so a phone can be
+// authorised once and stay authorised.
+type ServerConfig struct {
+	Host         string   `json:"host,omitempty"`
+	Port         int      `json:"port,omitempty"`
+	Token        string   `json:"token,omitempty"`
+	AllowOrigins []string `json:"allow_origins,omitempty"`
+}
+
 // ProfileConfig encapsulates provider settings, model preferences, and memory directories
 // for a named profile (e.g. "work", "personal").
 type ProfileConfig struct {
@@ -93,6 +107,7 @@ type FileConfig struct {
 	Providers       map[string]ProviderConfig `json:"providers,omitempty"`
 	Compactor       *CompactorConfig          `json:"compactor,omitempty"`
 	Web             *WebConfig                `json:"web,omitempty"`
+	Server          *ServerConfig             `json:"server,omitempty"`
 }
 
 // UserDir returns Golem's user configuration directory.
@@ -204,6 +219,36 @@ func Save(path string, cfg FileConfig) error {
 		return errors.Wrapf(err, "renaming temp config to %s", path)
 	}
 	return nil
+}
+
+// EnsureWebToken returns the configured web auth token, generating and
+// persisting one on first use. An empty token means "no auth", so this is what
+// keeps a real deployment from silently running unauthenticated.
+func EnsureWebToken(cfg *FileConfig, configPath string) (string, error) {
+	if cfg.Server == nil {
+		cfg.Server = &ServerConfig{}
+	}
+	if cfg.Server.Token != "" {
+		return cfg.Server.Token, nil
+	}
+
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", errors.Wrap(err, "generating web auth token")
+	}
+	cfg.Server.Token = hex.EncodeToString(buf)
+
+	if configPath == "" {
+		var err error
+		configPath, err = DefaultPath()
+		if err != nil {
+			return "", err
+		}
+	}
+	if err := Save(configPath, *cfg); err != nil {
+		return "", errors.Wrapf(err, "persisting web auth token to %s", configPath)
+	}
+	return cfg.Server.Token, nil
 }
 
 // ResolveAPIKey determines the API key in priority order:
@@ -488,6 +533,27 @@ func MergeConfigs(userCfg, wsCfg FileConfig) FileConfig {
 		}
 		for k, v := range wsCfg.Profiles {
 			merged.Profiles[k] = v
+		}
+	}
+
+	if wsCfg.Server != nil {
+		if merged.Server == nil {
+			merged.Server = &ServerConfig{}
+		} else {
+			clone := *merged.Server
+			merged.Server = &clone
+		}
+		if wsCfg.Server.Host != "" {
+			merged.Server.Host = wsCfg.Server.Host
+		}
+		if wsCfg.Server.Port > 0 {
+			merged.Server.Port = wsCfg.Server.Port
+		}
+		if wsCfg.Server.Token != "" {
+			merged.Server.Token = wsCfg.Server.Token
+		}
+		if len(wsCfg.Server.AllowOrigins) > 0 {
+			merged.Server.AllowOrigins = append([]string(nil), wsCfg.Server.AllowOrigins...)
 		}
 	}
 

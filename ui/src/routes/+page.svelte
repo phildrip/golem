@@ -10,6 +10,7 @@
 	import ImportModal from '$lib/components/ImportModal.svelte';
 	import ProfileModal from '$lib/components/ProfileModal.svelte';
 	import { realtime, getProfiles } from '$lib/client';
+	import { fetchAuthStatus, login } from '$lib/auth';
 	import {
 		sessions,
 		activeSessionId,
@@ -77,8 +78,46 @@
 		}
 	}
 
-	onMount(() => {
+	// Auth gate: the SPA shell loads unauthenticated, so ask the server whether a
+	// token is needed before opening the WebSocket or fetching any session data.
+	let authState: 'checking' | 'locked' | 'open' = 'checking';
+	let tokenInput = '';
+	let authError = '';
+	let authSubmitting = false;
+
+	async function checkAuthThenConnect() {
+		try {
+			const status = await fetchAuthStatus();
+			if (status.authRequired && !status.authenticated) {
+				authState = 'locked';
+				return;
+			}
+		} catch {
+			// Server unreachable: fall through so the normal disconnected state shows.
+		}
+		authState = 'open';
 		realtime.connect();
+	}
+
+	async function submitToken(event: Event) {
+		event.preventDefault();
+		const token = tokenInput.trim();
+		if (!token || authSubmitting) return;
+		authSubmitting = true;
+		authError = '';
+		const ok = await login(token);
+		authSubmitting = false;
+		if (ok) {
+			// Reload rather than resume in place: the cookie now authenticates every
+			// fetch and the WebSocket, so a clean boot is simpler than re-seeding state.
+			window.location.reload();
+			return;
+		}
+		authError = 'That token was not accepted.';
+	}
+
+	onMount(() => {
+		void checkAuthThenConnect();
 
 		unsubscribeConn = realtime.onConnectionChange((connected) => {
 			$serverConnected = connected;
@@ -523,6 +562,41 @@
 </script>
 
 <div class="h-screen w-screen flex flex-col bg-[#0b0f19] text-slate-100 overflow-hidden font-sans">
+	{#if authState === 'locked'}
+		<div class="fixed inset-0 z-[100] flex items-center justify-center bg-[#0b0f19] p-6">
+			<form class="w-full max-w-sm flex flex-col gap-3" onsubmit={submitToken}>
+				<div class="flex items-center gap-2 font-bold tracking-tight text-white">
+					<div class="h-7 w-7 rounded-lg bg-blue-600 flex items-center justify-center">
+						<Bot class="w-4 h-4" />
+					</div>
+					<span>Golem</span>
+				</div>
+				<p class="text-xs text-slate-400 leading-relaxed">
+					This server requires an access token. It is printed in the terminal running
+					<code class="font-mono text-slate-300">golem -serve</code> and stored in
+					<code class="font-mono text-slate-300">~/.golem/config.json</code>.
+				</p>
+				<input
+					bind:value={tokenInput}
+					type="password"
+					autocomplete="current-password"
+					placeholder="Access token"
+					class="w-full px-3 py-2.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-100 text-base placeholder:text-slate-600 focus:outline-none focus:border-blue-600"
+				/>
+				{#if authError}
+					<p class="text-xs text-red-400">{authError}</p>
+				{/if}
+				<button
+					type="submit"
+					disabled={authSubmitting || !tokenInput.trim()}
+					class="w-full px-3 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+				>
+					{authSubmitting ? 'Checking…' : 'Unlock'}
+				</button>
+			</form>
+		</div>
+	{/if}
+
 	<!-- Top Navigation Bar -->
 	<header class="flex items-center justify-between h-12 px-4 bg-[#090d16] border-b border-slate-800/80">
 		<div class="flex items-center gap-3">

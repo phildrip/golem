@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,9 +24,22 @@ import (
 	"github.com/user/golem/pkg/tools"
 )
 
+// DefaultListenHost keeps the server on loopback unless the operator opts in to
+// a wider bind. Exposing an unconfined agent shell to the network by default is
+// not a safe default.
+const DefaultListenHost = "127.0.0.1"
+
 // ServerConfig configures the HTTP and WebSocket multiplexer server.
 type ServerConfig struct {
-	Port         int
+	// Host is the interface to bind. Empty means DefaultListenHost (loopback).
+	Host string
+	Port int
+	// Token is the bearer token required on /api/* and /ws. Empty disables auth,
+	// which Start logs as a warning; the CLI always supplies one.
+	Token string
+	// AllowOrigins lists extra origins permitted to open a WebSocket beyond the
+	// request host and loopback (e.g. a tailscale serve hostname).
+	AllowOrigins []string
 	BaseAgentCfg golem.Config
 	StaticFS     fs.FS // embedded SvelteKit production build or nil
 }
@@ -33,6 +49,7 @@ type Server struct {
 	cfgMu      sync.RWMutex
 	configMu   sync.Mutex
 	cfg        ServerConfig
+	addr       string
 	hub        *Hub
 	sessions   *SessionManager
 	httpServer *http.Server
@@ -73,11 +90,17 @@ func NewServer(cfg ServerConfig) *Server {
 	if cfg.Port <= 0 {
 		cfg.Port = 8080
 	}
+	host := strings.TrimSpace(cfg.Host)
+	if host == "" {
+		host = DefaultListenHost
+	}
 	hub := NewHub()
+	hub.SetAllowOrigins(cfg.AllowOrigins)
 	sessions := NewSessionManager(cfg.BaseAgentCfg, hub)
 
 	s := &Server{
 		cfg:      cfg,
+		addr:     net.JoinHostPort(host, strconv.Itoa(cfg.Port)),
 		hub:      hub,
 		sessions: sessions,
 	}
@@ -86,16 +109,24 @@ func NewServer(cfg ServerConfig) *Server {
 	s.registerRoutes(mux)
 
 	s.httpServer = &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.Port),
-		Handler: mux,
+		Addr:    s.addr,
+		Handler: s.authMiddleware(mux),
 	}
 
 	return s
 }
 
+// Addr reports the resolved listen address (host:port).
+func (s *Server) Addr() string {
+	return s.addr
+}
+
 // Start boots the WebSocket hub and listens for HTTP requests.
 func (s *Server) Start() error {
 	go s.hub.Run()
+	if !s.AuthEnabled() {
+		log.Printf("WARNING: web auth is disabled; any client that can reach %s can drive this agent", s.addr)
+	}
 	return s.httpServer.ListenAndServe()
 }
 
@@ -121,6 +152,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		s.hub.HandleWS(w, r)
 	})
+
+	// Auth endpoints: the SPA uses /api/auth to decide between the chat and the
+	// token prompt, and /api/login to exchange a token for a cookie.
+	mux.HandleFunc("/api/auth", s.handleAuth)
+	mux.HandleFunc("/api/login", s.handleLogin)
+	mux.HandleFunc("/api/logout", s.handleLogout)
 
 	// History discovery & import endpoints
 	mux.HandleFunc("/api/importer/discover", func(w http.ResponseWriter, r *http.Request) {

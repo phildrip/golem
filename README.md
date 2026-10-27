@@ -103,6 +103,7 @@ The Web UI cockpit renders the live agent hierarchy, the message traffic between
 - **Images in the TUI**: `Ctrl+V` grabs a clipboard image — golem reads the clipboard itself (Wayland `wl-paste`, X11 `xclip`, macOS `pngpaste`), so tmux/terminal paste bindings don't matter — and dropping or typing an image path (`/tmp/shot.png`) attaches that file instead. `Ctrl+X` clears the queue. Attached images ride along with that turn as inline data for vision models; the transcript keeps the text chip (`[img 1: shot.png 1440x900 212KB]`) and the bytes are copied to `<memory-dir>/attachments/`, because fractal memory is a text log. The model is asked to say what it took from each image, so the picture stays recoverable from the text transcript after a restart.
 - **Readline CLI** for piping and non-interactive use.
 - **Web UI cockpit** (`-serve` / `-web`): parallel session tabs over WebSocket, swarm hierarchy view, and a fractal memory explorer. The SvelteKit SPA is embedded into the Go binary.
+- **Web auth**: `/api/*` and `/ws` require a bearer token (generated on first run, stored in `config.json`, overridable with `-token`). The SPA shell stays open so it can ask for the token, which it exchanges for an HttpOnly cookie — a browser cannot attach headers to a WebSocket handshake. The server binds `127.0.0.1` by default; widening it is an explicit `-host`.
 
 **Slash commands (TUI)**
 - Type `/` and the command palette opens above the prompt as you type: `Tab` completes the highlighted command, `↑`/`↓` move the highlight, `Enter` takes it, `Esc` dismisses. Once the command is complete (or arguments start) `Enter` runs it.
@@ -149,8 +150,11 @@ export GEMINI_API_KEY=...
 # Plain readline (no TUI)
 ./bin/golem -no-tui
 
-# Web UI cockpit
+# Web UI cockpit (loopback only, token auth on)
 ./bin/golem -serve -port 8080
+
+# Reachable from your phone over tailscale, still only on the tailnet
+./bin/golem -serve -host $(tailscale ip -4)
 ```
 
 Then just talk to it. Ask it to read a file, change some code, run the tests.
@@ -182,9 +186,17 @@ Example `~/.golem/config.json`:
         "model": "deepseek-chat"
       }
     }
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "token": "generated-on-first-serve-run",
+    "allow_origins": ["https://golem.tailnet.ts.net"]
   }
 }
 ```
+
+`server.token` is written automatically the first time you run `-serve`; delete it to get a fresh one (every authorised device will have to paste it again). `allow_origins` is only needed when a reverse proxy rewrites the `Host` header — `tailscale serve` does not.
 
 ### Common flags
 
@@ -201,6 +213,9 @@ Example `~/.golem/config.json`:
 | `-import pick\|latest\|<id>` | Import past session history |
 | `-no-tui` / `-tui` | Force plain CLI / force TUI |
 | `-serve` / `-web` / `-port <n>` | Web UI cockpit (default port 8080) |
+| `-host <iface>` | Interface the web server binds (default `127.0.0.1`; use your tailscale IP or `0.0.0.0` to reach it from a phone) |
+| `-token <tok>` | Web auth token (default: generated once and stored in `config.json`) |
+| `-no-web-auth` | Disable web auth entirely — only safe when bound to loopback |
 | `-no-mouse` | Start with in-TUI mouse capture off (restores native terminal/tmux text selection; toggle at runtime with `Ctrl+G`) |
 | `-mouse` | Explicitly keep in-TUI mouse capture on, including inside tmux/screen (this is already the default; scroll keys always work regardless) |
 | `-theme terminal\|nord` | TUI palette: `terminal` (default, inherits your terminal's colours and light/dark mode) or `nord` (bundled, adaptive). Also readable from `$GOLEM_THEME` |

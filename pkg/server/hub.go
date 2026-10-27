@@ -10,14 +10,6 @@ import (
 	"github.com/pkg/errors"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow localhost connections
-	},
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-}
-
 // Client wraps an active WebSocket connection and client outbound queue.
 type Client struct {
 	hub  *Hub
@@ -81,18 +73,35 @@ func (c *Client) readPump() {
 
 // Hub manages active WebSocket client connections and broadcasts events.
 type Hub struct {
-	mu        sync.RWMutex
-	clients   map[*Client]bool
-	broadcast chan []byte
-	closed    bool
+	mu           sync.RWMutex
+	clients      map[*Client]bool
+	broadcast    chan []byte
+	closed       bool
+	upgrader     websocket.Upgrader
+	allowOrigins []string
 }
 
 // NewHub constructs a new WebSocket Hub.
 func NewHub() *Hub {
-	return &Hub{
+	h := &Hub{
 		clients:   make(map[*Client]bool),
 		broadcast: make(chan []byte, 1024),
 	}
+	h.upgrader = websocket.Upgrader{
+		CheckOrigin:     h.originAllowed,
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+	}
+	return h
+}
+
+// SetAllowOrigins adds origins permitted to open a WebSocket beyond the request
+// host and loopback. Entries may be full origins ("https://x.ts.net") or bare
+// hosts ("x.ts.net").
+func (h *Hub) SetAllowOrigins(origins []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.allowOrigins = append([]string(nil), origins...)
 }
 
 // Run starts the central event pump for the hub.
@@ -168,7 +177,7 @@ func (h *Hub) Broadcast(evType WSEventType, sessionID string, payload any) error
 
 // HandleWS handles new incoming WebSocket upgrade requests.
 func (h *Hub) HandleWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
