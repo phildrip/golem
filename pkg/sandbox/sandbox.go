@@ -32,8 +32,22 @@ const (
 	ModeOff Mode = "off"
 	// ModePolicy denies dangerous shapes and writes outside the workspace.
 	ModePolicy Mode = "policy"
-	// ModeBwrap reserves OS-level isolation for the same decisions.
-	ModeBwrap Mode = "bwrap"
+	// ModeIsolation applies the same decisions and also enforces them: shell
+	// commands run under kernel confinement (Landlock), where filesystem
+	// outside the allowlist is invisible and TCP is refused. Enforcement is
+	// real, so a prompt-injected model cannot talk its way past a string check.
+	ModeIsolation Mode = "isolation"
+	// ModeBwrap is the previous name for ModeIsolation, kept so an existing
+	// profile keeps working.
+	ModeBwrap = ModeIsolation
+)
+
+// Network modes for confined commands.
+const (
+	// NetworkNone denies TCP bind and connect inside the sandbox.
+	NetworkNone = "none"
+	// NetworkHost leaves the network reachable.
+	NetworkHost = "host"
 )
 
 // Verdict is the outcome of a policy check.
@@ -109,6 +123,12 @@ type Config struct {
 	// AllowWrite lists extra writable paths; the workspace is always writable.
 	// Entries may be absolute, ~-relative, workspace-relative, or globs.
 	AllowWrite []string `json:"allow_write,omitempty"`
+	// ReadOnly lists extra readable paths for mode isolation. The system trees
+	// are always readable; this adds e.g. a second checkout or a data dir.
+	ReadOnly []string `json:"read_only,omitempty"`
+	// Network is none (default) or host: whether confined shell commands may
+	// reach the network.
+	Network string `json:"network,omitempty"`
 	// AllowNet lists allowed hosts for web_fetch. Empty means "no allowlist".
 	AllowNet []string `json:"allow_net,omitempty"`
 	// RequireConfirm lists tools that always need approval, e.g. ["shell"].
@@ -127,6 +147,8 @@ type Policy struct {
 	mode           Mode
 	workspace      string
 	allowWrite     []string
+	readOnly       []string
+	network        string
 	allowNet       []string
 	requireConfirm map[string]bool
 	envAllow       []string
@@ -140,9 +162,18 @@ func New(cfg Config, workspaceRoot string) (*Policy, error) {
 	switch mode {
 	case "":
 		mode = ModePolicy
-	case ModeOff, ModePolicy, ModeBwrap:
+	case "bwrap":
+		mode = ModeIsolation
+	case ModeOff, ModePolicy, ModeIsolation:
 	default:
-		return nil, fmt.Errorf("sandbox: unknown mode %q (want off, policy or bwrap)", cfg.Mode)
+		return nil, fmt.Errorf("sandbox: unknown mode %q (want off, policy or isolation)", cfg.Mode)
+	}
+	if mode == ModeIsolation {
+		// A profile that asks for enforcement must not silently run without
+		// it, so an unsupported kernel is a startup error, not a warning.
+		if err := IsolationSupported(); err != nil {
+			return nil, err
+		}
 	}
 
 	ws := workspaceRoot
@@ -171,6 +202,19 @@ func New(cfg Config, workspaceRoot string) (*Policy, error) {
 			p.allowWrite = append(p.allowWrite, resolved)
 		}
 	}
+	for _, raw := range cfg.ReadOnly {
+		if resolved, ok := p.resolvePattern(raw); ok {
+			p.readOnly = append(p.readOnly, resolved)
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Network)) {
+	case "", NetworkNone, "deny", "off":
+		p.network = NetworkNone
+	case NetworkHost, "allow", "on":
+		p.network = NetworkHost
+	default:
+		return nil, fmt.Errorf("sandbox: unknown network %q (want none or host)", cfg.Network)
+	}
 	for _, raw := range cfg.AllowNet {
 		if h := strings.ToLower(strings.TrimSpace(raw)); h != "" {
 			p.allowNet = append(p.allowNet, h)
@@ -198,6 +242,40 @@ func (p *Policy) Mode() Mode {
 		return ModeOff
 	}
 	return p.mode
+}
+
+// Network reports whether confined commands may reach the network. A nil
+// policy is mode off, which leaves the network untouched.
+func (p *Policy) Network() string {
+	if p == nil {
+		return NetworkHost
+	}
+	return p.network
+}
+
+// ReadOnlyPaths returns the extra readable paths the profile configured.
+func (p *Policy) ReadOnlyPaths() []string {
+	if p == nil {
+		return nil
+	}
+	return p.readOnly
+}
+
+// IsolationSpec builds the description of how to run command confined: the
+// workspace as cwd, the filtered environment, and the complete set of visible
+// paths. It is the one place that decides what a sandboxed shell can see.
+func (p *Policy) IsolationSpec(command string, env []string) Spec {
+	readOnly, readWrite := isolationPathsFor(p.Workspace(), p.ReadOnlyPaths(), p.allowWrite)
+	return Spec{
+		Command:     command,
+		Dir:         p.Workspace(),
+		Env:         env,
+		TimeoutMS:   p.ShellTimeout().Milliseconds(),
+		ReadOnly:    readOnly,
+		ReadWrite:   readWrite,
+		AllowNet:    p.Network() == NetworkHost,
+		ScopeSignal: true,
+	}
 }
 
 // Workspace returns the resolved workspace root the policy was compiled with.

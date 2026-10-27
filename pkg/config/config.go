@@ -65,13 +65,19 @@ type WebConfig struct {
 
 // SandboxConfig configures the policy layer every tool consults before it
 // touches the host. Mode off reproduces pre-sandbox behaviour; policy denies
-// dangerous shapes and writes outside the workspace; bwrap is reserved for
-// OS-level isolation.
+// dangerous shapes and writes outside the workspace; isolation enforces the
+// same intent with the kernel (Landlock): a shell command sees only the
+// workspace and the toolchain, and TCP is denied unless network is "host".
 type SandboxConfig struct {
 	// Mode is off, policy or bwrap (default policy).
 	Mode string `json:"mode,omitempty"`
 	// AllowWrite lists extra writable paths; the workspace is always writable.
 	AllowWrite []string `json:"allow_write,omitempty"`
+	// ReadOnly lists extra readable paths for mode isolation.
+	ReadOnly []string `json:"read_only,omitempty"`
+	// Network is none (default) or host: whether confined shell commands may
+	// reach the network.
+	Network string `json:"network,omitempty"`
 	// AllowNet lists hosts web_fetch may reach; empty means no allowlist.
 	AllowNet []string `json:"allow_net,omitempty"`
 	// RequireConfirm lists tools that always need human approval, e.g. ["shell"].
@@ -781,6 +787,11 @@ func ResolveSandboxConfig(sb *SandboxConfig) SandboxConfig {
 	}
 	if strings.TrimSpace(out.ShellTimeout) == "" {
 		out.ShellTimeout = "120s"
+	}
+	// Confinement defaults to no network: a model that can reach the internet
+	// can exfiltrate whatever it can read, so the profile has to ask for it.
+	if strings.TrimSpace(out.Network) == "" {
+		out.Network = sandbox.NetworkNone
 	}
 	return out
 }

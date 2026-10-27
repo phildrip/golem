@@ -101,7 +101,9 @@ The Web UI cockpit renders the live agent hierarchy, the message traffic between
 **Sandbox**
 - Every tool that can touch the host — `shell`, the file tools, `hashline_patch`, `web_fetch` and `web_search` — asks one policy layer first (`pkg/sandbox`), so there is exactly one place to reason about what the agent may do.
 - The default mode is `policy`: dangerous shell shapes are refused with a tool error the model can route around (`rm -rf ~`, `git checkout .`, `git reset --hard`, `git clean -fdx`, `sudo`, `curl … | sh`, `mkfs`, `dd of=/dev/…`, `chmod 777 /`, `shutdown`/`reboot`), and writes are confined to the workspace, with `allow_write` adding directories. `git push --force` and `git branch -D` come back as *confirm*; until the interactive approval gate lands that is reported as a refusal with the reason attached.
-- `sandbox.mode: "off"` restores the pre-sandbox behaviour exactly (nothing is checked). `allow_net` optionally pins the hosts `web_fetch`/`web_search` may reach. `bwrap` is reserved for OS-level isolation.
+- `sandbox.mode: "isolation"` enforces the same intent with the kernel instead of with a string check. Shell commands run under [Landlock](https://landlock.io), which golem applies to itself and which survives `exec`, so the command sees only the workspace, the toolchain and the system trees, cannot write outside them, and cannot reach the network unless `network` is `"host"`. It needs no root, no user namespaces, no `bwrap`/`nsjail` and no daemon: `pkg/sandbox` re-executes the golem binary as the confinement shim, so the whole sandbox is inside the binary you built. Where the kernel has Landlock ABI 6 or newer the command also cannot signal anything outside the sandbox, so a prompt-injected model cannot kill the agent that spawned it. The banner prints the ABI and what it enforces, and a kernel without Landlock is a startup error rather than a silent downgrade to policy.
+- `allow_write` adds writable directories and `read_only` adds readable ones. The defaults are `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/opt`, `/usr/local` and `$GOROOT` readable; the workspace, `/tmp`, `/dev/null`, `$GOPATH`, `$GOCACHE` and the usual build caches writable. `$HOME` and `/proc` are deliberately *not* granted — `/proc` would hand the command the agent's own environment.
+- `sandbox.mode: "off"` restores the pre-sandbox behaviour exactly (nothing is checked). `allow_net` optionally pins the hosts `web_fetch`/`web_search` may reach.
 - The startup banner prints the effective mode, so a profile that accidentally says `off` is visible before the first tool call.
 
 **Interfaces**
@@ -192,8 +194,10 @@ Example `~/.golem/config.json`:
         "model": "deepseek-chat"
       },
       "sandbox": {
-        "mode": "policy",
+        "mode": "isolation",
+        "network": "none",
         "allow_write": ["~/scratch"],
+        "read_only": ["/srv/datasets"],
         "allow_net": ["example.com"]
       }
     }
@@ -207,7 +211,7 @@ Example `~/.golem/config.json`:
 }
 ```
 
-`sandbox.mode` defaults to `policy` when the block is absent (see **Sandbox** above for what that denies). `server.token` is written automatically the first time you run `-serve`; delete it to get a fresh one (every authorised device will have to paste it again). `allow_origins` is only needed when a reverse proxy rewrites the `Host` header — `tailscale serve` does not.
+`sandbox.mode` defaults to `policy` when the block is absent (see **Sandbox** above for what that denies) and `sandbox.network` defaults to `none`, because a model that can reach the network can exfiltrate whatever it can read. `server.token` is written automatically the first time you run `-serve`; delete it to get a fresh one (every authorised device will have to paste it again). `allow_origins` is only needed when a reverse proxy rewrites the `Host` header — `tailscale serve` does not.
 
 ### Common flags
 

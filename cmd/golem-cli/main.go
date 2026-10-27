@@ -506,8 +506,12 @@ func formatSandboxStatus(sb *config.SandboxConfig) string {
 		return "Sandbox: OFF - tools run unconfined"
 	}
 	label := "Sandbox: policy - dangerous shell shapes denied, writes confined to the workspace"
-	if mode == sandbox.ModeBwrap {
-		label = "Sandbox: bwrap - OS isolation"
+	if mode == sandbox.ModeIsolation {
+		net := "network denied"
+		if resolved.Network == sandbox.NetworkHost {
+			net = "network allowed"
+		}
+		label = fmt.Sprintf("Sandbox: isolation - shell confined by the kernel (%s, %s)", sandbox.IsolationFeatures(), net)
 	}
 	var extra []string
 	if len(resolved.AllowWrite) > 0 {
