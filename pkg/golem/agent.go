@@ -557,6 +557,9 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	mcpManager := mcp.NewManager()
 	var mcpToolsets []mcp.NamedToolset
 	var adkToolsets []tool.Toolset
+	// MCP toolsets for subagents: allowlisted tools only, because a delegate has
+	// nobody to ask.
+	var delegateToolsets []tool.Toolset
 
 	mcpCfg := cfg.MCPConfig
 	if mcpCfg == nil {
@@ -573,7 +576,8 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		builtToolsets, _ := mcp.BuildToolsets(*mcpCfg)
 		mcpToolsets = builtToolsets
 		for _, ts := range builtToolsets {
-			adkToolsets = append(adkToolsets, ts.Toolset)
+			adkToolsets = append(adkToolsets, gateMCPToolset(ts.Toolset, sandboxPolicy, false))
+			delegateToolsets = append(delegateToolsets, gateMCPToolset(ts.Toolset, sandboxPolicy, true))
 		}
 	}
 
@@ -605,7 +609,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		WorkspaceDir:   workDir,
 		ReadOnlyTools:  []tool.Tool{delegateTools.readFile, delegateTools.findFiles, delegateTools.grepFiles, delegateTools.hashlineRead, delegateTools.hashlineFindBlk, zoomTool, dateTool, delegateTools.webSearch, delegateTools.webFetch},
 		ReadWriteTools: []tool.Tool{delegateTools.writeFile, delegateTools.replaceRegex, delegateTools.hashlinePatch, delegateTools.shell, rememberTool},
-		MCPToolsets:    adkToolsets,
+		MCPToolsets:    delegateToolsets,
 		SwarmBus:       swarmBus,
 		EventHandler: func(ev subagent.Event) {
 			if agentPtr != nil {

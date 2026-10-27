@@ -7,6 +7,7 @@ import (
 	"github.com/user/golem/pkg/sandbox"
 	"github.com/user/golem/pkg/tools"
 	"github.com/user/golem/pkg/web"
+	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/tool"
 )
 
@@ -77,4 +78,54 @@ func newToolSet(workDir string, policy *sandbox.Policy, webCfg config.WebConfig,
 		return ts, errors.Wrap(err, "creating web_fetch tool")
 	}
 	return ts, nil
+}
+
+// gateMCPToolset puts MCP tools under the policy.
+//
+// MCP tools run in another process, so pkg/sandbox cannot inspect what they do:
+// in policy and isolation mode every MCP tool call is a question unless the
+// profile lists it in mcp_allow. A delegate has nobody to ask, so for the
+// subagent set the same rule becomes a filter: only allowlisted MCP tools are
+// offered at all, which keeps a delegate from doing through MCP what the policy
+// would have stopped it doing directly.
+func gateMCPToolset(ts tool.Toolset, policy *sandbox.Policy, delegate bool) tool.Toolset {
+	if ts == nil {
+		return nil
+	}
+	if policy == nil || policy.Mode() == sandbox.ModeOff {
+		return ts
+	}
+	if delegate {
+		return tool.FilterToolset(ts, func(_ agent.ReadonlyContext, t tool.Tool) bool {
+			allowed := policy.MCPAllowed(t.Name())
+			approval.Note(approval.Unattended, t.Name(), sandbox.Decision{
+				Verdict: verdictFor(allowed),
+				Rule:    "mcp-allow",
+				Reason:  "MCP tools run outside the sandbox policy",
+			}, "")
+			return allowed
+		})
+	}
+	return tool.WithConfirmation(ts, false, func(toolName string, _ any) bool {
+		ask := policy.MCPRequiresConfirmation(toolName)
+		verdict := sandbox.Allow
+		rule := "mcp-allow"
+		if ask {
+			verdict = sandbox.Confirm
+			rule = "mcp-confirm"
+		}
+		approval.Note(approval.Interactive, toolName, sandbox.Decision{
+			Verdict: verdict,
+			Rule:    rule,
+			Reason:  "MCP tools run outside the sandbox policy",
+		}, "")
+		return ask
+	})
+}
+
+func verdictFor(allowed bool) sandbox.Verdict {
+	if allowed {
+		return sandbox.Allow
+	}
+	return sandbox.Deny
 }

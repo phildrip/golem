@@ -106,6 +106,7 @@ The Web UI cockpit renders the live agent hierarchy, the message traffic between
 - `allow_write` adds writable directories and `read_only` adds readable ones. The defaults are `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/opt`, `/usr/local` and `$GOROOT` readable; the workspace, `/tmp`, `/dev/null`, `$GOPATH`, `$GOCACHE` and the usual build caches writable. `$HOME` and `/proc` are deliberately *not* granted — `/proc` would hand the command the agent's own environment.
 - `sandbox.mode: "off"` restores the pre-sandbox behaviour exactly (nothing is checked). `allow_net` optionally pins the hosts `web_fetch`/`web_search` may reach.
 - The startup banner prints the effective mode, so a profile that accidentally says `off` is visible before the first tool call.
+- **MCP tools** run in another process, so the policy cannot see inside them: in `policy`/`isolation` mode every MCP tool call is a question, unless the profile lists it in `sandbox.mcp_allow`. Subagents get only the allowlisted ones — a delegate has nobody to ask, so the same rule becomes a filter rather than a prompt.
 - **Audit log**: every decision the policy takes — allow, deny and confirm, plus your answer to a prompt — is recorded with the exact command, the rule that fired and whether anyone was there to ask. The last 500 stay in memory (`/audit` in the TUI, `GET /api/sandbox/audit` in the cockpit) and each one is appended to `<memory-dir>/sandbox-audit.jsonl` (mode 0600) so the trail survives a restart. `sandbox.audit` sets the path, or `"off"` keeps it in memory only. Allowed calls are in the log too: "what did it do" is only answerable if the permitted calls are there.
 
 **Interfaces**
@@ -202,6 +203,7 @@ Example `~/.golem/config.json`:
         "read_only": ["/srv/datasets"],
         "allow_net": ["example.com"],
         "require_confirm": ["shell"],
+        "mcp_allow": ["read_notes"],
         "audit": "~/golem-audit.jsonl"
       }
     }

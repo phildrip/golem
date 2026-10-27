@@ -86,6 +86,9 @@ type SandboxConfig struct {
 	EnvAllow []string `json:"env_allow,omitempty"`
 	// ShellTimeout is a Go duration string for shell commands (default 120s).
 	ShellTimeout string `json:"shell_timeout,omitempty"`
+	// MCPAllow lists MCP tools that run without approval; every other MCP tool
+	// is a question, because the policy cannot see inside another process.
+	MCPAllow []string `json:"mcp_allow,omitempty"`
 	// Audit is where the tool-decision log is written. Empty means the default
 	// path under the memory dir; "off" disables the file (the in-memory ring of
 	// recent decisions stays available either way).

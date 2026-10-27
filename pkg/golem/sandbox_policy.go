@@ -23,6 +23,7 @@ func sandboxConfig(sb *config.SandboxConfig) sandbox.Config {
 		RequireConfirm: resolved.RequireConfirm,
 		EnvAllow:       resolved.EnvAllow,
 		ShellTimeout:   resolved.ShellTimeout,
+		MCPAllow:       resolved.MCPAllow,
 	}
 }
 

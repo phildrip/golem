@@ -145,6 +145,12 @@ func CurrentAuditor() *Auditor {
 	return auditor
 }
 
+// Note records a decision taken outside Gate - MCP toolsets, which the ADK
+// gates itself - so the log stays complete.
+func Note(mode Mode, toolName string, d sandbox.Decision, action string) {
+	note(mode, toolName, d, action)
+}
+
 // note records d if an auditor is installed.
 func note(mode Mode, toolName string, d sandbox.Decision, action string) {
 	a := CurrentAuditor()

@@ -137,6 +137,10 @@ type Config struct {
 	EnvAllow []string `json:"env_allow,omitempty"`
 	// ShellTimeout is a Go duration string, e.g. "120s".
 	ShellTimeout string `json:"shell_timeout,omitempty"`
+	// MCPAllow lists MCP tools (by tool name) that need no approval. Every
+	// other MCP tool is confirmed, because the policy cannot see inside another
+	// process: allowlisting is the only way to say "this one is fine".
+	MCPAllow []string `json:"mcp_allow,omitempty"`
 }
 
 // Policy is the compiled form of Config, bound to one workspace root.
@@ -151,6 +155,7 @@ type Policy struct {
 	network        string
 	allowNet       []string
 	requireConfirm map[string]bool
+	mcpAllow       map[string]bool
 	envAllow       []string
 	shellTimeout   time.Duration
 }
@@ -191,6 +196,12 @@ func New(cfg Config, workspaceRoot string) (*Policy, error) {
 		mode:           mode,
 		workspace:      ws,
 		requireConfirm: make(map[string]bool, len(cfg.RequireConfirm)),
+		mcpAllow:       make(map[string]bool, len(cfg.MCPAllow)),
+	}
+	for _, tool := range cfg.MCPAllow {
+		if t := strings.TrimSpace(tool); t != "" {
+			p.mcpAllow[t] = true
+		}
 	}
 	for _, tool := range cfg.RequireConfirm {
 		if t := strings.TrimSpace(tool); t != "" {
@@ -351,6 +362,26 @@ func (p *Policy) WithConfirmRequirement(tool string, d Decision) Decision {
 		Rule:    "require-confirm",
 		Reason:  tool + " is in require_confirm, so a human must approve each call",
 	}
+}
+
+// MCPRequiresConfirmation reports whether an MCP tool call needs a human.
+//
+// MCP tools run in another process, so the policy cannot inspect what they do:
+// in policy and isolation mode every one of them is a question unless the
+// profile lists it in mcp_allow. Mode off keeps the pre-sandbox behaviour.
+func (p *Policy) MCPRequiresConfirmation(tool string) bool {
+	if p == nil || p.mode == ModeOff {
+		return false
+	}
+	return !p.mcpAllow[tool]
+}
+
+// MCPAllowed reports whether an MCP tool may run without asking.
+func (p *Policy) MCPAllowed(tool string) bool {
+	if p == nil || p.mode == ModeOff {
+		return true
+	}
+	return p.mcpAllow[tool]
 }
 
 // --- shell -----------------------------------------------------------------
