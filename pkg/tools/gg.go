@@ -20,9 +20,9 @@ import (
 
 // FindFilesArgs defines input for fast file finding (gg).
 type FindFilesArgs struct {
-	Query       string `json:"query" jsonschema:"Fuzzy search term or pattern to match against file paths (e.g. 'agent.go', 'config', '*.json')"`
-	Directory   string `json:"directory,omitempty" jsonschema:"Subdirectory to search within (relative to workspace). Defaults to root if omitted."`
-	MaxResults  int    `json:"max_results,omitempty" jsonschema:"Maximum number of results to return (default 20, max 100)"`
+	Query      string `json:"query" jsonschema:"Fuzzy search term or pattern to match against file paths (e.g. 'agent.go', 'config', '*.json')"`
+	Directory  string `json:"directory,omitempty" jsonschema:"Subdirectory to search within (relative to workspace). Defaults to root if omitted."`
+	MaxResults int    `json:"max_results,omitempty" jsonschema:"Maximum number of results to return (default 20, max 100)"`
 }
 
 // FindFilesResult defines output from fast file search.
@@ -474,7 +474,7 @@ func NewFindFilesTool(baseDir string, opts ...Option) (tool.Tool, error) {
 		Name:        "find_files",
 		Description: "Fast file finder (gg) for rapidly locating files by name, extension, glob, or path across the workspace. Uses pure Go inverted index and fuzzy matching with fallback to git/walk.",
 	}, func(ctx agent.Context, args FindFilesArgs) (FindFilesResult, error) {
-		if err := o.checkRead("find_files", args.Directory); err != nil {
+		if err := o.checkRead(ctx, "find_files", args.Directory); err != nil {
 			return FindFilesResult{}, err
 		}
 		return FindFiles(baseDir, args.Directory, args.Query, args.MaxResults)
@@ -488,7 +488,7 @@ func NewGrepFilesTool(baseDir string, opts ...Option) (tool.Tool, error) {
 		Name:        "grep_files",
 		Description: "Fast content search (gg grep) across workspace files. Returns matching file paths, line numbers, and content excerpts using pure Go SIMD/regex searcher.",
 	}, func(ctx agent.Context, args GrepFilesArgs) (GrepFilesResult, error) {
-		if err := o.checkRead("grep_files", args.Directory); err != nil {
+		if err := o.checkRead(ctx, "grep_files", args.Directory); err != nil {
 			return GrepFilesResult{}, err
 		}
 		return GrepFiles(baseDir, args.Directory, args.Pattern, args.FilePattern, args.MaxResults)

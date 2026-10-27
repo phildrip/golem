@@ -64,7 +64,7 @@ func TestFileOperations(t *testing.T) {
 		expectError bool
 	}{
 		{
-			name: "write new file",
+			name:  "write new file",
 			setup: func(t *testing.T) {},
 			action: func(t *testing.T) {
 				err := WriteFile(tempDir, testFile, "initial content")
@@ -107,7 +107,7 @@ func TestFileOperations(t *testing.T) {
 			},
 		},
 		{
-			name: "read non-existent file",
+			name:  "read non-existent file",
 			setup: func(t *testing.T) {},
 			action: func(t *testing.T) {
 				_, err := ReadFile(tempDir, filepath.Join(tempDir, "missing.txt"))
@@ -118,7 +118,7 @@ func TestFileOperations(t *testing.T) {
 			verify: func(t *testing.T) {},
 		},
 		{
-			name: "prevent path traversal outside workspace",
+			name:  "prevent path traversal outside workspace",
 			setup: func(t *testing.T) {},
 			action: func(t *testing.T) {
 				_, err := ReadFile(tempDir, "../../etc/passwd")
@@ -469,4 +469,3 @@ func TestGrepFilesGGNative(t *testing.T) {
 		}
 	}
 }
-

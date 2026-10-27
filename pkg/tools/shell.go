@@ -114,7 +114,7 @@ func NewShellTool(opts ...Option) (tool.Tool, error) {
 		Name:        "shell",
 		Description: "Executes a shell command on the host system using bash. Returns stdout, stderr, and the exit code.",
 	}, func(ctx agent.Context, args ShellArgs) (ShellResult, error) {
-		if err := o.policy.CheckShell(args.Command, o.policy.Workspace()).Err("shell"); err != nil {
+		if err := o.checkShell(ctx, args.Command); err != nil {
 			return ShellResult{}, err
 		}
 		return ExecuteShell(ctx, o.policy, args.Command)

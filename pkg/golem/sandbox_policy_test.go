@@ -3,6 +3,7 @@ package golem
 import (
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/user/golem/pkg/config"
@@ -48,24 +49,51 @@ func TestSandboxConfigHonoursTheProfileBlock(t *testing.T) {
 }
 
 // TestEveryToolConstructorGetsThePolicy is a source-level tripwire: a new tool
-// added to agent.go without the policy option would be a silent bypass, which
-// is exactly what the sandbox epic forbids.
+// added to the tool set without the policy option would be a silent bypass,
+// which is exactly what the sandbox epic forbids.
 func TestEveryToolConstructorGetsThePolicy(t *testing.T) {
+	src, err := os.ReadFile("toolset.go")
+	if err != nil {
+		t.Fatalf("reading toolset.go: %v", err)
+	}
+	// Matches tools.NewXxxTool(...) and web.NewXxxTool(...) call sites.
+	call := regexp.MustCompile(`(?m)(tools|web)\.(New\w*Tool)\((.*)$`)
+	matches := call.FindAllStringSubmatch(string(src), -1)
+	if len(matches) == 0 {
+		t.Fatal("no tool constructor calls found in toolset.go; the tripwire regex is stale")
+	}
+	for _, m := range matches {
+		callArgs := m[3]
+		// Every call spreads the option slice, and that slice carries the
+		// policy: checked below.
+		if !strings.Contains(callArgs, "opts...") && !strings.Contains(callArgs, "webOpts...") {
+			t.Errorf("%s.%s is built without the sandbox policy options: %s", m[1], m[2], callArgs)
+		}
+	}
+	body := string(src)
+	if !strings.Contains(body, "tools.WithPolicy(policy)") {
+		t.Error("the tools option slice does not carry the sandbox policy")
+	}
+	if !strings.Contains(body, "web.WithPolicy(policy)") {
+		t.Error("the web option slice does not carry the sandbox policy")
+	}
+}
+
+// TestSubagentsGetUnattendedTools pins the delegation rule: the subagent tool
+// set is built unattended, so a delegate can never approve on the user's behalf.
+func TestSubagentsGetUnattendedTools(t *testing.T) {
 	src, err := os.ReadFile("agent.go")
 	if err != nil {
 		t.Fatalf("reading agent.go: %v", err)
 	}
-	// Matches tools.NewXxxTool(...) and web.NewWebFetchTool(...) call sites.
-	call := regexp.MustCompile(`(?m)^\s*\w+, err := (tools|web)\.(New\w*Tool)\((.*)$`)
-	matches := call.FindAllStringSubmatch(string(src), -1)
-	if len(matches) == 0 {
-		t.Fatal("no tool constructor calls found in agent.go; the tripwire regex is stale")
+	body := string(src)
+	if !strings.Contains(body, "newToolSet(workDir, sandboxPolicy, webCfg, approval.Interactive)") {
+		t.Error("the orchestrator tool set is not built interactive")
 	}
-	for _, m := range matches {
-		callArgs := m[3]
-		if regexp.MustCompile(`policyOpt|WithPolicy`).MatchString(callArgs) {
-			continue
-		}
-		t.Errorf("%s.%s is built without the sandbox policy: %s", m[1], m[2], callArgs)
+	if !strings.Contains(body, "newToolSet(workDir, sandboxPolicy, webCfg, approval.Unattended)") {
+		t.Error("the subagent tool set is not built unattended")
+	}
+	if !strings.Contains(body, "ReadWriteTools: []tool.Tool{delegateTools.writeFile") {
+		t.Error("the subagent read-write tools are not the delegate set")
 	}
 }

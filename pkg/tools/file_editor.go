@@ -79,7 +79,7 @@ func NewReadFileTool(baseDir string, opts ...Option) (tool.Tool, error) {
 		Name:        "read_file",
 		Description: "Reads and returns the complete text content of a file at the given relative or absolute path within the workspace.",
 	}, func(ctx agent.Context, args ReadFileArgs) (ReadFileResult, error) {
-		if err := o.checkRead("read_file", args.FilePath); err != nil {
+		if err := o.checkRead(ctx, "read_file", args.FilePath); err != nil {
 			return ReadFileResult{}, err
 		}
 		content, err := ReadFile(baseDir, args.FilePath)
@@ -129,7 +129,7 @@ func NewWriteFileTool(baseDir string, opts ...Option) (tool.Tool, error) {
 		Name:        "write_file",
 		Description: "Writes content to a file at the specified path within the workspace, creating it if needed or overwriting if it exists.",
 	}, func(ctx agent.Context, args WriteFileArgs) (WriteFileResult, error) {
-		if err := o.checkWrite("write_file", args.FilePath); err != nil {
+		if err := o.checkWrite(ctx, "write_file", args.FilePath, "write_file "+args.FilePath); err != nil {
 			return WriteFileResult{}, err
 		}
 		if err := WriteFile(baseDir, args.FilePath, args.Content); err != nil {
@@ -148,9 +148,9 @@ func NewWriteFileTool(baseDir string, opts ...Option) (tool.Tool, error) {
 
 // ReplaceRegexArgs defines input for regex replacement in a file.
 type ReplaceRegexArgs struct {
-	FilePath     string `json:"file_path" jsonschema:"The path to the file (must be within workspace)"`
-	Pattern      string `json:"pattern" jsonschema:"The regular expression pattern to search for"`
-	Replacement  string `json:"replacement" jsonschema:"The replacement text"`
+	FilePath    string `json:"file_path" jsonschema:"The path to the file (must be within workspace)"`
+	Pattern     string `json:"pattern" jsonschema:"The regular expression pattern to search for"`
+	Replacement string `json:"replacement" jsonschema:"The replacement text"`
 }
 
 // ReplaceRegexResult defines output after regex replacement.
@@ -196,7 +196,8 @@ func NewReplaceRegexTool(baseDir string, opts ...Option) (tool.Tool, error) {
 		Name:        "replace_regex",
 		Description: "Replaces occurrences of a regex pattern with replacement text in a specified file within the workspace.",
 	}, func(ctx agent.Context, args ReplaceRegexArgs) (ReplaceRegexResult, error) {
-		if err := o.checkWrite("replace_regex", args.FilePath); err != nil {
+		if err := o.checkWrite(ctx, "replace_regex", args.FilePath,
+			"replace_regex "+args.FilePath+" /"+args.Pattern+"/"); err != nil {
 			return ReplaceRegexResult{}, err
 		}
 		matched, err := ReplaceStringWithRegex(baseDir, args.FilePath, args.Pattern, args.Replacement)

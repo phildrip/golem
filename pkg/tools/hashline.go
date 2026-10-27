@@ -49,9 +49,9 @@ func ParseAnchor(raw string) (LineAnchor, error) {
 
 // HashlineReadArgs defines input for reading a file with hashline anchors.
 type HashlineReadArgs struct {
-	FilePath   string `json:"file_path" jsonschema:"Path to the file to read (must be within workspace)"`
-	StartLine  int    `json:"start_line,omitempty" jsonschema:"Optional starting line number (1-based, defaults to 1)"`
-	LineCount  int    `json:"line_count,omitempty" jsonschema:"Optional number of lines to read (defaults to full file)"`
+	FilePath  string `json:"file_path" jsonschema:"Path to the file to read (must be within workspace)"`
+	StartLine int    `json:"start_line,omitempty" jsonschema:"Optional starting line number (1-based, defaults to 1)"`
+	LineCount int    `json:"line_count,omitempty" jsonschema:"Optional number of lines to read (defaults to full file)"`
 }
 
 // HashlineReadLine represents a single line with its anchor.
@@ -484,7 +484,7 @@ func NewHashlineReadTool(baseDir string, opts ...Option) (tool.Tool, error) {
 		Name:        "hashline_read",
 		Description: "Reads a file with stable content-hashed line anchors (e.g. '42:a3'). Use before hashline_patch to prevent edit collision and hallucinated line modifications.",
 	}, func(ctx agent.Context, args HashlineReadArgs) (HashlineReadResult, error) {
-		if err := o.checkRead("hashline_read", args.FilePath); err != nil {
+		if err := o.checkRead(ctx, "hashline_read", args.FilePath); err != nil {
 			return HashlineReadResult{}, err
 		}
 		return ReadFileWithHashlines(baseDir, args.FilePath, args.StartLine, args.LineCount)
@@ -498,7 +498,7 @@ func NewHashlineFindBlockTool(baseDir string, opts ...Option) (tool.Tool, error)
 		Name:        "hashline_find_block",
 		Description: "Finds the enclosing syntactic code block (function, struct, class, if/for block) around a line:hash anchor. Useful before SWAP.BLK or DEL.BLK.",
 	}, func(ctx agent.Context, args HashlineFindBlockArgs) (HashlineFindBlockResult, error) {
-		if err := o.checkRead("hashline_find_block", args.FilePath); err != nil {
+		if err := o.checkRead(ctx, "hashline_find_block", args.FilePath); err != nil {
 			return HashlineFindBlockResult{}, err
 		}
 		return FindBlockWithHashline(baseDir, args.FilePath, args.Anchor)
@@ -513,7 +513,8 @@ func NewHashlinePatchTool(baseDir string, opts ...Option) (tool.Tool, error) {
 		Description: "Applies a robust content-hashed patch ('SWAP', 'DEL', 'INS.PRE', 'INS.POST', 'SWAP.BLK', 'DEL.BLK', 'INS.BLK.PRE', 'INS.BLK.POST') using verified anchors like '42:a3', range '42:a3..45:f1', or block anchor. Rejects stale edits if lines changed.",
 	}, func(ctx agent.Context, args HashlinePatchArgs) (HashlinePatchResult, error) {
 		if !args.DryRun {
-			if err := o.checkWrite("hashline_patch", args.FilePath); err != nil {
+			if err := o.checkWrite(ctx, "hashline_patch", args.FilePath,
+				fmt.Sprintf("hashline_patch %s (%s %s)", args.FilePath, args.Op, args.Anchor)); err != nil {
 				return HashlinePatchResult{}, err
 			}
 		}

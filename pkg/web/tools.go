@@ -38,7 +38,7 @@ func NewWebSearchTool(provider SearchProvider, opts ...Option) (tool.Tool, error
 			return ToolResult{Output: "web search is not configured."}, nil
 		}
 		if namer, ok := provider.(endpointNamer); ok {
-			if err := o.policy.CheckNet(namer.Endpoint()).Err("web_search"); err != nil {
+			if err := o.checkNet(ctx, "web_search", namer.Endpoint()); err != nil {
 				return ToolResult{}, err
 			}
 		}
@@ -64,7 +64,7 @@ func NewWebFetchTool(fetcher *Fetcher, opts ...Option) (tool.Tool, error) {
 		if fetcher == nil {
 			return ToolResult{Output: "web fetch is not configured."}, nil
 		}
-		if err := o.policy.CheckNet(args.URL).Err("web_fetch"); err != nil {
+		if err := o.checkNet(ctx, "web_fetch", args.URL); err != nil {
 			return ToolResult{}, err
 		}
 		text, err := fetcher.Fetch(ctx, args.URL)

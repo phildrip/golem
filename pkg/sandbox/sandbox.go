@@ -330,6 +330,29 @@ func (p *Policy) allowAll(rule, reason string) Decision {
 	return Decision{Verdict: Allow, Rule: rule, Reason: reason}
 }
 
+// RequiresConfirm reports whether the profile always asks a human before tool
+// runs, whatever the call looks like (require_confirm: ["shell"]).
+func (p *Policy) RequiresConfirm(tool string) bool {
+	if p == nil || p.mode == ModeOff {
+		return false
+	}
+	return p.requireConfirm[tool]
+}
+
+// WithConfirmRequirement promotes an allowed decision to Confirm when tool is
+// listed in require_confirm. Deny wins: a refused call is never downgraded to a
+// prompt, so a profile that denies shell cannot be talked into running it.
+func (p *Policy) WithConfirmRequirement(tool string, d Decision) Decision {
+	if d.Verdict != Allow || !p.RequiresConfirm(tool) {
+		return d
+	}
+	return Decision{
+		Verdict: Confirm,
+		Rule:    "require-confirm",
+		Reason:  tool + " is in require_confirm, so a human must approve each call",
+	}
+}
+
 // --- shell -----------------------------------------------------------------
 
 // shellRule is one pattern in the dangerous-shape table.
