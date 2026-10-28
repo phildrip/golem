@@ -472,6 +472,9 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 
 	// 4. Initialize Compactor Model (either dedicated compactor model or shared primary model)
+	// Whether compaction shares the turn's model matters for cache reuse: only
+	// then do the turn's tool declarations extend the same cached prefix.
+	compactorSharesTurnModel := true
 	compactorModelInstance := modelInstance
 	compactorModelName := cfg.CompactorModel
 	compactorProvider := cfg.CompactorProvider
@@ -483,6 +486,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 
 	if compactorModelName != "" && compactorModelName != cfg.ModelName {
+		compactorSharesTurnModel = false
 		if compactorProvider == "" {
 			compactorProvider = config.DeduceProviderFromModel(compactorModelName)
 			if compactorProvider == "" {
@@ -597,6 +601,14 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		rememberTool,
 		hostTools.webSearch,
 		hostTools.webFetch,
+	}
+
+	// Compaction calls share the turn's system prompt, tools and view, so a
+	// provider cache written by the turn is readable by the compactor. The tools
+	// half only helps when compaction runs on the same model (thesis section 4),
+	// so a dedicated compactor model gets the prompt alone.
+	if compactorSharesTurnModel {
+		summarizer.SetTools([]*genai.Tool{{FunctionDeclarations: toolDeclarations(allTools)}})
 	}
 
 	// 5. Discover & Build MCP Toolsets

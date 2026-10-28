@@ -9,6 +9,7 @@ import (
 	"github.com/user/golem/pkg/web"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/tool"
+	"google.golang.org/genai"
 )
 
 // toolSet is every tool that can touch the host or the network, i.e. every tool
@@ -128,4 +129,29 @@ func verdictFor(allowed bool) sandbox.Verdict {
 		return sandbox.Allow
 	}
 	return sandbox.Deny
+}
+
+// declaringTool is the part of a function tool that carries its schema. ADK
+// keeps the interface unexported, so it is restated structurally here.
+type declaringTool interface {
+	Declaration() *genai.FunctionDeclaration
+}
+
+// toolDeclarations collects the function declarations a turn sends, so a
+// compaction request can carry the same tool prefix (see LLMSummarizer.SetTools).
+func toolDeclarations(tools []tool.Tool) []*genai.FunctionDeclaration {
+	decls := make([]*genai.FunctionDeclaration, 0, len(tools))
+	for _, t := range tools {
+		if t == nil {
+			continue
+		}
+		dt, ok := t.(declaringTool)
+		if !ok {
+			continue
+		}
+		if d := dt.Declaration(); d != nil {
+			decls = append(decls, d)
+		}
+	}
+	return decls
 }
