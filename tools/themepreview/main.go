@@ -46,7 +46,7 @@ func render() string {
 	)
 	b.WriteString(header + "\n")
 	b.WriteString(tui.StatusBarMemoryStyle.Render(
-		tui.RenderMemoryMinimap(2048, map[int]int{0: 24, 1: 12, 2: 6, 3: 3}, 9, false),
+		tui.RenderMemoryMinimap(2048, map[int]int{0: 24, 1: 12, 2: 6, 3: 3}, 9, false, ""),
 	) + "\n\n")
 
 	b.WriteString(tui.UserBadgeStyle.Render("YOU") + "\n")

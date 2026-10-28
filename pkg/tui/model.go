@@ -51,9 +51,18 @@ const (
 	inputMaxRows = 10
 )
 
+// inputHistoryMaxEntries bounds up-arrow recall restored at startup. Older
+// prompts stay in memory (zoom them); recall is a convenience, not an index.
+const inputHistoryMaxEntries = 100
+
 // wheelRefillInterval is how much wall-clock time buys one more scroll step. It
 // is a variable so tests can pin the rate deterministically.
 var wheelRefillInterval = 20 * time.Millisecond
+
+// ExitCodeUnknown marks a tool whose exit status was never observed. A replayed
+// tool from the event log only has its echo text, which carries no status, so
+// claiming "EXIT 0" would be a lie; the card shows a neutral badge instead.
+const ExitCodeUnknown = -1
 
 // ChatEntry represents a single visual item in the conversation history.
 type ChatEntry struct {
@@ -115,6 +124,9 @@ type memoryStatsMsg struct {
 	totalEvents int
 	tailLevels  map[int]int
 	liveCount   int
+	// problems is the agent's health summary: internal failures (memory writes,
+	// compaction passes) that would otherwise be invisible.
+	problems string
 }
 
 // Model is the Bubbletea TUI application state machine.
@@ -212,15 +224,7 @@ func NewModel(agentInstance *golem.Agent, store *fractal.Store, viewEngine *frac
 		allEvents = store.EventsTail(startupEventScanLimit)
 	}
 
-	var initialHistory []string
-	for _, ev := range allEvents {
-		if ev.Kind == fractal.KindUser && strings.TrimSpace(ev.Text) != "" {
-			trimmed := strings.TrimSpace(ev.Text)
-			if len(initialHistory) == 0 || initialHistory[len(initialHistory)-1] != trimmed {
-				initialHistory = append(initialHistory, trimmed)
-			}
-		}
-	}
+	initialHistory := buildInputHistory(allEvents)
 
 	currentProfile := "default"
 	if agentInstance != nil && agentInstance.Config().Profile != "" {
@@ -1153,7 +1157,7 @@ func (m Model) renderHeader() string {
 		}
 	}
 	sub := HeaderSubStyle.Render(fmt.Sprintf(" [%s | %s:%s] • Fractal Memory", profStr, provStr, modelStr))
-	minimap := RenderMemoryMinimap(m.memoryStats.totalEvents, m.memoryStats.tailLevels, m.memoryStats.liveCount, false)
+	minimap := RenderMemoryMinimap(m.memoryStats.totalEvents, m.memoryStats.tailLevels, m.memoryStats.liveCount, false, m.memoryStats.problems)
 
 	// Both header lines are clipped to the pane: a header that wraps costs a
 	// row and makes the frame taller than the terminal, which tmux answers by
@@ -1656,6 +1660,7 @@ func (m *Model) updateMemoryStatsCmd() tea.Cmd {
 			totalEvents: total,
 			tailLevels:  levels,
 			liveCount:   liveCount,
+			problems:    m.agent.Health().Summary(),
 		}
 	}
 }
@@ -2250,6 +2255,8 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 
 		var target string
 		var id, n int
+		// A non-numeric argument leaves id/n at zero; fractal.Zoom then reports
+		// it, so the parse error needs no separate message.
 		if len(parts) >= 4 {
 			target = parts[1]
 			_, _ = fmt.Sscanf(parts[2], "%d", &id)

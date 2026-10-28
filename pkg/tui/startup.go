@@ -4,7 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode/utf8"
+
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/user/golem/pkg/memory/fractal"
 )
@@ -54,6 +55,31 @@ func buildStartupEntriesN(events []fractal.Event, workspace, profile string, now
 	}
 	entries = append(entries, eventsToEntries(tail)...)
 	return header, entries
+}
+
+// buildInputHistory seeds up-arrow recall with the prompts in events, oldest
+// first, bounded to inputHistoryMaxEntries. It reads the same startup scan
+// window as the replay (startupEventScanLimit events), so a prompt older than
+// that window is not in recall - it is still in memory and can be zoomed.
+func buildInputHistory(events []fractal.Event) []string {
+	var history []string
+	for _, ev := range events {
+		if ev.Kind != fractal.KindUser {
+			continue
+		}
+		trimmed := strings.TrimSpace(ev.Text)
+		if trimmed == "" {
+			continue
+		}
+		if len(history) > 0 && history[len(history)-1] == trimmed {
+			continue // the same prompt twice in a row is one recall entry
+		}
+		history = append(history, trimmed)
+		if len(history) > inputHistoryMaxEntries {
+			history = history[len(history)-inputHistoryMaxEntries:]
+		}
+	}
+	return history
 }
 
 // tailWindow returns the trailing events to replay and how many earlier events
@@ -110,9 +136,11 @@ func eventsToEntries(events []fractal.Event) []ChatEntry {
 			if lastTool >= 0 && entries[lastTool].IsRunning {
 				entries[lastTool].Content = capText(stripToolPrefix(ev.Text, entries[lastTool].ToolName), ev)
 				entries[lastTool].IsRunning = false
-				entries[lastTool].ExitCode = 0
+				// The echo carries output, not a status: replay answers "ran"
+				// rather than claiming a clean exit it cannot know (golem-sma.8).
+				entries[lastTool].ExitCode = ExitCodeUnknown
 			} else {
-				entries = append(entries, ChatEntry{Type: TypeTool, ToolName: "result", Content: capText(ev.Text, ev), IsRunning: false})
+				entries = append(entries, ChatEntry{Type: TypeTool, ToolName: "result", Content: capText(ev.Text, ev), ExitCode: ExitCodeUnknown, IsRunning: false})
 			}
 			lastTool = -1
 
@@ -123,11 +151,16 @@ func eventsToEntries(events []fractal.Event) []ChatEntry {
 	}
 
 	// Nothing in history is still running: a tool whose echo is missing (an
-	// interrupted turn, or a pair split by the window) must not show RUNNING.
+	// interrupted turn, or a pair split by the window) must not show RUNNING,
+	// and its exit status is unknown rather than a clean zero.
 	for i := range entries {
-		if entries[i].Type == TypeTool {
-			entries[i].IsRunning = false
+		if entries[i].Type != TypeTool {
+			continue
 		}
+		if entries[i].IsRunning {
+			entries[i].ExitCode = ExitCodeUnknown
+		}
+		entries[i].IsRunning = false
 	}
 
 	return entries
@@ -156,19 +189,40 @@ func formatStartupHeader(events []fractal.Event, workspace, profile string, now 
 		workspace, profile, len(events), humanizeAgo(now.Sub(last)))
 }
 
-// clampLines truncates each line of s to width runes, appending an ellipsis
-// when it cuts, so a deep workspace path cannot overflow the header block.
+// clampLines truncates each line of s to width terminal cells, appending an
+// ellipsis when it cuts, so a deep workspace path cannot overflow the header
+// block. It measures display width, not runes: a CJK or emoji path takes two
+// cells per character and would still overflow a rune-counted clamp.
 func clampLines(s string, width int) string {
 	if width <= 1 {
 		return s
 	}
 	lines := strings.Split(s, "\n")
 	for i, ln := range lines {
-		if utf8.RuneCountInString(ln) > width {
-			lines[i] = string([]rune(ln)[:width-1]) + "…"
+		if lipgloss.Width(ln) <= width {
+			continue
 		}
+		lines[i] = clampDisplayWidth(ln, width-1) + "…"
 	}
 	return strings.Join(lines, "\n")
+}
+
+// clampDisplayWidth returns the longest prefix of s that fits in width cells.
+// Per-rune widths are exact for CJK and emoji; a multi-rune grapheme (a ZWJ
+// emoji sequence) can still be counted slightly wide, which at worst drops one
+// character early.
+func clampDisplayWidth(s string, width int) string {
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		w := lipgloss.Width(string(r))
+		if used+w > width {
+			break
+		}
+		b.WriteRune(r)
+		used += w
+	}
+	return b.String()
 }
 
 // humanizeAgo renders a coarse relative time.

@@ -263,6 +263,7 @@ func TestModel_RenderMinimap(t *testing.T) {
 		tailLevels   map[int]int
 		liveCount    int
 		compacting   bool
+		problems     string
 		wantContains []string
 	}{
 		{
@@ -281,11 +282,20 @@ func TestModel_RenderMinimap(t *testing.T) {
 			compacting:   true,
 			wantContains: []string{"42 msgs", "L0:20", "L1:10", "L2:4", "Live:8", "Compacting"},
 		},
+		{
+			name:         "internal failures are visible",
+			totalEvents:  9,
+			tailLevels:   map[int]int{},
+			liveCount:    1,
+			compacting:   false,
+			problems:     "memory 2, compactor 1",
+			wantContains: []string{"9 msgs", "⚠ memory 2, compactor 1", "Live:1"},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rendered := RenderMemoryMinimap(tc.totalEvents, tc.tailLevels, tc.liveCount, tc.compacting)
+			rendered := RenderMemoryMinimap(tc.totalEvents, tc.tailLevels, tc.liveCount, tc.compacting, tc.problems)
 			for _, want := range tc.wantContains {
 				if !strings.Contains(rendered, want) {
 					t.Errorf("rendered minimap %q does not contain %q", rendered, want)

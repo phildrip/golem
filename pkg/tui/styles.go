@@ -320,11 +320,15 @@ func RenderCollapsedToolSummary(tools []ChatEntry) string {
 // RenderToolCard formats a tool invocation and its result as a styled card.
 func RenderToolCard(toolName string, commandOrArgs string, output string, exitCode int, isRunning bool, width int) string {
 	var statusBadge string
-	if isRunning {
+	switch {
+	case isRunning:
 		statusBadge = ToolRunningBadge.Render("RUNNING")
-	} else if exitCode == 0 {
+	case exitCode == ExitCodeUnknown:
+		// Replayed from memory or interrupted: the status was never observed.
+		statusBadge = lipgloss.NewStyle().Foreground(ColorMuted).Bold(true).Render("EXIT ?")
+	case exitCode == 0:
 		statusBadge = ToolSuccessBadge.Render("EXIT 0")
-	} else {
+	default:
 		statusBadge = ToolErrorBadge.Render(fmt.Sprintf("EXIT %d", exitCode))
 	}
 
@@ -402,9 +406,14 @@ func RenderSubagentCard(role, model, prompt, output string, isRunning bool, widt
 }
 
 // RenderMemoryMinimap formats a single-line summary of fractal tree levels and live head.
-func RenderMemoryMinimap(totalEvents int, tailNodesByLevel map[int]int, liveHeadCount int, compactorActive bool) string {
+// problems is the agent health summary ("" when clean): it sits right after the
+// message count so a broken store is visible before the line can be clipped.
+func RenderMemoryMinimap(totalEvents int, tailNodesByLevel map[int]int, liveHeadCount int, compactorActive bool, problems string) string {
 	parts := []string{
 		fmt.Sprintf("Memory: %d msgs", totalEvents),
+	}
+	if problems != "" {
+		parts = append(parts, ToolErrorBadge.Render("⚠ "+problems))
 	}
 
 	// Show levels from highest down to L0

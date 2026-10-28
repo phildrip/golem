@@ -7,6 +7,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/user/golem/pkg/memory/fractal"
 )
 
@@ -259,5 +260,77 @@ func TestCapTextKeepsLongAnswerWhole(t *testing.T) {
 	ev := fractal.Event{ID: 3, Kind: fractal.KindTalk, Text: answer}
 	if got := capText(answer, ev); got != answer {
 		t.Fatalf("6KB answer was truncated to %d bytes: startup replay must keep the whole reply", len(got))
+	}
+}
+
+// clampLines measures display width, not runes (golem-sma.8): a CJK workspace
+// path takes two cells per character.
+func TestClampLinesUsesDisplayWidth(t *testing.T) {
+	wide := strings.Repeat("漢", 40)
+	got := clampLines(wide, 20)
+	if w := lipgloss.Width(got); w > 20 {
+		t.Errorf("clampLines width = %d cells, want <= 20 (%q)", w, got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("clamped line should end in an ellipsis: %q", got)
+	}
+	if clampLines("漢字", 20) != "漢字" {
+		t.Errorf("a line that fits was changed")
+	}
+}
+
+// A replayed tool with no echo has no known exit status (golem-sma.8).
+func TestReplayedToolWithoutEchoHasNoExitCode(t *testing.T) {
+	now := time.Now()
+	events := []fractal.Event{
+		{ID: 0, Kind: fractal.KindUser, Text: "run it", Timestamp: now},
+		{ID: 1, Kind: fractal.KindTool, Text: `shell: {"command":"sleep 100"}`, Timestamp: now},
+	}
+	_, entries := buildStartupEntries(events, "/w", "home", now)
+
+	var tool *ChatEntry
+	for i := range entries {
+		if entries[i].Type == TypeTool {
+			tool = &entries[i]
+		}
+	}
+	if tool == nil {
+		t.Fatalf("no tool entry replayed: %+v", entries)
+	}
+	if tool.IsRunning {
+		t.Errorf("a tool from history must not show as RUNNING")
+	}
+	if tool.ExitCode != ExitCodeUnknown {
+		t.Errorf("ExitCode = %d, want ExitCodeUnknown (the log has no status)", tool.ExitCode)
+	}
+	if got := RenderToolCard(tool.ToolName, tool.Command, tool.Content, tool.ExitCode, tool.IsRunning, 80); !strings.Contains(got, "EXIT ?") {
+		t.Errorf("card does not show a neutral status: %q", got)
+	}
+}
+
+// Recall is bounded (golem-sma.8): a long log must not seed an unbounded
+// history, and consecutive duplicates count once.
+func TestBuildInputHistoryIsBounded(t *testing.T) {
+	var events []fractal.Event
+	for i := 0; i < inputHistoryMaxEntries*2; i++ {
+		events = append(events, fractal.Event{ID: i, Kind: fractal.KindUser, Text: fmt.Sprintf("prompt %d", i)})
+		events = append(events, fractal.Event{ID: i, Kind: fractal.KindTool, Text: "shell: ls"})
+	}
+	history := buildInputHistory(events)
+	if len(history) != inputHistoryMaxEntries {
+		t.Fatalf("history = %d entries, want %d", len(history), inputHistoryMaxEntries)
+	}
+	if history[len(history)-1] != fmt.Sprintf("prompt %d", inputHistoryMaxEntries*2-1) {
+		t.Errorf("newest prompt missing from recall: %q", history[len(history)-1])
+	}
+
+	dupes := buildInputHistory([]fractal.Event{
+		{ID: 0, Kind: fractal.KindUser, Text: "same"},
+		{ID: 1, Kind: fractal.KindUser, Text: "same"},
+		{ID: 2, Kind: fractal.KindUser, Text: "  "},
+		{ID: 3, Kind: fractal.KindUser, Text: "different"},
+	})
+	if len(dupes) != 2 || dupes[0] != "same" || dupes[1] != "different" {
+		t.Errorf("history = %v, want [same different]", dupes)
 	}
 }
