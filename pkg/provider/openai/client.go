@@ -280,7 +280,8 @@ const (
 
 func retryableStatus(code int) bool {
 	switch code {
-	case http.StatusTooManyRequests, http.StatusInternalServerError,
+	case http.StatusRequestTimeout, // 408: the server gave up waiting, the request never ran
+		http.StatusTooManyRequests, http.StatusInternalServerError,
 		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	}
@@ -318,6 +319,8 @@ func (c *Client) doRequestWithRetry(ctx context.Context, endpoint string, body [
 			lastErr = fmt.Errorf("api error %d from %s", resp.StatusCode, endpoint)
 			sleep = retryAfter(resp, delay)
 			if attempt < maxRequestAttempts {
+				// Drain so the keep-alive connection can be reused; a drain
+				// failure does not change the retry decision.
 				_, _ = io.Copy(io.Discard, resp.Body)
 				_ = resp.Body.Close()
 			}

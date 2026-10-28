@@ -837,3 +837,31 @@ func TestClient_ThinkingModelReasoningContentRoundtrip(t *testing.T) {
 	}
 }
 
+// A 408 means the server never started the work, so retrying is safe and the
+// turn loop should not see it (golem-nbk.9).
+func TestClient_RetriesRequestTimeout(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			w.WriteHeader(http.StatusRequestTimeout)
+			_, _ = w.Write([]byte("request timeout"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	c := NewClient("m", server.URL, "k", server.Client())
+	text, err := collectUnary(t, c, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if text != "ok" {
+		t.Errorf("text = %q, want ok", text)
+	}
+	if requests != 2 {
+		t.Errorf("requests = %d, want 2 (408 retried once)", requests)
+	}
+}
