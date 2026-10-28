@@ -352,7 +352,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 					defer s.sessions.ReleaseTurn(sessionID)
 					turnCtx, cancel := context.WithTimeout(sessCtx, 10*time.Minute)
 					defer cancel()
-					_, _ = s.sessions.SendPrompt(turnCtx, sessionID, p)
+					if _, err := s.sessions.SendPrompt(turnCtx, sessionID, p); err != nil {
+						// The HTTP caller already has its 202; the turn failing is
+						// logged (and streamed as agent_done) instead of dropped.
+						log.Printf("server: turn for session %s failed: %v", sessionID, err)
+					}
 				}(sess.ctx, req.Prompt)
 
 				writeJSON(w, http.StatusAccepted, map[string]string{"status": "processing"})
@@ -401,7 +405,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 					defer s.sessions.ReleaseTurn(sessionID)
 					turnCtx, cancel := context.WithTimeout(sessCtx, 10*time.Minute)
 					defer cancel()
-					_, _ = s.sessions.SendApproval(turnCtx, sessionID, callID, approved)
+					if _, err := s.sessions.SendApproval(turnCtx, sessionID, callID, approved); err != nil {
+						log.Printf("server: resuming session %s after approval failed: %v", sessionID, err)
+					}
 				}(sess.ctx, req.CallID, req.Approved)
 				writeJSON(w, http.StatusAccepted, map[string]string{"status": "processing"})
 			default:
@@ -567,14 +573,26 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 				return
 			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			// Best effort: a client that hung up mid-write needs no report.
 			_, _ = w.Write([]byte(`<!DOCTYPE html><html><head><title>Golem</title></head><body><h1>Golem Multiplexer Server</h1><p>WebSocket hub and REST APIs active.</p></body></html>`))
 		})
 	}
 }
 
+// broadcast fans an event out to WebSocket subscribers; delivery is best effort
+// (see SessionManager.broadcast).
+func (s *Server) broadcast(eventType WSEventType, sessionID string, payload any) {
+	if s.hub == nil {
+		return
+	}
+	_ = s.hub.Broadcast(eventType, sessionID, payload)
+}
+
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
+	// The status and headers are already out; a client that hung up mid-body
+	// cannot be told about it.
 	_ = json.NewEncoder(w).Encode(data)
 }
 
@@ -844,7 +862,7 @@ func (s *Server) handleSaveProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = s.hub.Broadcast(WSEventProfileChanged, "", resp)
+	s.broadcast(WSEventProfileChanged, "", resp)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -909,24 +927,26 @@ func (s *Server) handleSetActiveProfile(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	_ = s.hub.Broadcast(WSEventProfileChanged, "", resp)
+	s.broadcast(WSEventProfileChanged, "", resp)
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func deleteProfileFromPath(filePath, profileName string) bool {
+func deleteProfileFromPath(filePath, profileName string) (bool, error) {
 	cfg, err := config.Load(filePath)
 	if err != nil || cfg.Profiles == nil {
-		return false
+		return false, nil
 	}
 	if _, exists := cfg.Profiles[profileName]; !exists {
-		return false
+		return false, nil
 	}
 	delete(cfg.Profiles, profileName)
 	if cfg.ActiveProfile == profileName {
 		cfg.ActiveProfile = ""
 	}
-	_ = config.Save(filePath, cfg)
-	return true
+	if err := config.Save(filePath, cfg); err != nil {
+		return false, errors.Wrapf(err, "saving %s after deleting profile %q", filePath, profileName)
+	}
+	return true, nil
 }
 
 func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request, profileName string) {
@@ -952,20 +972,35 @@ func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request, pro
 	userPath, wsPath := s.resolveProfileConfigPaths()
 
 	deleted := false
-	if scope == "workspace" {
-		if wsPath != "" {
-			deleted = deleteProfileFromPath(wsPath, profileName)
+	// A profile that was removed but could not be written back must not report
+	// success: the caller would believe the deletion took effect.
+	var delErr error
+	removeFrom := func(path string) bool {
+		if path == "" {
+			return false
 		}
-	} else if scope == "user" {
-		if userPath != "" {
-			deleted = deleteProfileFromPath(userPath, profileName)
+		ok, err := deleteProfileFromPath(path, profileName)
+		if err != nil {
+			delErr = err
+			return false
 		}
-	} else {
-		if wsPath != "" && deleteProfileFromPath(wsPath, profileName) {
+		return ok
+	}
+	switch scope {
+	case "workspace":
+		deleted = removeFrom(wsPath)
+	case "user":
+		deleted = removeFrom(userPath)
+	default:
+		if removeFrom(wsPath) {
 			deleted = true
-		} else if userPath != "" && deleteProfileFromPath(userPath, profileName) {
+		} else if delErr == nil && removeFrom(userPath) {
 			deleted = true
 		}
+	}
+	if delErr != nil {
+		writeError(w, http.StatusInternalServerError, delErr.Error())
+		return
 	}
 
 	if !deleted {
@@ -984,7 +1019,7 @@ func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request, pro
 		return
 	}
 
-	_ = s.hub.Broadcast(WSEventProfileChanged, "", resp)
+	s.broadcast(WSEventProfileChanged, "", resp)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -1027,6 +1062,10 @@ func (s *Server) applyActiveProfile(ctx context.Context, profileName string, fil
 	if activeSess, ok := s.sessions.ActiveSession(); ok && activeSess.Agent != nil {
 		activeSess.mu.Lock()
 		defer activeSess.mu.Unlock()
-		_, _ = activeSess.Agent.SwitchProfile(ctx, name)
+		if _, err := activeSess.Agent.SwitchProfile(ctx, name); err != nil {
+			// The profile is stored either way; the live agent keeps its old
+			// model until the next turn, so say so rather than fail silently.
+			log.Printf("server: profile %q saved but the active session did not switch: %v", name, err)
+		}
 	}
 }

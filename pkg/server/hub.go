@@ -37,7 +37,11 @@ func (c *Client) writePump() {
 			if err != nil {
 				return
 			}
-			_, _ = w.Write(message)
+			if _, err := w.Write(message); err != nil {
+				// The client is going away mid-frame; dropping the frame is the
+				// only option and the reader will unregister it.
+				return
+			}
 			if err := w.Close(); err != nil {
 				return
 			}

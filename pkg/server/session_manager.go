@@ -42,6 +42,16 @@ type SessionManager struct {
 	subagentHub func(sessionID string) golem.SubagentStreamHandler
 }
 
+// broadcast fans an event out to WebSocket subscribers. Delivery is best
+// effort by design: a session nobody is watching has nothing to deliver to,
+// and a failed frame is dropped by the hub's writer anyway.
+func (sm *SessionManager) broadcast(eventType WSEventType, sessionID string, payload any) {
+	if sm.hub == nil {
+		return
+	}
+	_ = sm.hub.Broadcast(eventType, sessionID, payload)
+}
+
 // NewSessionManager creates a new SessionManager.
 func NewSessionManager(baseCfg golem.Config, hub *Hub) *SessionManager {
 	return &SessionManager{
@@ -93,7 +103,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, title string) (*Ses
 	// Wire reactive memory pub-sub listener to broadcast to WebSocket clients
 	sessID := id
 	agentInstance.Store().OnEvent(func(ev fractal.Event) {
-		_ = sm.hub.Broadcast(WSEventMemoryAdded, sessID, map[string]any{
+		sm.broadcast(WSEventMemoryAdded, sessID, map[string]any{
 			"id":        ev.ID,
 			"kind":      ev.Kind,
 			"text":      ev.Text,
@@ -104,14 +114,14 @@ func (sm *SessionManager) CreateSession(ctx context.Context, title string) (*Ses
 	// Wire reactive swarm message pub-sub listener to broadcast to WebSocket clients
 	if sb := agentInstance.SwarmBus(); sb != nil {
 		sess.unsubSwarm = sb.OnMessage(func(msg swarm.Message) {
-			_ = sm.hub.Broadcast(WSEventSwarmMessage, sessID, msg)
+			sm.broadcast(WSEventSwarmMessage, sessID, msg)
 		})
 		sess.unsubLock = sb.OnLockChange(func(ev swarm.LockEvent) {
-			_ = sm.hub.Broadcast(WSEventSwarmLock, sessID, ev)
+			sm.broadcast(WSEventSwarmLock, sessID, ev)
 		})
 	}
 
-	_ = sm.hub.Broadcast(WSEventSessionCreated, id, SessionInfo{
+	sm.broadcast(WSEventSessionCreated, id, SessionInfo{
 		ID:        id,
 		Title:     title,
 		CreatedAt: sess.CreatedAt,
@@ -174,7 +184,7 @@ func (sm *SessionManager) CreateSessionWithImport(ctx context.Context, title str
 	// Now attach the reactive OnEvent listener for subsequent turns
 	sessID := id
 	agentInstance.Store().OnEvent(func(ev fractal.Event) {
-		_ = sm.hub.Broadcast(WSEventMemoryAdded, sessID, map[string]any{
+		sm.broadcast(WSEventMemoryAdded, sessID, map[string]any{
 			"id":        ev.ID,
 			"kind":      ev.Kind,
 			"text":      ev.Text,
@@ -184,10 +194,10 @@ func (sm *SessionManager) CreateSessionWithImport(ctx context.Context, title str
 
 	if sb := agentInstance.SwarmBus(); sb != nil {
 		sess.unsubSwarm = sb.OnMessage(func(msg swarm.Message) {
-			_ = sm.hub.Broadcast(WSEventSwarmMessage, sessID, msg)
+			sm.broadcast(WSEventSwarmMessage, sessID, msg)
 		})
 		sess.unsubLock = sb.OnLockChange(func(ev swarm.LockEvent) {
-			_ = sm.hub.Broadcast(WSEventSwarmLock, sessID, ev)
+			sm.broadcast(WSEventSwarmLock, sessID, ev)
 		})
 	}
 
@@ -197,7 +207,7 @@ func (sm *SessionManager) CreateSessionWithImport(ctx context.Context, title str
 	}
 	sm.mu.Unlock()
 
-	_ = sm.hub.Broadcast(WSEventSessionCreated, id, SessionInfo{
+	sm.broadcast(WSEventSessionCreated, id, SessionInfo{
 		ID:        id,
 		Title:     title,
 		CreatedAt: sess.CreatedAt,
@@ -245,7 +255,7 @@ func (sm *SessionManager) SetActiveSession(id string) bool {
 		return false
 	}
 	sm.activeID = id
-	_ = sm.hub.Broadcast(WSEventSessionActive, id, map[string]string{"active_id": id})
+	sm.broadcast(WSEventSessionActive, id, map[string]string{"active_id": id})
 	return true
 }
 
@@ -324,7 +334,7 @@ func (sm *SessionManager) DeleteSession(id string) error {
 		sess.unsubLock()
 	}
 	_ = sess.Agent.Close()
-	_ = sm.hub.Broadcast(WSEventSessionDeleted, id, map[string]string{"id": id})
+	sm.broadcast(WSEventSessionDeleted, id, map[string]string{"id": id})
 	return nil
 }
 
@@ -341,7 +351,7 @@ func (sm *SessionManager) SendPrompt(ctx context.Context, sessionID, prompt stri
 	sess.mu.Unlock()
 
 	// Broadcast user prompt start
-	_ = sm.hub.Broadcast(WSEventUserPrompt, sessionID, map[string]string{"prompt": prompt})
+	sm.broadcast(WSEventUserPrompt, sessionID, map[string]string{"prompt": prompt})
 
 	handler := &sessionStreamAdapter{
 		sessionID: sessionID,
@@ -353,19 +363,19 @@ func (sm *SessionManager) SendPrompt(ctx context.Context, sessionID, prompt stri
 		// The sandbox stopped the turn for a human. The prompt itself has
 		// already been broadcast; the client answers it with SendApproval, so
 		// this is not an error the UI should render.
-		_ = sm.hub.Broadcast(WSEventAgentDone, sessionID, map[string]any{
+		sm.broadcast(WSEventAgentDone, sessionID, map[string]any{
 			"awaiting_approval": true,
 		})
 		return "", err
 	}
 	if err != nil {
-		_ = sm.hub.Broadcast(WSEventAgentDone, sessionID, map[string]any{
+		sm.broadcast(WSEventAgentDone, sessionID, map[string]any{
 			"error": err.Error(),
 		})
 		return "", err
 	}
 
-	_ = sm.hub.Broadcast(WSEventAgentDone, sessionID, map[string]any{
+	sm.broadcast(WSEventAgentDone, sessionID, map[string]any{
 		"response": response,
 	})
 	return response, nil
@@ -387,19 +397,19 @@ func (sm *SessionManager) SendApproval(ctx context.Context, sessionID, callID st
 
 	response, err := sess.Agent.RespondToApproval(ctx, callID, approved, handler)
 	if errors.Is(err, golem.ErrAwaitingApproval) {
-		_ = sm.hub.Broadcast(WSEventAgentDone, sessionID, map[string]any{
+		sm.broadcast(WSEventAgentDone, sessionID, map[string]any{
 			"awaiting_approval": true,
 		})
 		return "", err
 	}
 	if err != nil {
-		_ = sm.hub.Broadcast(WSEventAgentDone, sessionID, map[string]any{
+		sm.broadcast(WSEventAgentDone, sessionID, map[string]any{
 			"error": err.Error(),
 		})
 		return "", err
 	}
 
-	_ = sm.hub.Broadcast(WSEventAgentDone, sessionID, map[string]any{
+	sm.broadcast(WSEventAgentDone, sessionID, map[string]any{
 		"response": response,
 	})
 	return response, nil
@@ -412,15 +422,23 @@ type sessionStreamAdapter struct {
 	subagentIDs map[string]string
 }
 
+// broadcast mirrors SessionManager.broadcast for the per-session event adapter.
+func (a *sessionStreamAdapter) broadcast(eventType WSEventType, sessionID string, payload any) {
+	if a.hub == nil {
+		return
+	}
+	_ = a.hub.Broadcast(eventType, sessionID, payload)
+}
+
 func (a *sessionStreamAdapter) OnChunk(token string) {
-	_ = a.hub.Broadcast(WSEventAgentChunk, a.sessionID, map[string]string{
+	a.broadcast(WSEventAgentChunk, a.sessionID, map[string]string{
 		"token": token,
 		"delta": token,
 	})
 }
 
 func (a *sessionStreamAdapter) OnApprovalRequest(req approval.Request) {
-	_ = a.hub.Broadcast(WSEventApprovalRequest, a.sessionID, map[string]any{
+	a.broadcast(WSEventApprovalRequest, a.sessionID, map[string]any{
 		"call_id": req.CallID,
 		"tool":    req.Tool,
 		"hint":    req.Hint,
@@ -430,7 +448,7 @@ func (a *sessionStreamAdapter) OnApprovalRequest(req approval.Request) {
 }
 
 func (a *sessionStreamAdapter) OnToolStart(toolName, command string) {
-	_ = a.hub.Broadcast(WSEventToolStart, a.sessionID, map[string]any{
+	a.broadcast(WSEventToolStart, a.sessionID, map[string]any{
 		"tool":    toolName,
 		"command": command,
 		"args":    map[string]any{"command": command},
@@ -438,7 +456,7 @@ func (a *sessionStreamAdapter) OnToolStart(toolName, command string) {
 }
 
 func (a *sessionStreamAdapter) OnToolDone(toolName, output string, exitCode int) {
-	_ = a.hub.Broadcast(WSEventToolDone, a.sessionID, map[string]any{
+	a.broadcast(WSEventToolDone, a.sessionID, map[string]any{
 		"tool":      toolName,
 		"output":    output,
 		"exit_code": exitCode,
@@ -454,7 +472,7 @@ func (a *sessionStreamAdapter) OnSubagentStart(role, model, prompt string) {
 	a.subagentIDs[role] = id
 	a.subagentMu.Unlock()
 
-	_ = a.hub.Broadcast(WSEventSubagentStart, a.sessionID, map[string]string{
+	a.broadcast(WSEventSubagentStart, a.sessionID, map[string]string{
 		"id":     id,
 		"name":   role,
 		"role":   role,
@@ -468,7 +486,7 @@ func (a *sessionStreamAdapter) OnSubagentTool(role, model, toolName, command, ou
 	id := a.subagentIDs[role]
 	a.subagentMu.Unlock()
 
-	_ = a.hub.Broadcast(WSEventSubagentTool, a.sessionID, map[string]any{
+	a.broadcast(WSEventSubagentTool, a.sessionID, map[string]any{
 		"id":         id,
 		"role":       role,
 		"model":      model,
@@ -489,7 +507,7 @@ func (a *sessionStreamAdapter) OnSubagentDone(role, model, result string, durati
 	if err != nil {
 		errStr = err.Error()
 	}
-	_ = a.hub.Broadcast(WSEventSubagentDone, a.sessionID, map[string]any{
+	a.broadcast(WSEventSubagentDone, a.sessionID, map[string]any{
 		"id":       id,
 		"role":     role,
 		"model":    model,
