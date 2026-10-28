@@ -1240,16 +1240,20 @@ func isTransientError(err error) bool {
 		strings.Contains(msg, "unavailable") ||
 		strings.Contains(msg, "high demand") ||
 		strings.Contains(msg, "429") ||
+		strings.Contains(msg, "408") ||
+		strings.Contains(msg, "request timeout") ||
 		strings.Contains(msg, "resource_exhausted") ||
 		strings.Contains(msg, "deadline exceeded") ||
 		strings.Contains(msg, "timeout")
 }
 
 // shouldRestartTurn reports whether a failed attempt may be retried from
-// scratch: only when the failure is transient, attempts remain, and no tool has
-// executed yet (a restart would otherwise re-run side effects and redo work).
-func shouldRestartTurn(runErr error, attempt, maxRetries, toolCalls int) bool {
-	return isTransientError(runErr) && attempt < maxRetries && toolCalls == 0
+// scratch: only when the failure is transient, attempts remain, no tool has
+// executed (a restart would re-run its side effects), and nothing has been
+// streamed to the transport yet (a restart would render the same partial text
+// twice).
+func shouldRestartTurn(runErr error, attempt, maxRetries, toolCalls, streamedBytes int) bool {
+	return isTransientError(runErr) && attempt < maxRetries && toolCalls == 0 && streamedBytes == 0
 }
 
 // SessionID returns the agent's session identifier.

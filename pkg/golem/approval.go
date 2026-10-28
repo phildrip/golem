@@ -79,10 +79,11 @@ func (a *Agent) streamPass(ctx context.Context, sessionID string, content *genai
 			return responseBuilder.String(), nil
 		}
 
-		// Only restart a turn from scratch when nothing has executed yet. Once a
-		// tool has run, a restart would re-execute its side effects and discard
-		// all work, so surface the error (with any partial text) instead.
-		if shouldRestartTurn(runErr, attempt, maxRetries, a.turnToolCallCount()) {
+		// Only restart a turn from scratch when nothing has executed and nothing
+		// has been sent to the transport yet. Once a tool has run a restart would
+		// re-execute its side effects, and once text has been streamed a restart
+		// would show it twice, so surface the error instead.
+		if shouldRestartTurn(runErr, attempt, maxRetries, a.turnToolCallCount(), responseBuilder.Len()) {
 			if a.cfg.OnRetry != nil {
 				a.cfg.OnRetry(attempt, maxRetries, backoff)
 			}

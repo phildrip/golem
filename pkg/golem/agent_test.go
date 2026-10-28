@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/memory/fractal"
@@ -81,6 +82,11 @@ func TestIsTransientError(t *testing.T) {
 		{
 			name: "timeout",
 			err:  errors.New("context deadline exceeded (Client.Timeout exceeded)"),
+			want: true,
+		},
+		{
+			name: "408 request timeout",
+			err:  errors.New("api error 408 from https://example.test/v1/chat/completions"),
 			want: true,
 		},
 		{
@@ -484,15 +490,17 @@ func TestShouldRestartTurn(t *testing.T) {
 		attempt    int
 		maxRetries int
 		toolCalls  int
+		streamed   int
 		want       bool
 	}{
-		{"transient before progress", transient, 1, 3, 0, true},
-		{"transient after progress", transient, 1, 3, 1, false},
-		{"permanent", permanent, 1, 3, 0, false},
-		{"no attempts left", transient, 3, 3, 0, false},
+		{"transient before progress", transient, 1, 3, 0, 0, true},
+		{"transient after progress", transient, 1, 3, 1, 0, false},
+		{"transient after streamed text", transient, 1, 3, 0, 12, false},
+		{"permanent", permanent, 1, 3, 0, 0, false},
+		{"no attempts left", transient, 3, 3, 0, 0, false},
 	}
 	for _, tc := range cases {
-		if got := shouldRestartTurn(tc.err, tc.attempt, tc.maxRetries, tc.toolCalls); got != tc.want {
+		if got := shouldRestartTurn(tc.err, tc.attempt, tc.maxRetries, tc.toolCalls, tc.streamed); got != tc.want {
 			t.Errorf("%s: shouldRestartTurn = %v, want %v", tc.name, got, tc.want)
 		}
 	}
@@ -613,6 +621,46 @@ func TestClipHeadTail(t *testing.T) {
 	}
 	if short := clipHeadTail("ok", 50); short != "ok" {
 		t.Errorf("short string changed: %q", short)
+	}
+}
+
+// A cut at a raw byte offset can split a multi-byte rune, handing the model
+// invalid UTF-8 (golem-01i.9).
+func TestClipHeadTailIsRuneSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		unit  string
+		limit int
+	}{
+		{name: "two-byte runes", unit: "é", limit: 101},
+		{name: "three-byte runes", unit: "漢", limit: 100},
+		{name: "four-byte runes", unit: "🚀", limit: 99},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := strings.Repeat(tc.unit, 400)
+			got := clipHeadTail(s, tc.limit)
+			if !utf8.ValidString(got) {
+				t.Fatalf("clipHeadTail produced invalid UTF-8 for %q", tc.name)
+			}
+			if len(got) > tc.limit {
+				t.Errorf("len = %d, want <= %d (the marker counts against the limit)", len(got), tc.limit)
+			}
+			if !strings.Contains(got, "truncated") {
+				t.Errorf("missing truncation marker: %q", got)
+			}
+		})
+	}
+}
+
+// A limit smaller than the marker cannot hold one; clip instead of exploding.
+func TestClipHeadTailBelowMarkerSize(t *testing.T) {
+	s := strings.Repeat("é", 100)
+	got := clipHeadTail(s, 8)
+	if !utf8.ValidString(got) {
+		t.Errorf("invalid UTF-8: %q", got)
+	}
+	if len(got) > 8 {
+		t.Errorf("len = %d, want <= 8", len(got))
 	}
 }
 
