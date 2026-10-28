@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func newTestFetcher(server *httptest.Server, maxBytes int64) *Fetcher {
@@ -119,5 +120,31 @@ func TestFetchTimeoutIsBounded(t *testing.T) {
 	defer cancel()
 	if _, err := f.Fetch(ctx, "http://10.255.255.1/"); err == nil {
 		t.Errorf("expected error on cancelled/private fetch")
+	}
+}
+
+// The clip is applied to whatever a page returned; a page in a multi-byte
+// script must not produce invalid UTF-8, and the marker must fit in the budget.
+func TestClipHeadTailIsRuneSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		unit  string
+		limit int
+	}{
+		{name: "two-byte runes", unit: "é", limit: 101},
+		{name: "three-byte runes", unit: "漢", limit: 100},
+		{name: "four-byte runes", unit: "🚀", limit: 99},
+		{name: "limit below the marker", unit: "漢", limit: 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := strings.Repeat(tc.unit, 400)
+			got := clipHeadTail(s, tc.limit)
+			if !utf8.ValidString(got) {
+				t.Fatalf("clipHeadTail produced invalid UTF-8 for %q", tc.name)
+			}
+			if len(got) > tc.limit {
+				t.Errorf("len = %d, want <= %d", len(got), tc.limit)
+			}
+		})
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/html"
@@ -99,6 +100,8 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Drain a bounded prefix so the connection can be reused; the status,
+		// not the drain, is what the caller needs to see.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return "", errors.Errorf("fetch failed: HTTP %d from %s", resp.StatusCode, target.Redacted())
 	}
@@ -269,12 +272,48 @@ func normalizeText(s string) string {
 	return strings.Join(out, "\n")
 }
 
-// clipHeadTail clips s to limit bytes, keeping the head and the tail.
+// clipHeadTail keeps the head and the tail of a fetched page in at most limit
+// bytes, counting the truncation marker. Cuts are rune-aligned so a page in a
+// multi-byte script cannot produce invalid UTF-8.
 func clipHeadTail(s string, limit int) string {
-	if len(s) <= limit || limit <= 0 {
+	const marker = "\n... [truncated] ...\n"
+	if limit <= 0 || len(s) <= limit {
 		return s
 	}
-	head := limit * 2 / 3
-	tail := limit - head
-	return s[:head] + "\n... [truncated] ...\n" + s[len(s)-tail:]
+	budget := limit - len(marker)
+	if budget <= 0 {
+		return clipLeadingRunes(s, limit)
+	}
+	head := budget * 2 / 3
+	tail := budget - head
+	return clipLeadingRunes(s, head) + marker + clipTrailingRunes(s, tail)
+}
+
+// clipLeadingRunes returns at most n leading bytes of s, ending on a rune boundary.
+func clipLeadingRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// clipTrailingRunes returns at most n trailing bytes of s, starting on a rune boundary.
+func clipTrailingRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n >= len(s) {
+		return s
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
 }

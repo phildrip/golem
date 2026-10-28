@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pkg/errors"
 	"github.com/user/golem/pkg/approval"
@@ -217,15 +218,56 @@ const (
 	liveHeadMaxTotalBytes = 8000
 )
 
-// clipHeadTail clips s to limit bytes, keeping the start and the end (thesis
-// section 1: a tool output is clipped to its head and tail, never only its head).
+// clipHeadTail keeps the start and the end of s, in at most limit bytes (thesis
+// section 1: a tool output is clipped to its head and tail, never only its
+// head). The marker counts against the limit, so the result never exceeds the
+// budget it was given. Both cuts are rune-aligned: slicing at a raw byte offset
+// can split a multi-byte character and hand the model invalid UTF-8.
 func clipHeadTail(s string, limit int) string {
-	if len(s) <= limit || limit <= 0 {
+	const marker = "\n... [truncated] ...\n"
+	if limit <= 0 || len(s) <= limit {
 		return s
 	}
-	head := limit * 2 / 3
-	tail := limit - head
-	return s[:head] + "\n... [truncated] ...\n" + s[len(s)-tail:]
+	budget := limit - len(marker)
+	if budget <= 0 {
+		// Not enough room for the marker: a bare clipped head is better than
+		// a marker pretending to be the whole output.
+		return clipToRuneBoundary(s, limit)
+	}
+	head := budget * 2 / 3
+	tail := budget - head
+	return clipToRuneBoundary(s, head) + marker + clipTail(s, tail)
+}
+
+// clipToRuneBoundary returns at most n leading bytes of s, backing off so the
+// result ends on a rune boundary.
+func clipToRuneBoundary(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	if n < 0 {
+		n = 0
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// clipTail returns at most n trailing bytes of s, advancing so the result
+// starts on a rune boundary.
+func clipTail(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	if n < 0 {
+		n = 0
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
 }
 
 // formatLiveHead renders recent raw events (bounded) so the agent keeps the
