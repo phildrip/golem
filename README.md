@@ -36,6 +36,7 @@ A few details that matter:
 - **The live head is verbatim.** Recent turns are never lossy.
 - **Summaries are produced in the background** by a dedicated compactor, optionally on its own model/provider (`--compactor-model`, `--compactor-provider`) so compression never competes with your main model.
 - **`remember(text, scope)`** promotes an important fact — a preference, a convention, an architectural decision — into durable profile memory so it survives across sessions.
+- **Failures are never silently dropped.** A memory write or a background compaction pass that fails is logged, counted, and shown in the TUI header (`⚠ memory 2`) instead of leaving the view quietly stuck at `(not summarized yet)`.
 - **Mounted memories.** A session can mount additional read-only fractal stores (e.g. a `work` profile or a shared reference corpus) alongside its primary workspace memory; `zoom` and `date` accept an optional `target` to read them.
 
 Storage is a single embedded [bbolt](https://github.com/etcd-io/bbolt) file (`fractal.db`), append-only and local-first. Legacy `events.jsonl` / `tree.jsonl` stores are migrated automatically on open.
