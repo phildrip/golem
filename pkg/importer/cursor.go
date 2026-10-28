@@ -35,16 +35,16 @@ type cursorBubbleHeader struct {
 }
 
 type cursorComposerDetails struct {
-	ComposerID                 string               `json:"composerId"`
-	CreatedAt                  int64                `json:"createdAt"`
-	LastUpdatedAt              int64                `json:"lastUpdatedAt"`
+	ComposerID                  string               `json:"composerId"`
+	CreatedAt                   int64                `json:"createdAt"`
+	LastUpdatedAt               int64                `json:"lastUpdatedAt"`
 	FullConversationHeadersOnly []cursorBubbleHeader `json:"fullConversationHeadersOnly"`
 }
 
 type cursorBubble struct {
-	BubbleID            string          `json:"bubbleId"`
-	Type                int             `json:"type"`
-	Text                string          `json:"text"`
+	BubbleID            string            `json:"bubbleId"`
+	Type                int               `json:"type"`
+	Text                string            `json:"text"`
 	SuggestedCodeBlocks []json.RawMessage `json:"suggestedCodeBlocks,omitempty"`
 	ToolResults         []json.RawMessage `json:"toolResults,omitempty"`
 }

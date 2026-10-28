@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pkg/errors"
 	"github.com/user/golem/pkg/memory/fractal"
@@ -45,9 +46,9 @@ func DefaultOpenCodeDBPath() string {
 	return filepath.Join(base, "opencode", "opencode.db")
 }
 
-// openOpenCodeDB opens the OpenCode SQLite database read-only so an import never
-// writes to (or locks) the user's live OpenCode state.
-func openOpenCodeDB(path string) (*sql.DB, error) {
+// openSQLiteReadOnly opens a SQLite database read-only so an import never writes
+// to (or locks) the user's live OpenCode/Cursor state.
+func openSQLiteReadOnly(path string) (*sql.DB, error) {
 	u := url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}
 	db, err := sql.Open("sqlite", u.String())
 	if err != nil {
@@ -72,7 +73,7 @@ func discoverOpenCodeSessions(currentWorkspace string) ([]DiscoveredSession, err
 		return nil, nil
 	}
 
-	db, err := openOpenCodeDB(dbPath)
+	db, err := openSQLiteReadOnly(dbPath)
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +125,13 @@ func msToTime(ms int64) time.Time {
 
 // ParseOpenCode parses one OpenCode session (or the most recent when sessionID is
 // empty) from a DB file or its parent directory into normalized events.
+//
+// The whole session is buffered before it is returned: one message's parts at a
+// time (the query is per message, not per session), so the peak is the largest
+// single message, not the whole conversation. Import then writes those events to
+// memory, which is the point where a very large session would use the most
+// memory. Fine for the sessions seen so far; revisit with a streaming callback if
+// someone imports a session with thousands of messages (golem-2hp.6).
 func ParseOpenCode(path, sessionID string) ([]ImportedEvent, error) {
 	dbPath := path
 	fi, err := os.Stat(path)
@@ -138,7 +146,7 @@ func ParseOpenCode(path, sessionID string) ([]ImportedEvent, error) {
 		dbPath = candidate
 	}
 
-	db, err := openOpenCodeDB(dbPath)
+	db, err := openSQLiteReadOnly(dbPath)
 	if err != nil {
 		return nil, err
 	}
@@ -273,7 +281,10 @@ type ocPartData struct {
 	State struct {
 		Status string          `json:"status"`
 		Input  json.RawMessage `json:"input"`
-		Output string          `json:"output"`
+		// Output is raw: most tools store a string, but some store a structured
+		// object/array. Typing it as a string failed the whole part's unmarshal,
+		// which silently dropped the call *and* its result (golem-2hp.4).
+		Output json.RawMessage `json:"output"`
 	} `json:"state"`
 	Time struct {
 		Created int64 `json:"created"`
@@ -314,7 +325,7 @@ func assistantEvents(parts []ocPartData, msgTime time.Time) []ImportedEvent {
 				Text:      fmt.Sprintf("%s: %s", p.Tool, input),
 				Timestamp: ts,
 			})
-			if out := strings.TrimSpace(p.State.Output); out != "" {
+			if out := ocOutputText(p.State.Output); out != "" {
 				events = append(events, ImportedEvent{
 					Kind:      fractal.KindEcho,
 					Text:      fmt.Sprintf("%s: %s", p.Tool, clipImportedText(out, importedToolTextLimit)),
@@ -324,6 +335,19 @@ func assistantEvents(parts []ocPartData, msgTime time.Time) []ImportedEvent {
 		}
 	}
 	return events
+}
+
+// ocOutputText renders a tool part's output as text: a JSON string is unquoted,
+// and a structured value keeps its JSON so the result is still readable.
+func ocOutputText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return strings.TrimSpace(text)
+	}
+	return strings.TrimSpace(string(raw))
 }
 
 // joinPartText concatenates the text of every part of the given type.
@@ -340,12 +364,46 @@ func joinPartText(parts []ocPartData, partType string) string {
 	return strings.Join(texts, "\n\n")
 }
 
-// clipImportedText clips s to limit bytes, keeping the head and the tail.
+// clipImportedText keeps the head and the tail of an imported tool result in at
+// most limit bytes. Cuts are rune-aligned: an imported result in a multi-byte
+// script must not turn into invalid UTF-8 in memory.
 func clipImportedText(s string, limit int) string {
-	if len(s) <= limit || limit <= 0 {
+	const marker = "\n... [truncated] ...\n"
+	if limit <= 0 || len(s) <= limit {
 		return s
 	}
-	head := limit * 2 / 3
-	tail := limit - head
-	return s[:head] + "\n... [truncated] ...\n" + s[len(s)-tail:]
+	budget := limit - len(marker)
+	if budget <= 0 {
+		return clipHeadRunes(s, limit)
+	}
+	head := budget * 2 / 3
+	tail := budget - head
+	return clipHeadRunes(s, head) + marker + clipTailRunes(s, tail)
+}
+
+func clipHeadRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+func clipTailRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n >= len(s) {
+		return s
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
 }

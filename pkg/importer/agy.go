@@ -47,74 +47,74 @@ func ParseAGY(r io.Reader) ([]ImportedEvent, error) {
 			if err := json.Unmarshal([]byte(line), &step); err == nil {
 				ts := parseTimestamp(step.CreatedAt)
 
-		switch step.Type {
-		case "USER_INPUT":
-			text := cleanUserContent(step.Content)
-			if text != "" {
-				events = append(events, ImportedEvent{
-					Kind:      fractal.KindUser,
-					Text:      text,
-					Timestamp: ts,
-				})
-			}
+				switch step.Type {
+				case "USER_INPUT":
+					text := cleanUserContent(step.Content)
+					if text != "" {
+						events = append(events, ImportedEvent{
+							Kind:      fractal.KindUser,
+							Text:      text,
+							Timestamp: ts,
+						})
+					}
 
-		case "PLANNER_RESPONSE":
-			if strings.TrimSpace(step.Content) != "" {
-				events = append(events, ImportedEvent{
-					Kind:      fractal.KindTalk,
-					Text:      strings.TrimSpace(step.Content),
-					Timestamp: ts,
-				})
-			}
-			for _, tc := range step.ToolCalls {
-				argsStr := string(tc.Args)
-				if argsStr == "" || argsStr == "null" {
-					argsStr = "{}"
+				case "PLANNER_RESPONSE":
+					if strings.TrimSpace(step.Content) != "" {
+						events = append(events, ImportedEvent{
+							Kind:      fractal.KindTalk,
+							Text:      strings.TrimSpace(step.Content),
+							Timestamp: ts,
+						})
+					}
+					for _, tc := range step.ToolCalls {
+						argsStr := string(tc.Args)
+						if argsStr == "" || argsStr == "null" {
+							argsStr = "{}"
+						}
+						events = append(events, ImportedEvent{
+							Kind:      fractal.KindTool,
+							Text:      fmt.Sprintf("%s: %s", tc.Name, argsStr),
+							Timestamp: ts,
+						})
+					}
+
+				case "TOOL_RESPONSE", "TOOL_RESULT", "RUN_COMMAND", "VIEW_FILE", "GREP_SEARCH", "LIST_DIRECTORY", "SEARCH_WEB", "CODE_ACTION", "MCP_TOOL", "READ_URL_CONTENT", "GENERATE_IMAGE", "ERROR_MESSAGE":
+					if strings.TrimSpace(step.Content) != "" {
+						events = append(events, ImportedEvent{
+							Kind:      fractal.KindEcho,
+							Text:      strings.TrimSpace(step.Content),
+							Timestamp: ts,
+						})
+					}
+
+				case "INVOKE_SUBAGENT", "SUBAGENT_RESULT", "SUBAGENT_DONE":
+					if strings.TrimSpace(step.Content) != "" {
+						events = append(events, ImportedEvent{
+							Kind:      fractal.KindWork,
+							Text:      strings.TrimSpace(step.Content),
+							Timestamp: ts,
+						})
+					}
+
+				default:
+					if step.Source == "USER_EXPLICIT" {
+						text := cleanUserContent(step.Content)
+						if text != "" {
+							events = append(events, ImportedEvent{
+								Kind:      fractal.KindUser,
+								Text:      text,
+								Timestamp: ts,
+							})
+						}
+					} else if strings.TrimSpace(step.Content) != "" {
+						events = append(events, ImportedEvent{
+							Kind:      fractal.KindTalk,
+							Text:      strings.TrimSpace(step.Content),
+							Timestamp: ts,
+						})
+					}
 				}
-				events = append(events, ImportedEvent{
-					Kind:      fractal.KindTool,
-					Text:      fmt.Sprintf("%s: %s", tc.Name, argsStr),
-					Timestamp: ts,
-				})
 			}
-
-		case "TOOL_RESPONSE", "TOOL_RESULT", "RUN_COMMAND", "VIEW_FILE", "GREP_SEARCH", "LIST_DIRECTORY", "SEARCH_WEB", "CODE_ACTION", "MCP_TOOL", "READ_URL_CONTENT", "GENERATE_IMAGE", "ERROR_MESSAGE":
-			if strings.TrimSpace(step.Content) != "" {
-				events = append(events, ImportedEvent{
-					Kind:      fractal.KindEcho,
-					Text:      strings.TrimSpace(step.Content),
-					Timestamp: ts,
-				})
-			}
-
-		case "INVOKE_SUBAGENT", "SUBAGENT_RESULT", "SUBAGENT_DONE":
-			if strings.TrimSpace(step.Content) != "" {
-				events = append(events, ImportedEvent{
-					Kind:      fractal.KindWork,
-					Text:      strings.TrimSpace(step.Content),
-					Timestamp: ts,
-				})
-			}
-
-		default:
-			if step.Source == "USER_EXPLICIT" {
-				text := cleanUserContent(step.Content)
-				if text != "" {
-					events = append(events, ImportedEvent{
-						Kind:      fractal.KindUser,
-						Text:      text,
-						Timestamp: ts,
-					})
-				}
-			} else if strings.TrimSpace(step.Content) != "" {
-				events = append(events, ImportedEvent{
-					Kind:      fractal.KindTalk,
-					Text:      strings.TrimSpace(step.Content),
-					Timestamp: ts,
-				})
-			}
-		}
-		}
 		}
 		if readErr != nil {
 			if readErr == io.EOF {

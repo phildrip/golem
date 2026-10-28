@@ -3,7 +3,6 @@ package importer
 import (
 	"bufio"
 	"bytes"
-	"database/sql"
 	"io"
 	"os"
 	"path/filepath"
@@ -77,7 +76,9 @@ func deduceFileFormat(filePath string) (FormatType, error) {
 
 	// Check for SQLite database magic header
 	if len(header) >= 16 && bytes.HasPrefix(header, []byte("SQLite format 3\x00")) {
-		db, err := sql.Open("sqlite", filePath)
+		// Read-only like the parser: deducing a format must not create or touch
+		// a database file (golem-2hp.5).
+		db, err := openSQLiteReadOnly(filePath)
 		if err == nil {
 			defer db.Close()
 			var cursorTables int

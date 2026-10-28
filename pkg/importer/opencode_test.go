@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/user/golem/pkg/memory/fractal"
 	_ "modernc.org/sqlite"
@@ -161,5 +162,79 @@ func TestClipImportedText(t *testing.T) {
 	}
 	if strings.Contains(got, "MID") {
 		t.Errorf("middle not elided: %q", got)
+	}
+}
+
+// A tool part whose output is structured (not a string) must keep both the call
+// and its result; typing the field as a string dropped the whole part
+// (golem-2hp.4).
+func TestParseOpenCodeKeepsStructuredToolOutput(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "opencode.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	for _, stmt := range []string{
+		`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL DEFAULT '', slug TEXT NOT NULL DEFAULT '',
+			directory TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '',
+			time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL)`,
+		`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+			time_updated INTEGER NOT NULL, data TEXT NOT NULL)`,
+		`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+			time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("ddl: %v", err)
+		}
+	}
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('ses_x','/w','t',1000,2000)`, nil},
+		{`INSERT INTO message VALUES ('msg_1','ses_x',1000,1000,?)`, []any{`{"role":"assistant","time":{"created":1000}}`}},
+		{`INSERT INTO part VALUES ('prt_1','msg_1','ses_x',1000,1000,?)`, []any{
+			`{"type":"tool","tool":"read","state":{"status":"completed","input":{"path":"a.txt"},"output":{"files":["a.txt","b.txt"],"truncated":true}}}`,
+		}},
+	} {
+		if _, err := db.Exec(q.sql, q.args...); err != nil {
+			t.Fatalf("exec %q: %v", q.sql, err)
+		}
+	}
+
+	events, err := ParseOpenCode(dbPath, "ses_x")
+	if err != nil {
+		t.Fatalf("ParseOpenCode failed: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want tool + echo: %+v", len(events), events)
+	}
+	if events[0].Kind != fractal.KindTool || !strings.Contains(events[0].Text, "read: ") {
+		t.Errorf("tool event = %+v", events[0])
+	}
+	if events[1].Kind != fractal.KindEcho {
+		t.Fatalf("echo event = %+v", events[1])
+	}
+	for _, want := range []string{"files", "a.txt", "truncated"} {
+		if !strings.Contains(events[1].Text, want) {
+			t.Errorf("echo %q lost %q", events[1].Text, want)
+		}
+	}
+	if !utf8.ValidString(events[1].Text) {
+		t.Errorf("echo is not valid UTF-8: %q", events[1].Text)
+	}
+}
+
+// Imported output can be in any script: clipping must not split a rune.
+func TestClipImportedTextIsRuneSafe(t *testing.T) {
+	long := strings.Repeat("漢", 200)
+	got := clipImportedText(long, 101)
+	if !utf8.ValidString(got) {
+		t.Fatalf("clipImportedText produced invalid UTF-8")
+	}
+	if len(got) > 101 {
+		t.Errorf("len = %d, want <= 101 (the marker counts)", len(got))
 	}
 }

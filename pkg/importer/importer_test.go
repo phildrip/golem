@@ -180,6 +180,12 @@ func TestDiscoverHistories(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
+	// Isolate every source: discovery must not pick up the host's real
+	// OpenCode/Cursor sessions (golem-2hp.5).
+	t.Setenv("HOME", tempDir)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tempDir, "xdg-data"))
+	t.Setenv("APPDATA", filepath.Join(tempDir, "appdata"))
+	t.Setenv("OPENCODE_DB_PATH", "")
 	// Set AGY_BRAIN_DIR to tempDir
 	t.Setenv("AGY_BRAIN_DIR", tempDir)
 
@@ -208,8 +214,8 @@ func TestDiscoverHistories(t *testing.T) {
 		t.Fatalf("DiscoverHistories failed: %v", err)
 	}
 
-	if len(sessions) < 2 {
-		t.Fatalf("expected at least 2 sessions, got %d", len(sessions))
+	if len(sessions) != 2 {
+		t.Fatalf("expected exactly the 2 fixture sessions, got %d: %+v", len(sessions), sessions)
 	}
 
 	// First session should be the matching workspace one (conv-1) despite conv-2 being newer
