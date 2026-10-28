@@ -125,6 +125,10 @@ type Agent struct {
 	pendingApproval *approval.Request
 	pendingSession  string
 	sandbox         *sandbox.Policy
+
+	// health holds internal failures (memory appends, compaction passes) that
+	// the turn loop cannot return to its caller; see Health.
+	health *Health
 }
 
 // dynamicModel is a thread-safe proxy implementing model.LLM that allows hot-swapping the active LLM client.
@@ -581,6 +585,9 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		}
 	}
 
+	// Failures inside the tool callbacks have no caller to return to, so they
+	// report here instead of being discarded.
+	health := newHealth()
 	var agentPtr *Agent
 
 	// 6. Initialize Swarm Bus & Tools
@@ -669,7 +676,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 					return nil, lockErr
 				}
 				if t.Name() != "zoom" && t.Name() != "date" {
-					_, _ = store.AppendEvent(fractal.KindTool, fmt.Sprintf("%s: %s", t.Name(), string(argsBytes)))
+					appendMemoryEvent(health, store, fractal.KindTool, fmt.Sprintf("%s: %s", t.Name(), string(argsBytes)))
 				}
 
 				if agentPtr != nil {
@@ -711,7 +718,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 					out = clipHeadTail(out, 30000)
 				}
 				if t.Name() != "zoom" && t.Name() != "date" {
-					_, _ = store.AppendEvent(fractal.KindEcho, fmt.Sprintf("%s: %s", t.Name(), out))
+					appendMemoryEvent(health, store, fractal.KindEcho, fmt.Sprintf("%s: %s", t.Name(), out))
 				}
 
 				if agentPtr != nil {
@@ -759,6 +766,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		dynModel:         dynModel,
 		modelFactory:     modelFactory,
 		sandbox:          sandboxPolicy,
+		health:           health,
 	}
 
 	// Start background compactor loop if configured or for trigger events
@@ -785,14 +793,31 @@ func (a *Agent) startCompactorWorker(ctx context.Context) {
 				// Do not contend with an active turn for provider quota.
 				continue
 			}
-			_, _ = a.compactor.Pump(ctx)
+			a.pumpCompactor(ctx)
 		case <-a.compactorTrigger:
 			if a.isTurnActive() {
 				continue
 			}
-			_, _ = a.compactor.Pump(ctx)
+			a.pumpCompactor(ctx)
 		}
 	}
+}
+
+// pumpCompactor runs one compaction pass and reports a failure. A pass that
+// fails every time leaves the view stuck at "not summarized yet", which used to
+// be invisible because the error was dropped on the floor.
+func (a *Agent) pumpCompactor(ctx context.Context) {
+	if _, err := a.compactor.Pump(ctx); err != nil {
+		a.health.Record("compactor", "pump", err)
+	}
+}
+
+// Health exposes the internal-failure record for the TUI and the CLI banner.
+func (a *Agent) Health() *Health {
+	if a == nil {
+		return nil
+	}
+	return a.health
 }
 
 // triggerCompactor signals the background compactor worker without blocking.
