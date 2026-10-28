@@ -300,4 +300,3 @@ func NewRememberTool(registry StoreRegistry, defaultScope string) (tool.Tool, er
 	}
 	return t, nil
 }
-

@@ -323,6 +323,39 @@ func (c *capturingLLM) GenerateContent(ctx context.Context, req *model.LLMReques
 	}
 }
 
+func TestLLMSummarizerSharesTools(t *testing.T) {
+	fm := &capturingLLM{}
+	s := NewLLMSummarizer(fm, "")
+	s.SetTools([]*genai.Tool{{FunctionDeclarations: []*genai.FunctionDeclaration{
+		{Name: "shell", Description: "run a command"},
+	}}})
+
+	if _, err := s.Summarize(context.Background(), "<chat></chat>", "user: hi", false); err != nil {
+		t.Fatalf("Summarize failed: %v", err)
+	}
+	if fm.req == nil || fm.req.Config == nil || len(fm.req.Config.Tools) == 0 {
+		t.Fatalf("compaction request did not carry the turn tools")
+	}
+	if got := fm.req.Config.Tools[0].FunctionDeclarations[0].Name; got != "shell" {
+		t.Errorf("tool name = %q, want shell", got)
+	}
+}
+
+func TestLLMSummarizerWithoutToolsKeepsTheConfigLean(t *testing.T) {
+	fm := &capturingLLM{}
+	s := NewLLMSummarizer(fm, "")
+
+	if _, err := s.Summarize(context.Background(), "<chat></chat>", "user: hi", false); err != nil {
+		t.Fatalf("Summarize failed: %v", err)
+	}
+	if fm.req == nil {
+		t.Fatalf("no request captured")
+	}
+	if fm.req.Config != nil && len(fm.req.Config.Tools) > 0 {
+		t.Errorf("request carried tools nobody set")
+	}
+}
+
 func TestLLMSummarizerSharesSystemPrompt(t *testing.T) {
 	fm := &capturingLLM{}
 	s := NewLLMSummarizer(fm, "STATIC SYSTEM PROMPT")
@@ -338,5 +371,51 @@ func TestLLMSummarizerSharesSystemPrompt(t *testing.T) {
 	}
 	if got := fm.req.Config.SystemInstruction.Parts[0].Text; got != "STATIC SYSTEM PROMPT" {
 		t.Errorf("system instruction = %q, want the shared prompt", got)
+	}
+}
+
+// The first pass after a restart must not rescan the whole tree (golem-01i.11).
+func TestPumpWatermarksSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+
+	for i := 0; i < 4; i++ {
+		if _, err := store.AppendEvent(KindUser, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatalf("AppendEvent failed: %v", err)
+		}
+	}
+	view := NewView(store, ViewConfig{LiveHeadCount: 0})
+	first := NewCompactor(store, view, &stubSummarizer{}, DefaultCompactorConfig())
+	if _, err := first.Pump(context.Background()); err != nil {
+		t.Fatalf("Pump failed: %v", err)
+	}
+	marks := first.Watermarks()
+	if len(marks) == 0 || marks[0] != 4 {
+		t.Fatalf("watermarks after pump = %v, want level 0 at 4", marks)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Reopen: a new compactor on the same store picks the watermarks back up.
+	reopened, err := OpenStore(dir)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer reopened.Close()
+
+	restarted := NewCompactor(reopened, NewView(reopened, ViewConfig{LiveHeadCount: 0}), &stubSummarizer{}, DefaultCompactorConfig())
+	if got := restarted.Watermarks(); len(got) == 0 || got[0] != 4 {
+		t.Fatalf("watermarks after restart = %v, want level 0 at 4", got)
+	}
+	built, err := restarted.Pump(context.Background())
+	if err != nil {
+		t.Fatalf("Pump after restart failed: %v", err)
+	}
+	if built != 0 {
+		t.Errorf("restarted Pump built %d nodes, want 0 (nothing new)", built)
 	}
 }

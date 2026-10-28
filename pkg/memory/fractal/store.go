@@ -26,6 +26,10 @@ var (
 // viewStateKey is the single key under bucketView holding the persisted tiling.
 var viewStateKey = []byte("state")
 
+// watermarksKey holds the compactor's per-level progress under bucketView, so
+// the first pass after a restart does not rescan the whole tree.
+var watermarksKey = []byte("compactor_watermarks")
+
 // ViewState is the persisted tiling of a View: its parts and tail boundary.
 type ViewState struct {
 	Parts  []ViewPart `json:"parts"`
@@ -408,6 +412,50 @@ func (s *Store) SaveViewState(st ViewState) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(bucketView).Put(viewStateKey, data)
 	})
+}
+
+// SaveCompactorWatermarks persists the compactor's per-level progress. Node
+// writes commit before the watermark that covers them, so a stored watermark
+// never claims progress the store does not have.
+func (s *Store) SaveCompactorWatermarks(marks []int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	data, err := json.Marshal(marks)
+	if err != nil {
+		return errors.Wrap(err, "marshaling compactor watermarks")
+	}
+
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketView).Put(watermarksKey, data)
+	})
+}
+
+// LoadCompactorWatermarks returns the persisted per-level progress, if any.
+func (s *Store) LoadCompactorWatermarks() ([]int, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, false
+	}
+
+	var marks []int
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		data := tx.Bucket(bucketView).Get(watermarksKey)
+		if data == nil {
+			return nil
+		}
+		return json.Unmarshal(data, &marks)
+	})
+	if err != nil || len(marks) == 0 {
+		return nil, false
+	}
+	return marks, true
 }
 
 // LoadViewState returns the persisted View tiling, if any.

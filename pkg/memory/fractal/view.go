@@ -339,12 +339,36 @@ func (v *View) Render() string {
 func (v *View) RenderCompacted(targetBytes int) string {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
+	return v.renderCompactedLocked(targetBytes, -1)
+}
 
-	if targetBytes <= 0 || len(v.parts) < 2 || v.sizeOf(v.parts) <= targetBytes {
-		return v.renderParts(v.parts)
+// RenderCompactedEndingAt renders the view up to, but not including, event
+// endExclusive, coarsened to fit targetBytes. A node's compaction view ends
+// where that node starts (thesis section 4): the node's own text is the task,
+// so later events are not evidence its summary may use, and the view is bounded
+// by the node rather than by the whole log.
+func (v *View) RenderCompactedEndingAt(targetBytes, endExclusive int) string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.renderCompactedLocked(targetBytes, endExclusive)
+}
+
+func (v *View) renderCompactedLocked(targetBytes, endExclusive int) string {
+	parts := v.parts
+	if endExclusive >= 0 {
+		parts = v.partsEndingAt(parts, endExclusive)
 	}
 
-	parts := append([]ViewPart(nil), v.parts...)
+	if targetBytes <= 0 || len(parts) < 2 || v.sizeOf(parts) <= targetBytes {
+		return v.renderParts(parts)
+	}
+
+	parts = append([]ViewPart(nil), parts...)
+	// Only pairs whose parent is already built are merged, so every rendered
+	// line is real text. When no built parent is left the view stays longer
+	// than targetBytes instead of padding the prompt with placeholders: the
+	// compaction context is a hint, and "(not summarized yet)" tells the model
+	// nothing while still costing tokens.
 	for v.sizeOf(parts) > targetBytes {
 		idx := v.bestMergeIndexFor(parts)
 		if idx == -1 {
@@ -355,6 +379,50 @@ func (v *View) RenderCompacted(targetBytes int) string {
 		parts = append(parts[:idx], append([]ViewPart{parent}, parts[idx+2:]...)...)
 	}
 	return v.renderParts(parts)
+}
+
+// partsEndingAt clips a tiling so it ends exactly at endExclusive, splitting the
+// one part that straddles the boundary into its children (a built parent
+// implies its children are built).
+func (v *View) partsEndingAt(parts []ViewPart, endExclusive int) []ViewPart {
+	out := make([]ViewPart, 0, len(parts))
+	for _, p := range parts {
+		start, end := p.Range()
+		if end <= endExclusive {
+			out = append(out, p)
+			continue
+		}
+		if start >= endExclusive {
+			// The tiling is ordered, so nothing after this part qualifies.
+			break
+		}
+		out = append(out, v.splitToBoundary(p, endExclusive)...)
+	}
+	return out
+}
+
+// splitToBoundary descends through a part until it is cut at endExclusive.
+func (v *View) splitToBoundary(p ViewPart, endExclusive int) []ViewPart {
+	if p.Level == 0 {
+		return nil
+	}
+
+	var out []ViewPart
+	for _, child := range []ViewPart{
+		{Level: p.Level - 1, Index: 2 * p.Index},
+		{Level: p.Level - 1, Index: 2*p.Index + 1},
+	} {
+		start, end := child.Range()
+		if end <= endExclusive {
+			out = append(out, child)
+			continue
+		}
+		if start >= endExclusive {
+			break
+		}
+		out = append(out, v.splitToBoundary(child, endExclusive)...)
+	}
+	return out
 }
 
 // renderParts formats a tiling as the <chat>...</chat> view. Callers hold v.mu.

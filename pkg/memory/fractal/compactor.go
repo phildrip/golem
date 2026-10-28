@@ -44,6 +44,11 @@ const maxNodeBytes = 4 * DefaultNodeTargetBytes
 
 // buildCompactorPrompt renders the shared compaction instruction for both the
 // initial summary and the correction turn.
+//
+// The wording is Golem's own, not the thesis task verbatim (golem-01i.10): the
+// thesis text is not part of this repository, and the phrasing only affects the
+// tail of the request - the cacheable prefix is the system prompt, the tools and
+// the view, which the summarizer already shares with the turn.
 func buildCompactorPrompt(contextView, content string, isMerge bool) string {
 	instruction := "Compress this message into one single-line summary, in at most 512 bytes:"
 	if isMerge {
@@ -136,12 +141,27 @@ func (g *GeminiSummarizer) Correct(ctx context.Context, contextView, content str
 type LLMSummarizer struct {
 	model        model.LLM
 	systemPrompt string
+	// tools are the turn's tool declarations, when the compactor shares the
+	// turn's model; they extend the cached prefix past the system prompt.
+	tools []*genai.Tool
 }
 
 // NewLLMSummarizer creates a summarizer using any ADK model.LLM. systemPrompt is
 // the same static prompt turns use, so compaction requests share the turn prefix.
 func NewLLMSummarizer(m model.LLM, systemPrompt string) *LLMSummarizer {
 	return &LLMSummarizer{model: m, systemPrompt: systemPrompt}
+}
+
+// SetTools gives the summarizer the turn's tool declarations so a compaction
+// request carries the same tools, system prompt and view a turn does - the
+// shared prefix a provider cache needs (thesis section 4). It only buys
+// anything when the compactor is the same model as the turns; the caller
+// decides that.
+func (s *LLMSummarizer) SetTools(tools []*genai.Tool) {
+	if s == nil {
+		return
+	}
+	s.tools = tools
 }
 
 // Summarize sends a single compression step to the model with cached context prefix.
@@ -166,10 +186,14 @@ func (s *LLMSummarizer) Correct(ctx context.Context, contextView, content string
 
 func (s *LLMSummarizer) generate(ctx context.Context, contents []*genai.Content) (string, error) {
 	req := &model.LLMRequest{Contents: contents}
+	if s.systemPrompt != "" || len(s.tools) > 0 {
+		req.Config = &genai.GenerateContentConfig{}
+	}
 	if s.systemPrompt != "" {
-		req.Config = &genai.GenerateContentConfig{
-			SystemInstruction: genai.NewContentFromText(s.systemPrompt, "system"),
-		}
+		req.Config.SystemInstruction = genai.NewContentFromText(s.systemPrompt, "system")
+	}
+	if len(s.tools) > 0 {
+		req.Config.Tools = s.tools
 	}
 
 	var textBuilder strings.Builder
@@ -248,9 +272,14 @@ func SummarizeBounded(ctx context.Context, s Summarizer, contextView, content st
 const CompactionViewBytes = 24_000
 
 // CompactorConfig configures the tree compactor.
+//
+// There is deliberately no concurrency knob: Pump walks levels in watermark
+// order, and parallel node building would break that ordering (a parent can only
+// be built after its children) while competing with the turn for provider
+// quota. One compaction call at a time is the design, so a config field claiming
+// otherwise was removed (golem-nbk.8).
 type CompactorConfig struct {
 	TargetBytes int
-	Concurrency int
 	// CompactionViewBytes is the target size of the context view passed to a
 	// compaction, smaller than a turn's view.
 	CompactionViewBytes int
@@ -260,7 +289,6 @@ type CompactorConfig struct {
 func DefaultCompactorConfig() CompactorConfig {
 	return CompactorConfig{
 		TargetBytes:         DefaultNodeTargetBytes,
-		Concurrency:         2,
 		CompactionViewBytes: CompactionViewBytes,
 	}
 }
@@ -276,6 +304,11 @@ type Compactor struct {
 	// (built or found). It lets Pump consider only newly appended nodes instead
 	// of scanning the whole tree each pass (thesis section 4: never scan).
 	levelBuilt []int
+	// pumpFailures/lastPumpErr record failed passes. A pass that keeps failing
+	// leaves the view stuck at "not summarized yet", so it must be reportable
+	// rather than silently retried forever.
+	pumpFailures int
+	lastPumpErr  error
 }
 
 // NewCompactor creates a new Compactor instance.
@@ -283,19 +316,22 @@ func NewCompactor(store *Store, view *View, summarizer Summarizer, cfg Compactor
 	if cfg.TargetBytes <= 0 {
 		cfg.TargetBytes = DefaultNodeTargetBytes
 	}
-	if cfg.Concurrency <= 0 {
-		cfg.Concurrency = 4
-	}
 	if cfg.CompactionViewBytes <= 0 {
 		cfg.CompactionViewBytes = CompactionViewBytes
 	}
 
-	return &Compactor{
+	c := &Compactor{
 		store:      store,
 		view:       view,
 		summarizer: summarizer,
 		cfg:        cfg,
 	}
+	// Pick up where the last process left off: without this the first pass after
+	// a restart walks the whole tree again (golem-01i.11).
+	if marks, ok := store.LoadCompactorWatermarks(); ok {
+		c.levelBuilt = marks
+	}
+	return c
 }
 
 // BuildNode builds or verifies the summary node at coordinate (level, index).
@@ -330,7 +366,8 @@ func (c *Compactor) BuildNode(ctx context.Context, level, index int) (Node, erro
 			return Node{}, errors.New("cannot summarize oversized event: no summarizer configured")
 		}
 
-		contextView := c.view.RenderCompacted(c.cfg.CompactionViewBytes)
+		// The view ends where this event starts: its own text is the task.
+		contextView := c.view.RenderCompactedEndingAt(c.cfg.CompactionViewBytes, index)
 		summary, err := SummarizeBounded(ctx, c.summarizer, contextView, formatted, false)
 		if err != nil {
 			return Node{}, errors.Wrapf(err, "summarizing level 0 node %d", index)
@@ -392,7 +429,8 @@ func (c *Compactor) BuildNode(ctx context.Context, level, index int) (Node, erro
 	}
 
 	contentToMerge := fmt.Sprintf("Child 1: %s\nChild 2: %s", childA.Text, childB.Text)
-	contextView := c.view.RenderCompacted(c.cfg.CompactionViewBytes)
+	// The view ends where the merged node starts (its children are the task).
+	contextView := c.view.RenderCompactedEndingAt(c.cfg.CompactionViewBytes, index<<level)
 	summary, err := SummarizeBounded(ctx, c.summarizer, contextView, contentToMerge, true)
 	if err != nil {
 		return Node{}, errors.Wrapf(err, "merging node (%d, %d)", level, index)
@@ -416,6 +454,45 @@ func (c *Compactor) Pump(ctx context.Context) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	built, err := c.pumpLocked(ctx)
+	if err != nil {
+		c.pumpFailures++
+		c.lastPumpErr = err
+	}
+	if built > 0 {
+		if err := c.store.SaveCompactorWatermarks(c.levelBuilt); err != nil {
+			log.Printf("fractal: saving compactor watermarks: %v (the next pass will rescan)", err)
+		}
+	}
+	return built, err
+}
+
+// Watermarks returns a copy of the per-level progress (the number of leading
+// indices resolved at each level), for tests and diagnostics.
+func (c *Compactor) Watermarks() []int {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]int, len(c.levelBuilt))
+	copy(out, c.levelBuilt)
+	return out
+}
+
+// PumpStatus reports how many passes have failed since start and the most
+// recent failure, so a stuck view can say why it is stuck.
+func (c *Compactor) PumpStatus() (int, error) {
+	if c == nil {
+		return 0, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pumpFailures, c.lastPumpErr
+}
+
+// pumpLocked is Pump's body; the caller holds c.mu.
+func (c *Compactor) pumpLocked(ctx context.Context) (int, error) {
 	total := c.store.CountEvents()
 	tailEnd := total - c.view.cfg.LiveHeadCount
 	if tailEnd <= 0 {
@@ -505,7 +582,9 @@ func (c *Compactor) StartBackground(ctx context.Context, interval time.Duration)
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_, _ = c.Pump(ctx)
+				// Pump records its own failures (PumpStatus); a background pass
+				// has nobody to return them to.
+				c.Pump(ctx)
 			}
 		}
 	}()

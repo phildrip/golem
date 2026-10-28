@@ -447,3 +447,72 @@ func TestRenderCompactedCoarsens(t *testing.T) {
 		t.Errorf("compacted view missing chat tags: %q", comp)
 	}
 }
+
+// buildCoarseView seeds a store with 8 built events and a 2+2 tiling, so a
+// boundary can fall in the middle of a built parent.
+func buildCoarseView(t *testing.T) *View {
+	t.Helper()
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	for i := 0; i < 8; i++ {
+		if _, err := store.AppendEvent(KindUser, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatalf("AppendEvent failed: %v", err)
+		}
+	}
+	for i := 0; i < 8; i++ {
+		if err := store.SaveNode(Node{Level: 0, Index: i, Text: fmt.Sprintf("sum%d", i), Size: 6}); err != nil {
+			t.Fatalf("SaveNode failed: %v", err)
+		}
+	}
+	for lvl, count := range map[int]int{1: 4, 2: 2} {
+		for i := 0; i < count; i++ {
+			if err := store.SaveNode(Node{Level: lvl, Index: i, Text: fmt.Sprintf("L%d-%d", lvl, i), Size: 8}); err != nil {
+				t.Fatalf("SaveNode failed: %v", err)
+			}
+		}
+	}
+
+	v := &View{
+		cfg:    ViewConfig{LiveHeadCount: 0, ViewBudgetBytes: DefaultViewBudgetBytes, LowWaterBytes: DefaultViewLowWaterBytes},
+		store:  store,
+		parts:  []ViewPart{{Level: 2, Index: 0}, {Level: 2, Index: 1}},
+		tailTo: 8,
+	}
+	return v
+}
+
+// A node's compaction view ends where the node starts (golem-01i.11).
+func TestRenderCompactedEndingAtStopsAtTheNode(t *testing.T) {
+	v := buildCoarseView(t)
+
+	if got := v.RenderCompactedEndingAt(1<<20, 4); got != "<chat>\n0+4|L2-0\n</chat>" {
+		t.Errorf("view ending at 4 = %q, want just the 0+4 line", got)
+	}
+	// Ending inside a built parent splits it back into its children.
+	if got := v.RenderCompactedEndingAt(1<<20, 6); got != "<chat>\n0+4|L2-0\n4+2|L1-2\n</chat>" {
+		t.Errorf("view ending at 6 = %q, want 0+4 then 4+2", got)
+	}
+	// The whole view is still available through the unqualified call.
+	if got := v.RenderCompacted(1 << 20); got != "<chat>\n0+4|L2-0\n4+4|L2-1\n</chat>" {
+		t.Errorf("full compacted view = %q", got)
+	}
+}
+
+// A target that cannot be met without placeholders leaves the view long rather
+// than padding it with "(not summarized yet)".
+func TestRenderCompactedKeepsOnlyBuiltLines(t *testing.T) {
+	v := buildCoarseView(t)
+	v.parts = []ViewPart{{Level: 2, Index: 0}, {Level: 2, Index: 1}}
+
+	got := v.RenderCompactedEndingAt(1, 8)
+	if strings.Contains(got, "not summarized yet") {
+		t.Errorf("compaction view contains a placeholder: %q", got)
+	}
+	if len(got) <= 1 {
+		t.Errorf("compaction view collapsed to %q", got)
+	}
+}
