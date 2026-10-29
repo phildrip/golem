@@ -710,6 +710,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 			return buildInstruction(memoryMgr, view, swarmBus, excludeFrom), nil
 		},
 		BeforeToolCallbacks: []llmagent.BeforeToolCallback{
+			repairToolArguments,
 			func(ctx agent.Context, t tool.Tool, args map[string]any) (map[string]any, error) {
 				argsBytes, _ := json.Marshal(args)
 				cmdStr := string(argsBytes)

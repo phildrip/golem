@@ -10,6 +10,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/user/golem/pkg/swarm"
+	"github.com/user/golem/pkg/tools"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/runner"
@@ -161,7 +162,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 		})
 	}
 
-	tools := r.SelectTools(role)
+	agentTools := r.SelectTools(role)
 
 	if r.cfg.SwarmBus != nil {
 		// Register the subagent on the shared bus for its lifetime so direct
@@ -170,7 +171,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 		swarmTS := swarm.NewToolsetWithSession(r.cfg.SwarmBus, subagentID, subagentID)
 		defer swarmTS.Unregister()
 		if swarmTools, err := swarmTS.BuildTools(); err == nil {
-			tools = append(tools, swarmTools...)
+			agentTools = append(agentTools, swarmTools...)
 		}
 	}
 	systemPrompt := r.BuildSystemPrompt(role)
@@ -184,13 +185,16 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 		Name:        subagentID,
 		Description: fmt.Sprintf("Autonomous %s subagent using %s", role, resolvedModel),
 		Model:       modelInstance,
-		Tools:       tools,
+		Tools:       agentTools,
 		Toolsets:    r.cfg.MCPToolsets,
 		InstructionProvider: func(rc agent.ReadonlyContext) (string, error) {
 			return systemPrompt, nil
 		},
 		BeforeToolCallbacks: []llmagent.BeforeToolCallback{
 			func(ctx agent.Context, t tool.Tool, toolArgs map[string]any) (map[string]any, error) {
+				// Same argument repair as the orchestrator: a subagent calling
+				// zoom with {"id":"5441"} must not lose the call to validation.
+				tools.RepairArgs(t, toolArgs)
 				// Enforce advisory swarm locks before mutating a shared resource.
 				if lockErr := swarm.CheckToolLock(r.cfg.SwarmBus, subagentID, t.Name(), toolArgs); lockErr != nil {
 					return nil, lockErr
