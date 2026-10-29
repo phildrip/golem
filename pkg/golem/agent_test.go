@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/user/golem/pkg/config"
+	"github.com/user/golem/pkg/graph"
 	"github.com/user/golem/pkg/memory/fractal"
 )
 
@@ -415,7 +416,7 @@ func TestBuildInstructionIncludesLiveHead(t *testing.T) {
 	}
 	view.Sync()
 
-	out := buildInstruction(mgr, view, nil, -1)
+	out := buildInstruction(mgr, view, nil, -1, "")
 	if !strings.Contains(out, "<recent_live_head>") {
 		t.Errorf("instruction missing <recent_live_head> block:\n%s", out)
 	}
@@ -437,10 +438,10 @@ func TestBuildInstructionIncludesLiveHead(t *testing.T) {
 	}
 	view.Sync()
 
-	if withCur := buildInstruction(mgr, view, nil, -1); !strings.Contains(withCur, "CURRENT-TURN-MARKER") {
+	if withCur := buildInstruction(mgr, view, nil, -1, ""); !strings.Contains(withCur, "CURRENT-TURN-MARKER") {
 		t.Errorf("expected the current user event in the live head when not excluded")
 	}
-	out2 := buildInstruction(mgr, view, nil, curEv.ID)
+	out2 := buildInstruction(mgr, view, nil, curEv.ID, "")
 	if strings.Contains(out2, "CURRENT-TURN-MARKER") {
 		t.Errorf("in-flight user message was duplicated into the live head")
 	}
@@ -702,5 +703,46 @@ func TestAgentSwitchModelKeepsProvider(t *testing.T) {
 	}
 	if got := agent.Config().ModelName; got != "qwen3-coder-plus" {
 		t.Errorf("failed switch changed the model to %q", got)
+	}
+}
+
+// The graph tools are part of the agent's tool surface, and the graph skill is
+// in the static prompt: a tool the model is never told about is dead weight.
+func TestAgentWiresGraphToolsAndSkill(t *testing.T) {
+	cfg := Config{
+		ModelName:       "gemini-flash-latest",
+		APIKey:          "fake-api-key-for-testing",
+		StorageDir:      t.TempDir(),
+		LiveHeadCount:   4,
+		ViewBudgetBytes: 1024,
+	}
+	a, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer a.Close()
+
+	if a.Graphs() == nil {
+		t.Fatal("expected a graph manager")
+	}
+	if !strings.HasSuffix(a.Graphs().Dir(), graph.GraphsDir) {
+		t.Fatalf("graph dir %q is not the workspace graph directory", a.Graphs().Dir())
+	}
+
+	have := map[string]bool{}
+	for _, name := range a.ToolNames() {
+		have[name] = true
+	}
+	for _, want := range []string{"graph_list", "graph_show", "graph_validate", "graph_save", "graph_run", "graph_delete"} {
+		if !have[want] {
+			t.Errorf("tool %q missing from the tool surface (%v)", want, a.ToolNames())
+		}
+	}
+
+	out := buildInstruction(nil, nil, nil, -1, a.Graphs().Catalog())
+	for _, want := range []string{"graph_run", "adversarial review", "budgets"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("system prompt lacks the graph skill (%q missing)", want)
+		}
 	}
 }

@@ -23,6 +23,7 @@ type declaringTool interface {
 type paramSchema struct {
 	Type       json.RawMessage        `json:"type"`
 	Properties map[string]paramSchema `json:"properties"`
+	Items      *paramSchema           `json:"items"`
 }
 
 // types returns the schema's declared types. "type" is either a string or an
@@ -65,11 +66,19 @@ func (s paramSchema) has(typ string) bool {
 // have worked is lost, and because the model is not told why, the next attempt
 // tends to make the same mistake.
 //
-// Only arguments the declaration marks as numeric or boolean are touched: a
-// string parameter whose value happens to look like a number (a shell command,
-// a file name, a search query) stays a string. Because the rewrite is driven by
-// the schema it also covers numbers inside object parameters, and it is a no-op
-// for arguments that already have the right type.
+// It also undoes two shapes models wrap things in: a list around a single
+// string ({"tools":["read"]} for a string field) and a JSON-encoded object or
+// array in a string field.
+//
+// Structure: some models flatten a nested object or array
+// into a JSON-encoded string ({"budgets":"{\"max_nodes\":4}"}), which the same
+// validation rejects even though the value is the right data in the wrong
+// wrapper. A string parameter whose value happens to look like JSON (a shell
+// command, a file, a search query) stays a string, because the schema decides.
+//
+// Only arguments the declaration marks as numeric, boolean, object or array are
+// touched, so the rewrite is driven entirely by the schema: it covers nested
+// fields too, and it is a no-op for arguments that already have the right type.
 func RepairArgs(t tool.Tool, args map[string]any) {
 	if t == nil || len(args) == 0 {
 		return
@@ -112,6 +121,55 @@ func repairProperties(schema paramSchema, args map[string]any) {
 		}
 		if nested, isObject := value.(map[string]any); isObject && len(prop.Properties) > 0 {
 			repairProperties(prop, nested)
+			continue
+		}
+		if list, isList := value.([]any); isList {
+			if unwrapped, ok := unwrapSingleString(list, prop); ok {
+				args[name] = unwrapped
+				continue
+			}
+			if prop.Items != nil {
+				repairItems(*prop.Items, list)
+			}
+		}
+	}
+}
+
+// unwrapSingleString turns ["read"] into "read" for a field the schema declares
+// as a string: models reach for a list when a value looks like an enum, and a
+// one-element list of strings carries no other meaning.
+func unwrapSingleString(list []any, schema paramSchema) (string, bool) {
+	if !schema.has("string") || len(list) != 1 {
+		return "", false
+	}
+	s, ok := list[0].(string)
+	if !ok {
+		return "", false
+	}
+	return s, true
+}
+
+// repairItems walks an array argument, coercing stringified elements and
+// recursing into object elements.
+func repairItems(schema paramSchema, list []any) {
+	for i, item := range list {
+		switch v := item.(type) {
+		case string:
+			if coerced, ok := coerceString(v, schema); ok {
+				list[i] = coerced
+			}
+		case map[string]any:
+			if len(schema.Properties) > 0 {
+				repairProperties(schema, v)
+			}
+		case []any:
+			if unwrapped, ok := unwrapSingleString(v, schema); ok {
+				list[i] = unwrapped
+				continue
+			}
+			if schema.Items != nil {
+				repairItems(*schema.Items, v)
+			}
 		}
 	}
 }
@@ -145,6 +203,25 @@ func coerceString(s string, schema paramSchema) (any, bool) {
 		case "false":
 			return false, true
 		}
+	case schema.has("object"):
+		var m map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &m); err != nil {
+			return nil, false
+		}
+		// The rehydrated object may itself hold stringified numbers.
+		if len(schema.Properties) > 0 {
+			repairProperties(schema, m)
+		}
+		return m, true
+	case schema.has("array"):
+		var list []any
+		if err := json.Unmarshal([]byte(trimmed), &list); err != nil {
+			return nil, false
+		}
+		if schema.Items != nil {
+			repairItems(*schema.Items, list)
+		}
+		return list, true
 	}
 	return nil, false
 }

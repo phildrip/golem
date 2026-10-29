@@ -15,6 +15,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/user/golem/pkg/approval"
 	"github.com/user/golem/pkg/config"
+	"github.com/user/golem/pkg/graph"
 	"github.com/user/golem/pkg/mcp"
 	"github.com/user/golem/pkg/memory/fractal"
 	"github.com/user/golem/pkg/provider/openai"
@@ -103,6 +104,7 @@ type Agent struct {
 	mcpManager          *mcp.Manager
 	mcpToolsets         []mcp.NamedToolset
 	subagentRunner      *subagent.Runner
+	graphs              *graph.Manager
 	runner              *runner.Runner
 	adkAgent            agent.Agent
 	userID              string
@@ -130,6 +132,10 @@ type Agent struct {
 	// health holds internal failures (memory appends, compaction passes) that
 	// the turn loop cannot return to its caller; see Health.
 	health *Health
+
+	// tools is the flat tool list handed to the ADK agent. It is kept for
+	// introspection (what can this turn actually call?) rather than for use.
+	tools []tool.Tool
 }
 
 // dynamicModel is a thread-safe proxy implementing model.LLM that allows hot-swapping the active LLM client.
@@ -203,6 +209,19 @@ Subagents & Delegation:
 - Use invoke_subagent to delegate focused investigations, file explorations, or complex coding tasks to subagents.
 - Subagents run with isolated context windows, preventing context bloat.
 - Both you and your subagents share the same fractal memory store. Subagents can use zoom(id, n), date(id), and remember(text) to inspect and update memory.
+
+Graphs (saved multi-agent procedures):
+- A graph is a procedure you write once and run many times: nodes are separate agents, each with its own context and tools, wired into a DAG and executed by one graph_run call. Only the sink node's output comes back to you, so a fan-out of deep investigations never enters your own context.
+- Reach for a graph when a task needs several independent angles merged, when work must be adversarially reviewed before it ships, or when a pipeline will be reused. For one focused bounded task, invoke_subagent is cheaper.
+- Tools: graph_list, graph_show <name>, graph_validate <spec>, graph_save <spec>, graph_run {name or inline spec, input}, graph_delete <name>. graph_validate returns every problem at once — iterate on a spec with it before running anything.
+- Spec: {name, description, max_concurrency, budgets:{max_nodes, max_wall_seconds, max_tokens}, nodes:[...], edges:[[from,to],...]}
+  - node kinds: agent{id, role: researcher|critic|coder|general, instruction, model?, tools: read|write|none}; tool{id, tool:<registered name>, args:{...}}; join{id}
+  - several edges out of one node fan out (all fire, each gets the same input); several edges into a join merge (its output is labelled sections); exactly one node may have no outgoing edge, and that node is the result.
+  - every node wired from START receives your graph_run input as its task, so write each instruction as a standing brief for that slice of the work rather than a restatement of the whole task.
+- Two shapes that pay for themselves:
+  - adversarial review: START -> draft (general) and START -> 2-3 critics with different lenses -> join -> revise (general). Tell each critic which lens to attack: correctness, missing cases, evidence-vs-claim, cost, blast radius.
+  - research fan-out: START -> one researcher per angle -> join -> synthesis (general) that produces one answer with sources.
+- Budgets are real: a 5-node graph is five model contexts. The defaults (300s, 200k tokens, concurrency 3) suit most runs; keep to <=8 nodes unless the work demands more, and prefer one sharp instruction per node over a long shared preamble.
 
 Swarm (multi-agent coordination):
 - You and your subagents are agents on a shared in-memory swarm bus, each with an identity ("orchestrator" for you).
@@ -310,7 +329,7 @@ func formatLiveHead(events []fractal.Event, excludeFrom int) string {
 // buildInstruction assembles the Golem system instruction: the static guidance,
 // the fractal summary view, the recent verbatim live head, and swarm state.
 // excludeFrom >= 0 omits events with ID >= excludeFrom (the in-flight turn).
-func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swarmBus *swarm.Bus, excludeFrom int) string {
+func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swarmBus *swarm.Bus, excludeFrom int, graphCatalog string) string {
 	if memoryMgr != nil {
 		memoryMgr.SyncAll()
 	}
@@ -336,6 +355,14 @@ func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swar
 		if n := swarmBus.UnreadCount(swarm.OrchestratorID); n > 0 {
 			sb.WriteString(fmt.Sprintf("\n\n<swarm_inbox>You have %d unread swarm message(s). Call check_inbox to read them.</swarm_inbox>\n", n))
 		}
+	}
+
+	// The catalog is the recall half of the graph skill: the agent cannot think
+	// to run a procedure it does not know exists. It sits after the live head so
+	// the static prefix above it stays cacheable.
+	if graphCatalog != "" {
+		sb.WriteString(graphCatalog)
+		sb.WriteString("\n")
 	}
 
 	sb.WriteString("Now assist the user with their request accurately and effectively.")
@@ -693,6 +720,35 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 	allTools = append(allTools, invokeSubagentTool)
 
+	// 7b. Graph tools: agent-authored multi-agent procedures. The nodes run on
+	// the same delegate tools subagents get, so a policy confirmation inside a
+	// graph fails instead of hanging a run nobody is watching.
+	graphMgr := graph.NewManager(filepath.Join(workDir, graph.GraphsDir), graph.BuilderConfig{
+		Models:        modelFactory,
+		ReadOnlyTools: []tool.Tool{delegateTools.readFile, delegateTools.findFiles, delegateTools.grepFiles, delegateTools.hashlineRead, delegateTools.hashlineFindBlk, zoomTool, dateTool, delegateTools.webSearch, delegateTools.webFetch},
+		WriteTools:    []tool.Tool{delegateTools.writeFile, delegateTools.replaceRegex, delegateTools.hashlinePatch, delegateTools.shell, rememberTool},
+		Toolsets:      delegateToolsets,
+		MemoryContext: func() string {
+			if view == nil {
+				return ""
+			}
+			view.Sync()
+			return formatLiveHead(view.LiveHeadEvents(), -1)
+		},
+		OnEvent: func(ev graph.Event) {
+			if agentPtr != nil {
+				agentPtr.dispatchGraphEvent(ev)
+			}
+		},
+	})
+	graphTools, err := graph.NewTools(graphMgr)
+	if err != nil {
+		store.Close()
+		mcpManager.Close()
+		return nil, errors.Wrap(err, "creating graph tools")
+	}
+	allTools = append(allTools, graphTools...)
+
 	// 8. Build LLM Agent with dynamic fractal memory injection & logging callbacks
 	dynModel := newDynamicModel(modelInstance)
 	adkAgent, err := llmagent.New(llmagent.Config{
@@ -707,7 +763,13 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 			if agentPtr != nil {
 				excludeFrom = agentPtr.currentTurnStartEventID()
 			}
-			return buildInstruction(memoryMgr, view, swarmBus, excludeFrom), nil
+			// The graph catalog is re-read every turn: a graph saved mid-session
+			// must be visible in the same session without a restart.
+			catalog := ""
+			if graphMgr != nil {
+				catalog = graphMgr.Catalog()
+			}
+			return buildInstruction(memoryMgr, view, swarmBus, excludeFrom, catalog), nil
 		},
 		BeforeToolCallbacks: []llmagent.BeforeToolCallback{
 			repairToolArguments,
@@ -810,6 +872,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		mcpManager:       mcpManager,
 		mcpToolsets:      mcpToolsets,
 		subagentRunner:   subagentRunner,
+		graphs:           graphMgr,
 		runner:           adkRunner,
 		adkAgent:         adkAgent,
 		userID:           "user",
@@ -822,6 +885,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		modelFactory:     modelFactory,
 		sandbox:          sandboxPolicy,
 		health:           health,
+		tools:            allTools,
 	}
 
 	// Start background compactor loop if configured or for trigger events
@@ -1250,6 +1314,72 @@ func (a *Agent) SubagentRunner() *subagent.Runner {
 // SwarmBus returns the swarm communication bus.
 func (a *Agent) SwarmBus() *swarm.Bus {
 	return a.swarmBus
+}
+
+// ToolNames lists the tools the turn was given, in registration order.
+func (a *Agent) ToolNames() []string {
+	if a == nil {
+		return nil
+	}
+	names := make([]string, 0, len(a.tools))
+	for _, t := range a.tools {
+		if t != nil {
+			names = append(names, t.Name())
+		}
+	}
+	return names
+}
+
+// Graphs exposes the saved-graph manager.
+func (a *Agent) Graphs() *graph.Manager {
+	if a == nil {
+		return nil
+	}
+	return a.graphs
+}
+
+// dispatchGraphEvent renders a running graph node the way transports already
+// render a subagent: a graph that takes two minutes must not look like a hung
+// tool call. The node id is folded into the role label so a fan-out of three
+// critics is three visible rows, not one.
+func (a *Agent) dispatchGraphEvent(ev graph.Event) {
+	a.activeHandlerMu.RLock()
+	h := a.activeHandler
+	a.activeHandlerMu.RUnlock()
+	if h == nil {
+		return
+	}
+
+	label := ev.Node
+	if ev.Role != "" {
+		label = ev.Role + "\u00b7" + ev.Node
+	}
+	if ev.Graph != "" {
+		label = ev.Graph + "/" + label
+	}
+
+	switch ev.Kind {
+	case graph.EventStart:
+		if sh, ok := h.(SubagentStreamHandler); ok {
+			sh.OnSubagentStart(label, ev.Model, ev.Prompt)
+			return
+		}
+		h.OnToolStart("graph:"+label, ev.Prompt)
+	case graph.EventDone, graph.EventError:
+		if sh, ok := h.(SubagentStreamHandler); ok {
+			var err error
+			if ev.Err != "" {
+				err = errors.New(ev.Err)
+			}
+			sh.OnSubagentDone(label, ev.Model, "", ev.Duration, err)
+			return
+		}
+		if ev.Err != "" {
+			h.OnToolDone("graph:"+label, ev.Err, 1)
+			return
+		}
+		h.OnToolDone("graph:"+label, "done", 0)
+	}
 }
 
 func (a *Agent) dispatchSubagentEvent(ev subagent.Event) {

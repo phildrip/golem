@@ -8,6 +8,7 @@ import (
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/functiontool"
+	"google.golang.org/genai"
 )
 
 // declaredTool builds a function tool from args, so the test exercises the
@@ -188,5 +189,119 @@ func TestRepairArgsIgnoresToolsWithoutASchema(t *testing.T) {
 	RepairArgs(nil, args)
 	if got := args["id"]; got != "5441" {
 		t.Fatalf("id = %#v, want it untouched", got)
+	}
+}
+
+// A model that flattens a nested object or array into a JSON string sends the
+// right data in the wrong wrapper; the schema says so, so rehydrate it.
+func TestRepairArgsRehydratesStringifiedStructure(t *testing.T) {
+	params := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"budgets": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"max_nodes": map[string]any{"type": "integer"},
+				},
+			},
+			"edges": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			},
+			"name": map[string]any{"type": "string"},
+		},
+	}
+	declared := declTool{params: params}
+	args := map[string]any{
+		"budgets": `{"max_nodes": "4"}`,
+		"edges":   `[["START", "a"], ["a", "b"]]`,
+		"name":    `{"not":"json to rehydrate"}`,
+	}
+	RepairArgs(declared, args)
+
+	budgets, ok := args["budgets"].(map[string]any)
+	if !ok {
+		t.Fatalf("budgets not rehydrated: %T %v", args["budgets"], args["budgets"])
+	}
+	if budgets["max_nodes"] != int64(4) {
+		t.Fatalf("nested number not coerced: %T %v", budgets["max_nodes"], budgets["max_nodes"])
+	}
+	edges, ok := args["edges"].([]any)
+	if !ok || len(edges) != 2 {
+		t.Fatalf("edges not rehydrated: %T %v", args["edges"], args["edges"])
+	}
+	first, ok := edges[0].([]any)
+	if !ok || len(first) != 2 || first[0] != "START" {
+		t.Fatalf("edge shape wrong: %v", edges[0])
+	}
+	// A schema that says string is left alone, even when the value parses.
+	if args["name"] != `{"not":"json to rehydrate"}` {
+		t.Fatalf("string argument was rewritten: %v", args["name"])
+	}
+}
+
+// Strings that are not valid JSON for the declared structure stay untouched, so
+// the tool's own error message is the one the model sees.
+func TestRepairArgsLeavesUnparseableStructureAlone(t *testing.T) {
+	params := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"budgets": map[string]any{"type": "object"}},
+	}
+	declared := declTool{params: params}
+	args := map[string]any{"budgets": "{not json"}
+	RepairArgs(declared, args)
+	if args["budgets"] != "{not json" {
+		t.Fatalf("unparseable value was replaced: %v", args["budgets"])
+	}
+}
+
+// declTool carries a hand-written schema, which is the shape a nested object or
+// array parameter arrives in from the ADK's own inference.
+type declTool struct{ params map[string]any }
+
+func (d declTool) Name() string        { return "nested" }
+func (d declTool) Description() string { return "carries a hand-written schema" }
+func (d declTool) IsLongRunning() bool { return false }
+func (d declTool) Declaration() *genai.FunctionDeclaration {
+	return &genai.FunctionDeclaration{Name: "nested", ParametersJsonSchema: d.params}
+}
+
+// A one-element list around a string is the same value in a wrapper: models
+// reach for a list when a field looks like an enum ({"tools":["read"]}).
+func TestRepairArgsUnwrapsSingleElementLists(t *testing.T) {
+	params := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"tools": map[string]any{"type": "string"},
+			"nodes": map[string]any{
+				"type": "array",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"role": map[string]any{"type": "string"},
+					},
+				},
+			},
+		},
+	}
+	declared := declTool{params: params}
+	args := map[string]any{
+		"tools": []any{"read"},
+		"nodes": []any{map[string]any{"role": []any{"critic"}}},
+	}
+	RepairArgs(declared, args)
+	if args["tools"] != "read" {
+		t.Fatalf("tools = %#v, want read", args["tools"])
+	}
+	node := args["nodes"].([]any)[0].(map[string]any)
+	if node["role"] != "critic" {
+		t.Fatalf("nested role = %#v, want critic", node["role"])
+	}
+
+	// A genuine list of several values is not touched.
+	many := map[string]any{"tools": []any{"read", "write"}}
+	RepairArgs(declared, many)
+	if list, ok := many["tools"].([]any); !ok || len(list) != 2 {
+		t.Fatalf("multi-element list was rewritten: %#v", many["tools"])
 	}
 }

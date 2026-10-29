@@ -81,6 +81,61 @@ The Web UI cockpit renders the live agent hierarchy, the message traffic between
 
 ---
 
+## Graphs
+
+A subagent is one context you delegate to. A **graph** is a whole procedure you delegate to: several agents with their own contexts and tools, wired into a DAG, run to completion by one tool call. The orchestrator only ever sees the **sink node's output** — so five researchers can each read fifty files and the main conversation stays exactly as small as one merged answer.
+
+The graph is *data*, not Go code. The agent writes a JSON spec, validates it, saves it, and runs it; `pkg/graph` turns the spec into a `workflow.Workflow` on the ADK engine (`AgentNode`, `JoinNode`, `ToolNode`, fan-out edges, `WithMaxConcurrency`). `FunctionNode` and `DynamicNode` need closures, so they are rejected at validate time — that restriction is the safety story rather than a missing feature.
+
+**Tools**
+
+| tool | what it does |
+| --- | --- |
+| `graph_list` | what saved graphs exist (name, node count, one-line purpose) |
+| `graph_show` | a saved graph's spec, to adapt rather than rewrite |
+| `graph_validate` | check a spec, returning **every** problem at once |
+| `graph_save` | validate + write `.golem/graphs/<name>.json` (workspace-scoped, so a procedure is reviewable and committable like code) |
+| `graph_run` | run by name or inline spec, with a seed input; returns the sink's output plus a per-node digest (tokens, duration, error) |
+| `graph_delete` | remove a saved graph |
+
+**Spec**
+
+```json
+{
+  "v": 1,
+  "name": "review-plan",
+  "description": "draft a plan, attack it from three angles, fold the critique back in",
+  "max_concurrency": 3,
+  "budgets": { "max_nodes": 8, "max_wall_seconds": 300, "max_tokens": 200000 },
+  "nodes": [
+    { "id": "draft",  "kind": "agent", "role": "general", "instruction": "Write the plan ..." },
+    { "id": "risk",   "kind": "agent", "role": "critic",  "instruction": "Attack it for unhandled failure modes ..." },
+    { "id": "scope",  "kind": "agent", "role": "critic",  "instruction": "Attack it for scope creep and cost ..." },
+    { "id": "merge",  "kind": "join" },
+    { "id": "revise", "kind": "agent", "role": "general", "instruction": "Fold every blocking finding in ..." }
+  ],
+  "edges": [
+    ["START", "draft"], ["START", "risk"], ["START", "scope"],
+    ["draft", "merge"], ["risk", "merge"], ["scope", "merge"],
+    ["merge", "revise"]
+  ]
+}
+```
+
+- **Kinds**: `agent` (its own context; `role` picks the prompt and default tools — `researcher` and `critic` are read-only, `coder` may edit and run, `general` is the default; `tools` is one word: `read` (default), `write` or `none`), `tool` (one registered tool with pinned args — a deterministic step like "read this file"), `join` (fan-in barrier; its output is the predecessors' results as labelled sections).
+- **Edges**: several edges out of one node **fan out** (all fire, each gets the same input); several edges into a `join` **merge**; exactly one node may have no outgoing edge, and that node is the result. Every node wired from `START` receives the `graph_run` input, so instructions are standing briefs for a slice of work, not restatements of the task.
+- **Roles get prompts, not just labels.** A `critic` is told to find what is wrong, to name a location and a consequence for every finding, to rank by severity, and *not* to invent a defect to look useful. A `researcher` must ground each claim in a path, line, symbol or quote and say what it did not cover.
+- **Budgets are mandatory and enforced**: `max_nodes` and shape at validate time; wall clock, token ceiling and concurrency at run time. The token ceiling is shared by every node — a fan-out cannot multiply it. A run that overruns its wall clock is cancelled mid-flight and reports which node was executing.
+- **The skill ships with the tools.** The system prompt explains when a graph beats `invoke_subagent` (several independent angles, adversarial review, a pipeline you will reuse), the spec grammar, the two shapes that pay for themselves, and the cost model — and every turn's prompt carries a catalog of the saved graphs, re-read from disk, so a procedure saved mid-session is known in the same session.
+
+Inside a run each node reports start/finish to the transport, so a fan-out shows up as live rows in the TUI and the cockpit instead of a tool call that looks hung.
+
+> A graph runs on its own ADK runner and session (created per run, deleted after), which is what lets a node agent's tool loop work: the flow rebuilds every model request from session history, so a node driven without a runner re-calls the same tool forever.
+>
+> Graphs run **unattended**, so nodes get the same policy treatment as subagents: a call the sandbox would ask you to confirm pauses the node, and because nobody is watching, the run ends reporting exactly that and which node it was. Give nodes read-only work and do the gated call in the main turn. A run is synchronous within the turn — pause/resume across turns (ADK `Resume` over a durable session) is not wired yet, because golem gives each turn a throwaway ADK session; the spec and the saved procedures survive restarts, the in-flight run does not.
+
+---
+
 ## Everything else
 
 **Agent loop**
@@ -93,6 +148,7 @@ The Web UI cockpit renders the live agent hierarchy, the message traffic between
 - Archetypes: **`researcher`** (read-only), **`coder`** (read + write + shell), **`general`**.
 - Subagents share the same fractal memory and can `zoom`/`date`/`remember` too.
 - Optionally run a subagent on a specific model (e.g. a cheaper or stronger one).
+- For more than one worker — parallel angles, adversarial review, a reusable pipeline — use a [graph](#graphs) instead: each node is its own context and only the merged result comes back.
 
 
 **Search & shell**
