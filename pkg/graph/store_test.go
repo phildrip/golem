@@ -25,7 +25,8 @@ func TestSaveListLoadDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if len(entries) != 1 || entries[0].Name != "spike" || entries[0].Nodes != 4 {
+	saved := onlySaved(entries)
+	if len(saved) != 1 || saved[0].Name != "spike" || saved[0].Nodes != 4 {
 		t.Fatalf("unexpected catalog: %+v", entries)
 	}
 	if cat := m.Catalog(); !strings.Contains(cat, "fan out over two angles") {
@@ -62,8 +63,8 @@ func TestSaveRejectsInvalidSpec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("a rejected spec was written: %+v", entries)
+	if saved := onlySaved(entries); len(saved) != 0 {
+		t.Fatalf("a rejected spec was written: %+v", saved)
 	}
 }
 
@@ -93,7 +94,8 @@ func TestUnreadableSpecIsReportedNotHidden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if len(entries) != 1 || !strings.Contains(entries[0].Description, "unreadable") {
+	saved := onlySaved(entries)
+	if len(saved) != 1 || !strings.Contains(saved[0].Description, "unreadable") {
 		t.Fatalf("broken spec not surfaced: %+v", entries)
 	}
 }
@@ -102,8 +104,8 @@ func TestUnreadableSpecIsReportedNotHidden(t *testing.T) {
 // call, not after a cache TTL.
 func TestCatalogSeesGraphsSavedInTheSameTurn(t *testing.T) {
 	m := NewManager(t.TempDir(), BuilderConfig{})
-	if cat := m.Catalog(); cat != "" {
-		t.Fatalf("expected an empty catalog, got:\n%s", cat)
+	if cat := m.Catalog(); strings.Contains(cat, "spike") {
+		t.Fatalf("expected no saved graph in the catalog, got:\n%s", cat)
 	}
 	spec := fanOutSpec()
 	spec.Description = "review two angles"
@@ -120,4 +122,15 @@ func TestCatalogSeesGraphsSavedInTheSameTurn(t *testing.T) {
 	if cat := m.Catalog(); strings.Contains(cat, "spike") {
 		t.Fatalf("catalog still lists a deleted graph:\n%s", cat)
 	}
+}
+
+// onlySaved drops the built-in seeds, which every workspace catalog contains.
+func onlySaved(entries []CatalogEntry) []CatalogEntry {
+	var out []CatalogEntry
+	for _, e := range entries {
+		if !e.Builtin() {
+			out = append(out, e)
+		}
+	}
+	return out
 }

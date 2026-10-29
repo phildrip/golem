@@ -96,7 +96,16 @@ The graph is *data*, not Go code. The agent writes a JSON spec, validates it, sa
 | `graph_validate` | check a spec, returning **every** problem at once |
 | `graph_save` | validate + write `.golem/graphs/<name>.json` (workspace-scoped, so a procedure is reviewable and committable like code) |
 | `graph_run` | run by name or inline spec, with a seed input; returns the sink's output plus a per-node digest (tokens, duration, error) |
-| `graph_delete` | remove a saved graph |
+| `graph_delete` | remove a saved graph (a built-in can be shadowed, not deleted) |
+
+**Two built-in procedures ship with the binary**, so the cases that pay for a graph need no spec at all:
+
+| name | shape | use it for |
+| --- | --- | --- |
+| `adversarial-review` | three critics fan out (correctness; failure modes and hostile inputs; claim-vs-requirement, including what you already ruled) → join → one `Verdict:` merging and ranking what they found | anything about to ship: a diff, a plan, a design, a claim |
+| `research-fanout` | three researchers fan out (the code as it is; outside docs, changelog and prior art with URLs; what the user already decided, from memory) → join → a verifier that re-checks every claim against its source → one decision-ready brief | "how should we do X", where a confident guess is the failure mode |
+
+`graph_run {"name": "adversarial-review", "input": "review the diff in pkg/graph/store.go"}` is the whole call. The seeds are JSON embedded in the binary (`pkg/graph/seeds/`), so they improve when golem does and nothing has to be written into your workspace; `graph_show` returns the spec to adapt, and saving a graph under a seed's name shadows it for that workspace (deleting the saved copy restores the built-in). The verifier step is the point of `research-fanout`: three researchers agree, one of them is wrong, and a brief built from unverified claims is worse than no brief.
 
 **Spec**
 
@@ -126,7 +135,7 @@ The graph is *data*, not Go code. The agent writes a JSON spec, validates it, sa
 - **Edges**: several edges out of one node **fan out** (all fire, each gets the same input); several edges into a `join` **merge**; exactly one node may have no outgoing edge, and that node is the result. Every node wired from `START` receives the `graph_run` input, so instructions are standing briefs for a slice of work, not restatements of the task.
 - **Roles get prompts, not just labels.** A `critic` is told to find what is wrong, to name a location and a consequence for every finding, to rank by severity, and *not* to invent a defect to look useful. A `researcher` must ground each claim in a path, line, symbol or quote and say what it did not cover.
 - **Budgets are mandatory and enforced**: `max_nodes` and shape at validate time; wall clock, token ceiling and concurrency at run time. The token ceiling is shared by every node — a fan-out cannot multiply it. A run that overruns its wall clock is cancelled mid-flight and reports which node was executing.
-- **The skill ships with the tools.** The system prompt explains when a graph beats `invoke_subagent` (several independent angles, adversarial review, a pipeline you will reuse), the spec grammar, the two shapes that pay for themselves, and the cost model — and every turn's prompt carries a catalog of the saved graphs, re-read from disk, so a procedure saved mid-session is known in the same session.
+- **The skill ships with the tools.** The system prompt explains when a graph beats `invoke_subagent` (several independent angles, adversarial review, a pipeline you will reuse), the spec grammar, the two shapes that pay for themselves, and the cost model — and it names the two built-in procedures, so the agent checks the catalog before authoring a spec. Every turn's prompt carries that catalog — saved graphs re-read from disk, so a procedure saved mid-session is known in the same session, and the built-ins marked as such.
 
 Inside a run each node reports start/finish to the transport, so a fan-out shows up as live rows in the TUI and the cockpit instead of a tool call that looks hung.
 

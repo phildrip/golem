@@ -119,12 +119,23 @@ func nodePrompt(n Node, memoryContext string) string {
 	return sb.String()
 }
 
+// Catalog sources. A workspace graph shadows a built-in one of the same name,
+// which is how a seed gets customised without losing the reference shape.
+const (
+	SourceWorkspace = "workspace"
+	SourceBuiltin   = "builtin"
+)
+
 // CatalogEntry is one saved graph as the orchestrator sees it.
 type CatalogEntry struct {
 	Name        string
 	Description string
 	Nodes       int
+	Source      string
 }
+
+// Builtin reports whether this entry is a seeded graph rather than a saved one.
+func (e CatalogEntry) Builtin() bool { return e.Source == SourceBuiltin }
 
 // formatCatalog renders the saved-graph catalog for the system prompt. It is
 // the recall half of the skill: the agent has to know a graph exists before it
@@ -134,13 +145,17 @@ func formatCatalog(entries []CatalogEntry) string {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString("\n<graph_catalog>Saved graphs (call graph_run with the name; graph_show for the spec):\n")
+	sb.WriteString("\n<graph_catalog>Saved graphs (call graph_run with the name; graph_show for the spec; saving a graph under a built-in name overrides it):\n")
 	for _, e := range entries {
 		desc := e.Description
 		if desc == "" {
 			desc = "(no description)"
 		}
-		fmt.Fprintf(&sb, "- %s (%d nodes): %s\n", e.Name, e.Nodes, desc)
+		kind := ""
+		if e.Builtin() {
+			kind = ", built-in"
+		}
+		fmt.Fprintf(&sb, "- %s (%d nodes%s): %s\n", e.Name, e.Nodes, kind, desc)
 	}
 	sb.WriteString("</graph_catalog>\n")
 	return sb.String()

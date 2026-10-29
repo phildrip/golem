@@ -1,0 +1,62 @@
+{
+  "v": 1,
+  "name": "research-fanout",
+  "description": "Three researchers work in parallel (the code as it is, the outside world, and what the user already ruled), a verifier re-checks every claim against its source, then one brief recommends a course.",
+  "max_concurrency": 3,
+  "budgets": {
+    "max_nodes": 6,
+    "max_wall_seconds": 900,
+    "max_tokens": 400000
+  },
+  "nodes": [
+    {
+      "id": "repo",
+      "kind": "agent",
+      "role": "researcher",
+      "tools": "read",
+      "instruction": "Investigate how this codebase actually behaves, from the code rather than from memory or documentation.\n\nStart at the paths your input names and follow the call graph to the place that makes the decision. For each fact give the file:line, the symbol, and the one line that proves it - a condition, a default, a mutation. Cover what the tests exercise and, more usefully, what they never touch. Where the question crosses a boundary (client/server, tool/model, Go/shell), trace both sides.\n\nReturn a findings list, not a narration of your search."
+    },
+    {
+      "id": "outside",
+      "kind": "agent",
+      "role": "researcher",
+      "tools": "read",
+      "instruction": "Find out how this problem is solved outside this repository: upstream documentation for the exact versions in go.mod, the library's own source or changelog, prior art and known pitfalls.\n\nUse web_search, and fetch the pages you rely on. Prefer the project's own docs and source over blog posts, and say which version a claim applies to. Quote the sentence that supports each claim and give its URL. Where the repository already deviates from documented behaviour, say so.\n\nSkip anything you cannot source: a sibling node covers the code, and an unsourced guess here contaminates the brief. If web search is not configured in this session, say that in one line and fall back to the versions actually vendored in the module cache on disk (read-only is enough) - never fill the gap from memory."
+    },
+    {
+      "id": "prior-decisions",
+      "kind": "agent",
+      "role": "researcher",
+      "tools": "read",
+      "instruction": "Establish what the user has already decided about this area, and why.\n\nSearch the shared fractal memory: zoom(id, n) inspects a compacted node, and n=1 returns a verbatim message; date(id) gives when it was said. You are looking for rulings, corrections, rejected options and constraints the user stated once and expects honoured.\n\nFor each: the event id, the date, what was decided, and the constraint it puts on the work in hand. Where a decision was reversed later, say which ruling is current. If the memory holds nothing relevant, say so in one line - do not fill the gap with inference."
+    },
+    {
+      "id": "gathered",
+      "kind": "join"
+    },
+    {
+      "id": "verify",
+      "kind": "agent",
+      "role": "critic",
+      "tools": "read",
+      "instruction": "Re-check the factual claims in your input before anyone acts on them.\n\nFor a claim about the code, open the cited file and confirm the cited line. For a claim about the web, fetch the URL and confirm both the quote and the version. For a claim about memory, zoom the event id and confirm what was actually said.\n\nMark each claim CONFIRMED, UNSUPPORTED (nothing at the cited location proves it) or WRONG (the evidence contradicts it), and quote the line that contradicts it. Do no new research of your own: a verifier who wanders becomes a fourth researcher nobody asked for.\n\nEnd with the claims that must not survive into the brief."
+    },
+    {
+      "id": "brief",
+      "kind": "agent",
+      "role": "general",
+      "tools": "none",
+      "instruction": "Write the brief the reader will act on.\n\nUse only claims the verifier marked CONFIRMED, plus its WRONG and UNSUPPORTED corrections; never promote a finding the verification contradicted.\n\nShape: what is true today (bulleted, with file:line or URL), what is contested and why, the options with their real cost, what is still unknown and how it could be learned cheaply, then one line starting 'Recommendation:' naming a single course of action.\n\nKeep it under 400 words. Dense beats complete, and a gap you name is worth more than a guess you hide."
+    }
+  ],
+  "edges": [
+    ["START", "repo"],
+    ["START", "outside"],
+    ["START", "prior-decisions"],
+    ["repo", "gathered"],
+    ["outside", "gathered"],
+    ["prior-decisions", "gathered"],
+    ["gathered", "verify"],
+    ["verify", "brief"]
+  ]
+}

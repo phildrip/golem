@@ -1,0 +1,54 @@
+{
+  "v": 1,
+  "name": "adversarial-review",
+  "description": "Three critics review the same work from different angles (correctness, failure modes, claim vs requirement), then one verdict merges and ranks what they found.",
+  "max_concurrency": 3,
+  "budgets": {
+    "max_nodes": 5,
+    "max_wall_seconds": 600,
+    "max_tokens": 300000
+  },
+  "nodes": [
+    {
+      "id": "correctness",
+      "kind": "agent",
+      "role": "critic",
+      "tools": "read",
+      "instruction": "Your input names the work under review: a diff, file paths, or a claim.\n\nJudge only whether it is correct. Does each path do what it claims, on every input it accepts? Look for the wrong value at a boundary, an error swallowed so a failure reports success, a type or unit mismatch, the nil/empty/zero case, state shared without a lock, a resource (file, goroutine, connection, timer) never released, and a case the existing tests would not catch.\n\nReach the code itself rather than reasoning from the description: cite file:line and quote the line you are judging. Do not comment on style, naming or structure - another critic owns scope, and a finding you cannot locate is not a finding."
+    },
+    {
+      "id": "failure-modes",
+      "kind": "agent",
+      "role": "critic",
+      "tools": "read",
+      "instruction": "Your input names the work under review: a diff, file paths, or a claim.\n\nBreak it. Work from hostile inputs and hostile timing, not from the happy path: empty, one element, huge, malformed, unicode, duplicated, out of order, concurrent, and called twice or after it closed. Ask what happens when a dependency it trusts fails or answers late - a partial write, a timeout, a restart mid-operation, a retry of a call that is not idempotent. Ask who can reach the new code and what they control: a path, a URL, a name, a length, a header.\n\nReport each break with the input that triggers it, the file:line that would handle it, and the consequence a user would see. 'This could be unsafe' without naming the input is not a finding."
+    },
+    {
+      "id": "claim-vs-requirement",
+      "kind": "agent",
+      "role": "critic",
+      "tools": "read",
+      "instruction": "Your input names the work under review: a diff, file paths, or a claim.\n\nCompare the claim to the evidence and to the requirement behind it. What does the change say it does, and does the evidence shown - code, tests, the diff - actually demonstrate that? Which case from the original request is unhandled, which assertion is untested, which test only proves the code ran rather than that it is right?\n\nCheck the shared fractal memory (zoom, date) for an earlier ruling from the user about this area and flag any change that quietly contradicts one, naming the event id. A missing requirement outranks a missing convenience."
+    },
+    {
+      "id": "findings",
+      "kind": "join"
+    },
+    {
+      "id": "verdict",
+      "kind": "agent",
+      "role": "general",
+      "tools": "none",
+      "instruction": "Merge the critics' findings into one review the reader can act on.\n\nDrop every finding that lacks a location and a consequence, and merge the duplicates. Where two critics disagree about a fact, say so and name the evidence instead of picking a winner.\n\nGroup under 'Blocking', 'Should fix', 'Nits' (omit an empty heading) and within each put what bites soonest first. Keep at most twelve findings: the reader acts on the top of this list, not on all of it.\n\nEnd with one line starting 'Verdict:' - ship it, fix the blocking items first, or rework, and why. If there is nothing blocking, say that plainly and name the strongest risk that remains."
+    }
+  ],
+  "edges": [
+    ["START", "correctness"],
+    ["START", "failure-modes"],
+    ["START", "claim-vs-requirement"],
+    ["correctness", "findings"],
+    ["failure-modes", "findings"],
+    ["claim-vs-requirement", "findings"],
+    ["findings", "verdict"]
+  ]
+}

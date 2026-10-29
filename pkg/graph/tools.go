@@ -24,7 +24,7 @@ func NewTools(m *Manager) ([]tool.Tool, error) {
 			return listResult{}, err
 		}
 		if len(entries) == 0 {
-			return listResult{Output: "No saved graphs yet. Build one with graph_save (see the Graph section of your instructions)."}, nil
+			return listResult{Output: "No graphs available. Build one with graph_save (see the Graphs section of your instructions)."}, nil
 		}
 		var sb strings.Builder
 		for _, e := range entries {
@@ -32,8 +32,13 @@ func NewTools(m *Manager) ([]tool.Tool, error) {
 			if desc == "" {
 				desc = "(no description)"
 			}
-			fmt.Fprintf(&sb, "%-28s %2d nodes  %s\n", e.Name, e.Nodes, desc)
+			src := "saved"
+			if e.Builtin() {
+				src = "built-in"
+			}
+			fmt.Fprintf(&sb, "%-28s %2d nodes  %-9s %s\n", e.Name, e.Nodes, src, desc)
 		}
+		sb.WriteString("\nRun either kind by name with graph_run. Saving a graph under a built-in name overrides it.")
 		return listResult{Output: sb.String()}, nil
 	})
 	if err != nil {
@@ -49,8 +54,15 @@ func NewTools(m *Manager) ([]tool.Tool, error) {
 		if err != nil {
 			return showResult{}, err
 		}
-		path := m.path(spec.Name)
-		return showResult{Output: specJSON(spec), Path: path}, nil
+		if m.isSaved(spec.Name) {
+			return showResult{Output: specJSON(spec), Path: m.path(spec.Name), Source: SourceWorkspace}, nil
+		}
+		// A built-in has no path of its own; say so, so the model does not try to
+		// edit a file that is not there.
+		return showResult{
+			Output: specJSON(spec) + "\n(built-in, not a file in " + GraphsDir + "; saving a graph of this name overrides it for this workspace)",
+			Source: SourceBuiltin,
+		}, nil
 	})
 	if err != nil {
 		return nil, err
@@ -173,6 +185,7 @@ type listResult struct {
 type showResult struct {
 	Output string `json:"output"`
 	Path   string `json:"path,omitempty"`
+	Source string `json:"source,omitempty"`
 }
 
 type validateResult struct {
