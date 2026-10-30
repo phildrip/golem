@@ -214,7 +214,8 @@ Graphs (saved multi-agent procedures):
 - A graph is a procedure you write once and run many times: nodes are separate agents, each with its own context and tools, wired into a DAG and executed by one graph_run call. Only the sink node's output comes back to you, so a fan-out of deep investigations never enters your own context.
 - Reach for a graph when a task needs several independent angles merged, when work must be adversarially reviewed before it ships, or when a pipeline will be reused. For one focused bounded task, invoke_subagent is cheaper.
 - Two built-in procedures ship with Golem: adversarial-review (three critics on different lenses, then one ranked verdict) and research-fanout (three researchers: the code, the outside world, what you already decided — then a verifier that re-checks every claim, then one brief). Run either by name with graph_run and no spec at all, or graph_show it and save a variant under your own name. Check graph_list before authoring a spec: the shape you want probably already exists.
-- Tools: graph_list, graph_show <name>, graph_validate <spec>, graph_save <spec>, graph_run {name or inline spec, input}, graph_delete <name>. graph_validate returns every problem at once — iterate on a spec with it before running anything. Saving a graph under a built-in name overrides that built-in for this workspace.
+- Tools: graph_list, graph_show <name>, graph_validate <spec>, graph_save <spec>, graph_run {name or inline spec, input}, graph_stat [run_id], graph_resume {run_id, approve|answer}, graph_delete <name>. graph_validate returns every problem at once — iterate on a spec with it before running anything. Saving a graph under a built-in name overrides that built-in for this workspace.
+- A run is durable and may pause: a node whose tool call needs a human decision stops the run instead of guessing. graph_run then reports PAUSED with a run_id and exactly what is waiting; answer it with graph_resume(run_id, approve=true|false) — or answer=... for a node that asked a question — and the run continues from where it stopped, with the nodes that already finished kept. Runs live under .golem/graphs/runs/ and survive a restart, so graph_stat is how you find one a previous turn left waiting.
 - Spec: {name, description, max_concurrency, budgets:{max_nodes, max_wall_seconds, max_tokens}, nodes:[...], edges:[[from,to],...]}
   - node kinds: agent{id, role: researcher|critic|coder|general, instruction, model?, tools: read|write|none}; tool{id, tool:<registered name>, args:{...}}; join{id}
   - several edges out of one node fan out (all fire, each gets the same input); several edges into a join merge (its output is labelled sections); exactly one node may have no outgoing edge, and that node is the result.
@@ -721,14 +722,29 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 	allTools = append(allTools, invokeSubagentTool)
 
-	// 7b. Graph tools: agent-authored multi-agent procedures. The nodes run on
-	// the same delegate tools subagents get, so a policy confirmation inside a
-	// graph fails instead of hanging a run nobody is watching.
+	// 7b. Graph tools: agent-authored multi-agent procedures.
+	//
+	// Nodes get interactive tools, not the delegate set. A subagent runs with
+	// nobody watching, so a call the policy would ask about is refused; a graph
+	// run is durable, so the same call pauses it instead: the run reports what
+	// it is waiting for, and the human answers with graph_resume — approved, the
+	// call runs and the node carries on; refused, the node gets a tool error it
+	// can route around.
+	graphTools, err := newToolSet(workDir, sandboxPolicy, webCfg, approval.Interactive)
+	if err != nil {
+		store.Close()
+		mcpManager.Close()
+		return nil, err
+	}
+	var graphToolsets []tool.Toolset
+	for _, ts := range mcpToolsets {
+		graphToolsets = append(graphToolsets, gateMCPToolset(ts.Toolset, sandboxPolicy, false))
+	}
 	graphMgr := graph.NewManager(filepath.Join(workDir, graph.GraphsDir), graph.BuilderConfig{
 		Models:        modelFactory,
-		ReadOnlyTools: []tool.Tool{delegateTools.readFile, delegateTools.findFiles, delegateTools.grepFiles, delegateTools.hashlineRead, delegateTools.hashlineFindBlk, zoomTool, dateTool, delegateTools.webSearch, delegateTools.webFetch},
-		WriteTools:    []tool.Tool{delegateTools.writeFile, delegateTools.replaceRegex, delegateTools.hashlinePatch, delegateTools.shell, rememberTool},
-		Toolsets:      delegateToolsets,
+		ReadOnlyTools: []tool.Tool{graphTools.readFile, graphTools.findFiles, graphTools.grepFiles, graphTools.hashlineRead, graphTools.hashlineFindBlk, zoomTool, dateTool, graphTools.webSearch, graphTools.webFetch},
+		WriteTools:    []tool.Tool{graphTools.writeFile, graphTools.replaceRegex, graphTools.hashlinePatch, graphTools.shell, rememberTool},
+		Toolsets:      graphToolsets,
 		MemoryContext: func() string {
 			if view == nil {
 				return ""
@@ -742,13 +758,13 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 			}
 		},
 	})
-	graphTools, err := graph.NewTools(graphMgr)
+	graphToolset, err := graph.NewTools(graphMgr)
 	if err != nil {
 		store.Close()
 		mcpManager.Close()
 		return nil, errors.Wrap(err, "creating graph tools")
 	}
-	allTools = append(allTools, graphTools...)
+	allTools = append(allTools, graphToolset...)
 
 	// 8. Build LLM Agent with dynamic fractal memory injection & logging callbacks
 	dynModel := newDynamicModel(modelInstance)

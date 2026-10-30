@@ -95,7 +95,9 @@ The graph is *data*, not Go code. The agent writes a JSON spec, validates it, sa
 | `graph_show` | a saved graph's spec, to adapt rather than rewrite |
 | `graph_validate` | check a spec, returning **every** problem at once |
 | `graph_save` | validate + write `.golem/graphs/<name>.json` (workspace-scoped, so a procedure is reviewable and committable like code) |
-| `graph_run` | run by name or inline spec, with a seed input; returns the sink's output plus a per-node digest (tokens, duration, error) |
+| `graph_run` | run by name or inline spec, with a seed input; returns the sink's output plus a per-node digest (tokens, duration, error), or the pause and its `run_id` |
+| `graph_stat` | the workspace's runs, newest first — status, cost, and what a waiting run is waiting for (one run in full detail when given a `run_id`) |
+| `graph_resume` | answer a paused run: `approve=true\|false` for a tool confirmation, `answer=...` for a question; the run continues where it stopped |
 | `graph_delete` | remove a saved graph (a built-in can be shadowed, not deleted) |
 
 **Two built-in procedures ship with the binary**, so the cases that pay for a graph need no spec at all:
@@ -139,9 +141,13 @@ The graph is *data*, not Go code. The agent writes a JSON spec, validates it, sa
 
 Inside a run each node reports start/finish to the transport, so a fan-out shows up as live rows in the TUI and the cockpit instead of a tool call that looks hung.
 
-> A graph runs on its own ADK runner and session (created per run, deleted after), which is what lets a node agent's tool loop work: the flow rebuilds every model request from session history, so a node driven without a runner re-calls the same tool forever.
+> A graph runs on its own ADK runner and session, which is what lets a node agent's tool loop work: the flow rebuilds every model request from session history, so a node driven without a runner re-calls the same tool forever.
 >
-> Graphs run **unattended**, so nodes get the same policy treatment as subagents: a call the sandbox would ask you to confirm pauses the node, and because nobody is watching, the run ends reporting exactly that and which node it was. Give nodes read-only work and do the gated call in the main turn. A run is synchronous within the turn — pause/resume across turns (ADK `Resume` over a durable session) is not wired yet, because golem gives each turn a throwaway ADK session; the spec and the saved procedures survive restarts, the in-flight run does not.
+> **A run is durable.** Its record and its session events live in `.golem/graphs/runs/<run-id>/`, so a run outlives the tool call that started it — and the process. A run that pauses can be answered later, in another turn, after a restart: `graph_resume` rebuilds the engine state from the run's own session, replays the answer into it, and re-runs only the parked node and what follows it, keeping what already finished.
+>
+> Graphs run **unattended**, so nodes get the same policy treatment as subagents: a call the sandbox would ask you to confirm pauses the run instead of asking mid-node. The pause is a question, not a failure — `graph_run` returns `PAUSED` with the `run_id`, the node, and the exact call (`gated_write({"path": "notes.txt"})`), and the answer goes through the same gate the main turn uses: approved, the call runs and the node finishes; refused, the model gets a tool error it can route around. Read-only work still belongs in the nodes; a gated call is worth approving when the node has done the thinking and only the write is left.
+>
+> Runs are pruned to the twenty most recent, so the workspace does not fill with transcripts; a waiting run is never pruned.
 
 ---
 

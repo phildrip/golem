@@ -733,7 +733,7 @@ func TestAgentWiresGraphToolsAndSkill(t *testing.T) {
 	for _, name := range a.ToolNames() {
 		have[name] = true
 	}
-	for _, want := range []string{"graph_list", "graph_show", "graph_validate", "graph_save", "graph_run", "graph_delete"} {
+	for _, want := range []string{"graph_list", "graph_show", "graph_validate", "graph_save", "graph_run", "graph_stat", "graph_resume", "graph_delete"} {
 		if !have[want] {
 			t.Errorf("tool %q missing from the tool surface (%v)", want, a.ToolNames())
 		}

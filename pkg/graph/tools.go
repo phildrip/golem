@@ -121,7 +121,7 @@ func NewTools(m *Manager) ([]tool.Tool, error) {
 		Description: "Run a graph to completion inside this turn and return its sink node's output plus a per-node digest. " +
 			"Each node is a separate agent with its own context, so this is how you get N independent investigations merged, " +
 			"or a draft/critique/revise loop, without filling your own context with the intermediate work. " +
-			"Blocks until the graph finishes or its budgets run out; use it once the spec validates.",
+			"Blocks until the graph finishes, pauses for a human decision, or its budgets run out; use it once the spec validates.",
 	}, func(ctx agent.Context, args runArgs) (runResult, error) {
 		var spec *Spec
 		if args.Spec != nil {
@@ -156,6 +156,63 @@ func NewTools(m *Manager) ([]tool.Tool, error) {
 	}
 	out = append(out, run)
 
+	stat, err := functiontool.New(functiontool.Config{
+		Name: "graph_stat",
+		Description: "List this workspace's graph runs, newest first: run_id, graph, status, token cost and duration. " +
+			"A run that is waiting needs a human decision, which graph_resume delivers. Runs outlive the process, " +
+			"so check here when a previous turn left one paused.",
+	}, func(ctx agent.Context, args statArgs) (statResult, error) {
+		runs, err := m.ListRuns()
+		if err != nil {
+			return statResult{}, err
+		}
+		if args.RunID != "" {
+			rec, err := m.LoadRun(args.RunID)
+			if err != nil {
+				return statResult{}, err
+			}
+			return statResult{Output: describeRun(rec, true)}, nil
+		}
+		if len(runs) == 0 {
+			return statResult{Output: "No graph runs recorded yet."}, nil
+		}
+		var sb strings.Builder
+		for _, rec := range runs {
+			sb.WriteString(describeRun(rec, false))
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\ngraph_resume(run_id, approve|answer) answers a waiting run; graph_stat(run_id) shows one run in detail.")
+		return statResult{Output: sb.String()}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, stat)
+
+	resume, err := functiontool.New(functiontool.Config{
+		Name: "graph_resume",
+		Description: "Answer a paused graph run and drive it on from where it stopped. " +
+			"approve answers a tool confirmation (true lets the parked tool call run, false refuses it); " +
+			"answer replies to a node that asked for input. Finished nodes do not run again.",
+	}, func(ctx agent.Context, args resumeArgs) (runResult, error) {
+		res, runErr := m.Resume(ctx, args.RunID, Decision{Approve: args.Approve, Answer: args.Answer})
+		if res == nil {
+			if runErr != nil {
+				return runResult{}, runErr
+			}
+			return runResult{}, fmt.Errorf("graph produced no result")
+		}
+		text := renderResult(res)
+		if runErr != nil {
+			return runResult{Output: text}, nil
+		}
+		return runResult{Output: text}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, resume)
+
 	return out, nil
 }
 
@@ -176,6 +233,20 @@ type runArgs struct {
 	Name  string `json:"name,omitempty" jsonschema:"saved graph to run; ignored when spec is given"`
 	Spec  *Spec  `json:"spec,omitempty" jsonschema:"inline graph spec, for a one-off run you do not want to save first"`
 	Input string `json:"input" jsonschema:"the seed text handed to every node wired from START"`
+}
+
+type statArgs struct {
+	RunID string `json:"run_id,omitempty" jsonschema:"one run to describe in detail; omit to list them all"`
+}
+
+type resumeArgs struct {
+	RunID   string `json:"run_id" jsonschema:"the waiting run to answer, as reported by graph_run or graph_stat"`
+	Approve bool   `json:"approve,omitempty" jsonschema:"for a tool confirmation: true lets the parked tool call run, false refuses it"`
+	Answer  string `json:"answer,omitempty" jsonschema:"for a node waiting on input: the reply to hand it"`
+}
+
+type statResult struct {
+	Output string `json:"output"`
 }
 
 type listResult struct {
@@ -230,6 +301,40 @@ func renderResult(res *Result) string {
 	if res.Err != "" {
 		fmt.Fprintf(&sb, "graph %s FAILED: %s\n\n", res.Graph, res.Err)
 	}
+	if res.Status == string(RunWaiting) {
+		fmt.Fprintf(&sb, "graph %s PAUSED (run_id %s) — a node needs a human decision:\n", res.Graph, res.RunID)
+		for _, w := range res.Waiting {
+			node := w.Node
+			if node == "" {
+				node = "(unknown node)"
+			}
+			switch w.Kind {
+			case InterruptToolConfirmation:
+				fmt.Fprintf(&sb, "  - node %s wants to run %s", node, w.ToolName)
+				if len(w.ToolArgs) > 0 {
+					if data, err := marshalInline(w.ToolArgs); err == nil {
+						fmt.Fprintf(&sb, "(%s)", data)
+					}
+				}
+				if w.Hint != "" {
+					fmt.Fprintf(&sb, " — %s", w.Hint)
+				}
+			case InterruptRequestInput:
+				fmt.Fprintf(&sb, "  - node %s asks: %s", node, w.Hint)
+				if w.Payload != nil {
+					if data, err := marshalInline(w.Payload); err == nil {
+						fmt.Fprintf(&sb, "\n    payload: %s", data)
+					}
+				}
+			default:
+				fmt.Fprintf(&sb, "  - node %s is blocked on %s", node, w.ToolName)
+			}
+			sb.WriteString("\n")
+		}
+		fmt.Fprintf(&sb, "\nAnswer with graph_resume(run_id=%q, approve=true|false) for a tool confirmation, "+
+			"or answer=... for a question. The run keeps everything it has already finished: "+
+			"only the parked node and the nodes after it run again.\n\n", res.RunID)
+	}
 	fmt.Fprintf(&sb, "<graph_result name=%q nodes=%d tokens=%d duration=%s>\n",
 		res.Graph, len(res.Nodes), res.Tokens, res.Duration.Round(time.Millisecond))
 	sb.WriteString(res.Output)
@@ -255,6 +360,70 @@ func renderResult(res *Result) string {
 			n.ID, kind, n.Tokens, n.Duration.Round(time.Millisecond), clipRunes(preview, 160), status)
 	}
 	return sb.String()
+}
+
+// describeRun renders one run record: one line when listing, the whole record
+// when the caller asked for it by ID.
+func describeRun(rec *RunRecord, detail bool) string {
+	status := string(rec.Status)
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%-34s %-22s %-9s %7d tok %8s",
+		rec.RunID, rec.Graph, status, rec.Tokens, rec.Duration.Round(time.Second))
+	if rec.Status == RunWaiting {
+		for _, w := range rec.Waiting {
+			node := w.Node
+			if node == "" {
+				node = "?"
+			}
+			switch w.Kind {
+			case InterruptToolConfirmation:
+				fmt.Fprintf(&sb, "  waiting: %s wants %s", node, w.ToolName)
+			case InterruptRequestInput:
+				fmt.Fprintf(&sb, "  waiting: %s asks \"%s\"", node, clipRunes(w.Hint, 80))
+			default:
+				fmt.Fprintf(&sb, "  waiting: %s on %s", node, w.ToolName)
+			}
+		}
+	}
+	if rec.Err != "" {
+		fmt.Fprintf(&sb, "  error: %s", clipRunes(rec.Err, 200))
+	}
+	if !detail {
+		return sb.String()
+	}
+	var out strings.Builder
+	out.WriteString(sb.String())
+	out.WriteString("\n")
+	fmt.Fprintf(&out, "input: %s\n", clipRunes(firstLine(rec.Input), 200))
+	if rec.Output != "" {
+		fmt.Fprintf(&out, "sink output:\n%s\n", clipRunes(rec.Output, maxNodeText))
+	}
+	out.WriteString("nodes:\n")
+	for _, n := range rec.Nodes {
+		kind := n.Kind
+		if n.Role != "" {
+			kind = n.Role
+		}
+		note := ""
+		if n.Err != "" {
+			note = " — " + n.Err
+		}
+		fmt.Fprintf(&out, "- %-20s %-10s %6d tok %8s  %s%s\n", n.ID, kind, n.Tokens,
+			n.Duration.Round(time.Millisecond), clipRunes(firstLine(n.Text), 120), note)
+	}
+	if rec.Spec != nil {
+		fmt.Fprintf(&out, "\nspec: %s (graph_show %q to print it)\n", rec.Spec.Name, rec.Spec.Name)
+	}
+	return out.String()
+}
+
+// marshalInline encodes a small value for a one-line tool message.
+func marshalInline(v any) (string, error) {
+	data, err := marshalJSON(v)
+	if err != nil {
+		return "", err
+	}
+	return clipRunes(string(data), 400), nil
 }
 
 func specJSON(spec *Spec) string {

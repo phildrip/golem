@@ -15,6 +15,7 @@ import (
 	"google.golang.org/adk/v2/memory"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
+	"google.golang.org/adk/v2/workflow"
 	"google.golang.org/genai"
 )
 
@@ -22,12 +23,15 @@ import (
 // the sink's text plus a per-node digest, so the model learns both the answer
 // and what the answer cost.
 type Result struct {
-	Graph    string        `json:"graph"`
-	Output   string        `json:"output"`
-	Nodes    []NodeResult  `json:"nodes"`
-	Tokens   int64         `json:"tokens"`
-	Duration time.Duration `json:"duration"`
-	Err      string        `json:"error,omitempty"`
+	Graph    string             `json:"graph"`
+	RunID    string             `json:"run_id,omitempty"`
+	Status   string             `json:"status,omitempty"`
+	Output   string             `json:"output"`
+	Nodes    []NodeResult       `json:"nodes"`
+	Waiting  []WaitingInterrupt `json:"waiting,omitempty"`
+	Tokens   int64              `json:"tokens"`
+	Duration time.Duration      `json:"duration"`
+	Err      string             `json:"error,omitempty"`
 }
 
 // NodeResult is one node's contribution.
@@ -56,31 +60,89 @@ type nodeCapture struct {
 // keep the orchestrator's context small.
 const maxNodeText = 8000
 
-// Run executes spec with input as the seed handed to every START successor.
-//
-// Errors are returned alongside a partially filled Result: a fan-out where one
-// branch died still tells the orchestrator what the other branches learned.
+// Run executes spec with input as the seed handed to every START successor and
+// returns the sink's output. The run is durable: its record and its session
+// events live under .golem/graphs/runs/<run-id>/, so a run that parks on a
+// human approval can be answered later — in another tool call, or after the
+// process has restarted — with Resume.
 func (m *Manager) Run(ctx agent.Context, spec *Spec, input string) (*Result, error) {
 	if err := spec.Validate(ValidateOptions{KnownTool: func(name string) bool { return m.builder.ToolNames()[name] }}); err != nil {
 		return nil, err
 	}
+	rec := &RunRecord{
+		RunID:  newRunID(spec.Name),
+		Graph:  spec.Name,
+		Spec:   spec,
+		Input:  input,
+		Status: RunRunning,
+	}
+	rec.SessionID = rec.RunID
+	if err := m.saveRunRecord(rec); err != nil {
+		return nil, err
+	}
+	m.pruneRuns(maxKeptRuns)
+	return m.execute(ctx, spec, rec, nil)
+}
 
-	wf, budget, err := m.builder.Build(ctx, spec)
+// maxKeptRuns caps how many run directories a workspace keeps. A run holds its
+// session transcript, which is what makes a resume possible; the oldest runs
+// are pruned once the cap is reached so .golem/graphs/runs/ does not grow
+// without bound.
+const maxKeptRuns = 20
+
+// Resume answers a paused run and drives it on.
+//
+// The decision applies to every interrupt the run is waiting on: nodes parked
+// on a tool confirmation get Approve, nodes parked for input get Answer.
+// Resuming is a second turn of the same durable session, so nodes that already
+// finished do not run again and their output carries forward from the record.
+func (m *Manager) Resume(ctx agent.Context, runID string, d Decision) (*Result, error) {
+	rec, err := m.LoadRun(runID)
+	if err != nil {
+		return nil, err
+	}
+	if rec.Status != RunWaiting {
+		return nil, fmt.Errorf("run %s is %s, not waiting for an answer", rec.RunID, rec.Status)
+	}
+	if rec.Spec == nil {
+		return nil, fmt.Errorf("run %s has no spec recorded", rec.RunID)
+	}
+	return m.execute(ctx, rec.Spec, rec, &d)
+}
+
+// execute drives one turn of a run: build, run, capture, persist.
+//
+// A turn is one ADK runner invocation. On a fresh run that is wf.Run; on a
+// resume it is wf.Resume with the engine state rebuilt from the session this
+// run already has on disk.
+func (m *Manager) execute(ctx agent.Context, spec *Spec, rec *RunRecord, resume *Decision) (*Result, error) {
+	builder := m.builder
+	if resume != nil {
+		// The human's answers ride on the tools themselves: an approved call
+		// runs instead of asking a second time, a refused one fails fast.
+		builder = m.builder.withApprovals(decisionsFor(rec.Waiting, *resume))
+	}
+	wf, budget, err := builder.Build(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
 
 	timeout := time.Duration(spec.Budgets.MaxWallSeconds) * time.Second
 	budget.setDeadline(time.Now().Add(timeout))
+	if resume != nil {
+		// Tokens spent by earlier turns still count against the ceiling.
+		budget.add("", int(rec.Tokens))
+	}
 
 	start := time.Now()
-	res := &Result{Graph: spec.Name}
-	captures := map[string]*nodeCapture{}
+	res := &Result{Graph: spec.Name, RunID: rec.RunID}
+	captures := priorCaptures(rec, resume != nil)
+	seen := map[string]bool{}
+
 	byNode := make(map[string]Node, len(spec.Nodes))
 	for _, n := range spec.Nodes {
 		byNode[n.ID] = n
 	}
-
 	capture := func(author string) *nodeCapture {
 		c, ok := captures[author]
 		if ok {
@@ -96,18 +158,19 @@ func (m *Manager) Run(ctx agent.Context, spec *Spec, input string) (*Result, err
 	// runner appends events to a session, and the LLM flow rebuilds each
 	// request from session history. Driven directly, a node agent cannot see
 	// the function responses from its own tool calls and re-calls the same
-	// tool until the wall clock kills the run.
-	events, cleanup, err := m.drive(ctx, spec, wf, input)
+	// tool until the wall clock kills the run. The session is the run's durable
+	// memory, so it outlives this turn when the graph pauses.
+	seq, drv, err := m.drive(ctx, spec, rec, wf, resume)
 	if err != nil {
 		res.Duration = time.Since(start)
 		res.Err = fmt.Sprintf("graph failed to start: %v", err)
+		rec.Status, rec.Err = RunFailed, res.Err
+		_ = m.saveRunRecord(rec)
 		return res, errors.New(res.Err)
 	}
-	defer cleanup()
 
 	var runErr error
-	var paused []string
-	for ev, err := range events {
+	for ev, err := range seq {
 		if err != nil {
 			runErr = err
 			break
@@ -126,14 +189,9 @@ func (m *Manager) Run(ctx agent.Context, spec *Spec, input string) (*Result, err
 		if author == "" {
 			continue
 		}
-		// A long-running tool call is the engine's pause signal: the node is
-		// parked in NodeWaiting and the iterator simply ends. Graphs run
-		// unattended, so there is nobody to answer it.
-		if len(ev.LongRunningToolIDs) > 0 {
-			paused = append(paused, author)
-		}
 		c := capture(author)
 		c.seen = true
+		seen[author] = true
 		if ev.Output != nil {
 			c.out = ev.Output
 		}
@@ -149,21 +207,38 @@ func (m *Manager) Run(ctx agent.Context, spec *Spec, input string) (*Result, err
 	res.Duration = time.Since(start)
 	res.Tokens = budget.Tokens()
 
-	// Report in spec order, so the digest reads like the graph rather than
-	// like whichever node happened to finish first.
+	events, evErr := drv.events(ctx)
+	if evErr != nil && runErr == nil {
+		runErr = evErr
+	}
+	// An unanswered long-running call is the engine's pause signal: the node
+	// parks in NodeWaiting and the iterator simply ends.
+	interrupts := openInterrupts(events, spec)
+
+	// Report in spec order, so the digest reads like the graph rather than like
+	// whichever node happened to finish first.
+	prior := priorNodes(rec)
 	sink := spec.Sink()
 	for _, n := range spec.Nodes {
 		c := captures[n.ID]
 		nr := NodeResult{ID: n.ID, Role: n.Role, Kind: n.Kind}
+		if old, ok := prior[n.ID]; ok {
+			nr.Tokens, nr.Duration = old.Tokens, old.Duration
+			nr.Err = old.Err
+		}
 		switch {
-		case c != nil && c.seen:
+		case c != nil && c.seen && seen[n.ID]:
 			nr.Text = clipRunes(c.text.String(), maxNodeText)
 			nr.Tokens = budget.nodeTokens(n.ID)
 			nr.Duration = budget.elapsed(n.ID)
+			nr.Err = ""
+		case c != nil && c.seen:
+			nr.Text = clipRunes(c.text.String(), maxNodeText)
 		case n.Kind == KindJoin:
 			// A join is a barrier: it merges, it does not produce text of its
 			// own, so an absent event is normal.
 			nr.Tokens = budget.nodeTokens(n.ID)
+			nr.Err = ""
 		default:
 			nr.Err = "did not run"
 		}
@@ -171,21 +246,77 @@ func (m *Manager) Run(ctx agent.Context, spec *Spec, input string) (*Result, err
 	}
 
 	res.Output = renderSinkOutput(spec, captures)
-	if runErr != nil {
+
+	rec.Nodes = res.Nodes
+	rec.Tokens = res.Tokens
+	rec.Duration += res.Duration
+	rec.InvocationID = drv.invocationID
+
+	switch {
+	case runErr != nil:
 		res.Err = describeRunError(runErr, timeout, budget)
+		rec.Status, rec.Err, rec.Waiting = RunFailed, res.Err, nil
+	case len(interrupts) > 0:
+		res.Status = string(RunWaiting)
+		res.Waiting = interrupts
+		rec.Status, rec.Err, rec.Waiting = RunWaiting, "", interrupts
+	case res.Output == "":
+		res.Err = fmt.Sprintf("graph finished but sink %q produced no output", sink)
+		rec.Status, rec.Err, rec.Waiting = RunFailed, res.Err, nil
+	default:
+		res.Status = string(RunCompleted)
+		rec.Status, rec.Err, rec.Waiting = RunCompleted, "", nil
+		rec.Output = res.Output
+	}
+	if saveErr := m.saveRunRecord(rec); saveErr != nil && res.Err == "" {
+		res.Err = "graph finished but its run record could not be saved: " + saveErr.Error()
+	}
+	if runErr != nil {
 		return res, errors.New(res.Err)
 	}
-	if len(paused) > 0 {
-		res.Err = fmt.Sprintf("node(s) %s paused waiting for a human to approve a tool call; "+
-			"a graph runs unattended, so no one can answer it — give the node read-only work and do the gated "+
-			"call in the main turn, or add the tool to sandbox.mcp_allow", strings.Join(uniqueStrings(paused), ", "))
-		return res, errors.New(res.Err)
+	if len(interrupts) > 0 {
+		// A pause is a question, not a failure: the orchestrator answers it
+		// with graph_resume.
+		return res, nil
 	}
 	if res.Output == "" {
-		res.Err = fmt.Sprintf("graph finished but sink %q produced no output", sink)
 		return res, errors.New(res.Err)
 	}
 	return res, nil
+}
+
+// priorCaptures seeds the node captures with what earlier turns of this run
+// already produced, so the sink's join render and the digest stay complete
+// after a resume. A node that was waiting is cleared: it re-runs from the top,
+// and keeping its pre-pause text would duplicate it.
+func priorCaptures(rec *RunRecord, resuming bool) map[string]*nodeCapture {
+	caps := map[string]*nodeCapture{}
+	if !resuming {
+		return caps
+	}
+	for _, n := range rec.Nodes {
+		if n.Err != "" || n.Text == "" {
+			continue
+		}
+		c := &nodeCapture{id: n.ID, role: n.Role, kind: n.Kind, seen: true}
+		c.text.WriteString(n.Text)
+		caps[n.ID] = c
+	}
+	for _, w := range rec.Waiting {
+		if c, ok := caps[w.Node]; ok {
+			c.text.Reset()
+		}
+	}
+	return caps
+}
+
+// priorNodes indexes a record's node results by node ID.
+func priorNodes(rec *RunRecord) map[string]NodeResult {
+	out := make(map[string]NodeResult, len(rec.Nodes))
+	for _, n := range rec.Nodes {
+		out[n.ID] = n
+	}
+	return out
 }
 
 // describeRunError turns the engine's error into something the orchestrator can
@@ -348,31 +479,64 @@ func (m *Manager) Dir() string { return m.dir }
 // Builder exposes the builder (the tools validate against its registry).
 func (m *Manager) Builder() *Builder { return m.builder }
 
-// drive runs the workflow through its own ADK runner.
+// runDriver is one turn's handle on a run: its durable session, which the turn
+// appends to, and the invocation ID the turn ran under.
+type runDriver struct {
+	svc          *fileSessionService
+	invocationID string
+}
+
+// events re-reads the run's session history from its durable store.
+func (d *runDriver) events(ctx context.Context) ([]*session.Event, error) {
+	return d.svc.Events(ctx)
+}
+
+// drive runs one turn of the workflow through its own ADK runner.
 //
 // The runner is what makes a node agent's tool loop work: it appends every
 // event to the session, and the LLM flow rebuilds each model request from that
 // history. A graph driven with a bare wf.RunNode call has no such history, so a
 // node re-calls the same tool forever.
 //
-// The session is deleted when the run finishes. Nothing needs it afterwards
-// today; when pause/resume lands it becomes the durable record instead.
-func (m *Manager) drive(ctx agent.Context, spec *Spec, wf interface {
-	Run(agent.InvocationContext) iter.Seq2[*session.Event, error]
-}, input string) (iter.Seq2[*session.Event, error], func(), error) {
+// The session is durable — it lives at .golem/graphs/runs/<run-id>/session — and
+// is what a resumed turn reads back, so a graph that paused on a human approval
+// continues where it stopped instead of starting over.
+func (m *Manager) drive(ctx agent.Context, spec *Spec, rec *RunRecord, wf *workflow.Workflow, resume *Decision) (iter.Seq2[*session.Event, error], *runDriver, error) {
+	svc, sess, err := openFileSessionService(ctx, m.sessionDir(rec.RunID), graphAppName, m.userID, rec.SessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	drv := &runDriver{svc: svc}
+
+	run := wf.Run
+	content := genai.NewContentFromText(rec.Input, genai.RoleUser)
+	if resume != nil {
+		// The answers go into the session first, so the engine can see the
+		// interrupt resolved when it rebuilds the run, and the resumed turn's
+		// own content is what the model reads.
+		if err := appendResumeAnswers(ctx, svc, sess, rec.Waiting, *resume); err != nil {
+			return nil, nil, errors.Wrap(err, "recording the answer")
+		}
+		run = resumeTurn(wf, rec, *resume)
+		content = genai.NewContentFromText(resumeText(rec.Waiting, *resume), genai.RoleUser)
+	}
+
 	wfAgent, err := agent.New(agent.Config{
 		Name:        spec.WorkflowName(),
 		Description: spec.Description,
-		Run:         wf.Run,
+		Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			drv.invocationID = ictx.InvocationID()
+			return run(ictx)
+		},
 	})
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "wrapping the workflow as an agent")
 	}
 
 	r, err := runner.New(runner.Config{
-		AppName:           "golem-graph",
+		AppName:           graphAppName,
 		Agent:             wfAgent,
-		SessionService:    m.sessions,
+		SessionService:    svc,
 		ArtifactService:   artifact.InMemoryService(),
 		MemoryService:     memory.InMemoryService(),
 		AutoCreateSession: true,
@@ -381,18 +545,45 @@ func (m *Manager) drive(ctx agent.Context, spec *Spec, wf interface {
 		return nil, nil, errors.Wrap(err, "creating the graph runner")
 	}
 
-	sessionID := fmt.Sprintf("graph-%s-%d", spec.Name, time.Now().UnixNano())
-	cleanup := func() {
-		_ = m.sessions.Delete(context.Background(), &session.DeleteRequest{
-			AppName:   "golem-graph",
-			UserID:    m.userID,
-			SessionID: sessionID,
-		})
-	}
-	seq := r.Run(ctx, m.userID, sessionID, genai.NewContentFromText(input, genai.RoleUser), agent.RunConfig{
+	seq := r.Run(ctx, m.userID, rec.SessionID, content, agent.RunConfig{
 		StreamingMode: agent.StreamingModeNone,
 	})
-	return seq, cleanup, nil
+	return seq, drv, nil
+}
+
+// resumeTurn rebuilds the paused run's engine state from the run's own session
+// and hands the human's answer to the workflow, which re-runs the parked node
+// with that answer as its input.
+func resumeTurn(wf *workflow.Workflow, rec *RunRecord, d Decision) func(agent.InvocationContext) iter.Seq2[*session.Event, error] {
+	return func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+		return func(yield func(*session.Event, error) bool) {
+			// An empty invocation ID means "every event in this session": the
+			// session belongs to exactly one run, so nothing else can leak in,
+			// and a run that paused more than once still rebuilds whole.
+			state, err := wf.ReconstructRunState(ictx.Session(), "")
+			if err != nil {
+				yield(nil, errors.Wrapf(err, "rebuilding run %s", rec.RunID))
+				return
+			}
+			if state == nil {
+				yield(nil, fmt.Errorf("run %s has nothing left to resume", rec.RunID))
+				return
+			}
+			responses := resumeResponses(rec.Waiting, d)
+			if len(responses) == 0 {
+				yield(nil, fmt.Errorf("run %s is not waiting on any interrupt", rec.RunID))
+				return
+			}
+			// Resume takes an agent.Context (it schedules nodes, which need
+			// Actions); the invocation context the runner handed us is the
+			// same turn, one wrapper level down.
+			for ev, err := range wf.Resume(agent.NewContext(ictx), state, responses) {
+				if !yield(ev, err) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // uniqueStrings drops duplicates while keeping first-seen order.

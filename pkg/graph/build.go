@@ -42,6 +42,12 @@ type BuilderConfig struct {
 	Toolsets      []tool.Toolset
 	MemoryContext func() string
 	OnEvent       func(Event)
+
+	// Approvals answers "has a human already decided this exact call?" for
+	// the tools a node may use. It is set only on a resumed turn: a node's
+	// tools run unattended, so a call the sandbox policy wants a human for
+	// pauses the run instead of asking, and the answer comes back here.
+	Approvals ApprovalFunc
 }
 
 // Builder turns a validated spec into a runnable workflow.
@@ -77,9 +83,9 @@ func (b *Builder) classTools(class string) []tool.Tool {
 		out := make([]tool.Tool, 0, len(b.cfg.ReadOnlyTools)+len(b.cfg.WriteTools))
 		out = append(out, b.cfg.ReadOnlyTools...)
 		out = append(out, b.cfg.WriteTools...)
-		return out
+		return wrapTools(out, b.cfg.Approvals)
 	default:
-		return b.cfg.ReadOnlyTools
+		return wrapTools(b.cfg.ReadOnlyTools, b.cfg.Approvals)
 	}
 }
 
@@ -138,7 +144,13 @@ func (b *Builder) Build(ctx context.Context, spec *Spec) (*workflow.Workflow, *r
 		}
 	}
 
-	wf, err := workflow.New(spec.WorkflowName(), eb.Build(), workflow.WithMaxConcurrency(spec.MaxConcurrency))
+	// The workflow is anonymous on purpose. A named workflow is persisted under
+	// its name in session state and prefixes every node's path with
+	// "<name>@1/", while the resume path drives wf.Resume without that prefix —
+	// so a node's events would change identity between the turn that paused and
+	// the turn that resumed it. A run's own record and session are its durable
+	// identity here; the engine name adds nothing but that inconsistency.
+	wf, err := workflow.New("", eb.Build(), workflow.WithMaxConcurrency(spec.MaxConcurrency))
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "building workflow")
 	}
@@ -228,7 +240,8 @@ func (b *Builder) buildAgentNode(ctx context.Context, spec *Spec, n Node, budget
 	if err != nil {
 		return nil, errors.Wrap(err, "creating node agent")
 	}
-	return workflow.NewAgentNode(adkAgent, workflow.NodeConfig{})
+	rerun := true
+	return workflow.NewAgentNode(adkAgent, workflow.NodeConfig{RerunOnResume: &rerun})
 }
 
 // firstLine returns the first non-empty line, clipped, for a node description.

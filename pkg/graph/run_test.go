@@ -421,9 +421,10 @@ func TestWallClockErrorNamesTheStuckNodes(t *testing.T) {
 	}
 }
 
-// A node that needs a human is a dead end inside a graph: nobody is watching,
-// and the engine's pause is otherwise silent (the iterator just ends).
-func TestPausedNodeIsReportedAsUnattended(t *testing.T) {
+// A node that needs a human is a pause, not a dead end: the run stops, says
+// exactly what it is waiting for, and records itself so a later turn can answer
+// it with graph_resume.
+func TestPausedNodeIsReportedAsWaiting(t *testing.T) {
 	confirming, err := functiontool.New(functiontool.Config{Name: "needs_ok", Description: "asks a human"},
 		func(ctx agent.Context, args map[string]any) (map[string]any, error) {
 			if err := ctx.RequestConfirmation("approve?", args); err != nil {
@@ -448,7 +449,16 @@ func TestPausedNodeIsReportedAsUnattended(t *testing.T) {
 		Edges: [][]string{{"START", "gate"}},
 	}
 	out := invokeGraphRun(t, m, map[string]any{"spec": spec, "input": "go"})
-	if !strings.Contains(out, "paused waiting for a human") {
-		t.Fatalf("a paused node was not reported as unattended:\n%s", out)
+	for _, want := range []string{"PAUSED", "run_id", "gate", "needs_ok", "graph_resume"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the pause report is missing %q:\n%s", want, out)
+		}
+	}
+	runs, err := m.ListRuns()
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("ListRuns: %v (runs %d)", err, len(runs))
+	}
+	if runs[0].Status != RunWaiting || len(runs[0].Waiting) != 1 {
+		t.Fatalf("paused run was not recorded as waiting: %+v", runs[0])
 	}
 }
