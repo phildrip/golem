@@ -222,9 +222,6 @@ func (s *Session) Resume(ctx context.Context) error {
 	s.suspended = false
 	now := time.Now().UTC()
 	s.LastActiveAt = now
-	if agentInstance.Store() != nil {
-		s.cachedEvents = agentInstance.Store().GetAllEvents()
-	}
 	onWire := s.onWire
 	mgr := s.manager
 	s.mu.Unlock()

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -924,6 +926,53 @@ func TestAgentClose_CompactorGracePeriodTimeoutCancelsCleanly(t *testing.T) {
 	// When grace period expires and worker context is canceled, no error should be logged or recorded in health
 	if a.Health().Total() != 0 {
 		t.Errorf("expected 0 health problems on shutdown cancellation, got %d: %s", a.Health().Total(), a.Health().Summary())
+	}
+}
+
+func TestAgent_SubSessionDoesNotDeadlockOrTimeoutMountingProfileMemory(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	profDir := filepath.Join(tempHome, ".golem", "profiles", "work", "memory")
+	if err := os.MkdirAll(profDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Open the primary profile agent (which locks profDir/fractal.db)
+	mainCfg := Config{
+		Profile:    "work",
+		StorageDir: profDir,
+		Provider:   config.ProviderOpenAI,
+		ModelName:  "test-model",
+	}
+	mainAgent, err := New(context.Background(), mainCfg)
+	if err != nil {
+		t.Fatalf("failed to create main agent: %v", err)
+	}
+	defer mainAgent.Close()
+
+	// 2. Open a sub-session agent whose StorageDir is inside profDir (e.g. profDir/session-123)
+	subDir := filepath.Join(profDir, "session-123")
+	subCfg := Config{
+		Profile:    "work",
+		StorageDir: subDir,
+		Provider:   config.ProviderOpenAI,
+		ModelName:  "test-model",
+		SessionID:  "session-123",
+	}
+
+	start := time.Now()
+	subAgent, err := New(context.Background(), subCfg)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("failed to create sub-session agent: %v", err)
+	}
+	defer subAgent.Close()
+
+	// Before the fix, New() would attempt to open profDir/fractal.db while mainAgent held the lock,
+	// hanging for the bbolt timeout (5 seconds).
+	if elapsed > 1*time.Second {
+		t.Errorf("sub-session creation took %v, expected < 1s (lock timeout bug)", elapsed)
 	}
 }
 

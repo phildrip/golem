@@ -87,7 +87,7 @@ func OpenStore(dir string) (*Store, error) {
 	}
 
 	dbPath := filepath.Join(dir, "fractal.db")
-	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 5 * time.Second})
+	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		return nil, errors.Wrapf(err, "opening bbolt database %s", dbPath)
 	}
@@ -234,33 +234,33 @@ func (s *Store) loadFromDB() error {
 		bEv := tx.Bucket(bucketEvents)
 		cEv := bEv.Cursor()
 
-		// First determine max event ID to ensure 1:1 indexing without gap corruption
+		// Determine max event ID from the last big-endian key in bbolt
 		maxID := -1
+		if k, _ := cEv.Last(); k != nil && len(k) == 8 {
+			maxID = int(binary.BigEndian.Uint64(k))
+		}
+
+		if maxID >= 0 {
+			s.events = make([]Event, maxID+1)
+		}
+
 		for k, v := cEv.First(); k != nil; k, v = cEv.Next() {
 			var ev Event
 			if err := json.Unmarshal(v, &ev); err != nil {
 				continue
 			}
-			if ev.ID > maxID {
-				maxID = ev.ID
+			if ev.ID >= len(s.events) {
+				newEvents := make([]Event, ev.ID+1)
+				copy(newEvents, s.events)
+				s.events = newEvents
 			}
-		}
-
-		if maxID >= 0 {
-			s.events = make([]Event, maxID+1)
-			for k, v := cEv.First(); k != nil; k, v = cEv.Next() {
-				var ev Event
-				if err := json.Unmarshal(v, &ev); err != nil {
-					continue
+			if ev.ID >= 0 {
+				s.events[ev.ID] = ev
+				if ev.TurnID != "" {
+					s.turnIndex[ev.TurnID] = append(s.turnIndex[ev.TurnID], ev.ID)
 				}
-				if ev.ID >= 0 && ev.ID < len(s.events) {
-					s.events[ev.ID] = ev
-					if ev.TurnID != "" {
-						s.turnIndex[ev.TurnID] = append(s.turnIndex[ev.TurnID], ev.ID)
-					}
-					if ev.SessionID != "" {
-						s.sessionIndex[ev.SessionID] = append(s.sessionIndex[ev.SessionID], ev.ID)
-					}
+				if ev.SessionID != "" {
+					s.sessionIndex[ev.SessionID] = append(s.sessionIndex[ev.SessionID], ev.ID)
 				}
 			}
 		}

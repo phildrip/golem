@@ -457,10 +457,15 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	// Mount profile memory if configured and different from primary workspace memory
 	if cfg.Profile != "" && cfg.Profile != "default" {
 		profDir, _ := config.ProfileMemoryDir(cfg.Profile)
-		if profDir != "" && profDir != cfg.StorageDir {
-			if profStore, err := fractal.OpenStore(profDir); err == nil {
-				profView := fractal.NewView(profStore, viewCfg)
-				memoryMgr.Mount(cfg.Profile, profStore, profView, true)
+		if profDir != "" {
+			rel, err := filepath.Rel(filepath.Clean(profDir), filepath.Clean(cfg.StorageDir))
+			// Only mount profile memory if StorageDir is NOT profDir itself and NOT a subdirectory of profDir
+			isSubOrSame := (err == nil && !strings.HasPrefix(rel, ".."))
+			if !isSubOrSame {
+				if profStore, err := fractal.OpenStore(profDir); err == nil {
+					profView := fractal.NewView(profStore, viewCfg)
+					memoryMgr.Mount(cfg.Profile, profStore, profView, true)
+				}
 			}
 		}
 	}
@@ -469,10 +474,14 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	allMounted := append([]config.MountedMemoryConfig(nil), cfg.MountedMemories...)
 	allMounted = append(allMounted, cfg.FileConfig.MountedMemories...)
 	for _, mm := range allMounted {
-		if mm.Path != "" && mm.Path != cfg.StorageDir {
-			if mStore, err := fractal.OpenStore(mm.Path); err == nil {
-				mView := fractal.NewView(mStore, viewCfg)
-				memoryMgr.Mount(mm.Name, mStore, mView, mm.ReadOnly)
+		if mm.Path != "" {
+			rel, err := filepath.Rel(filepath.Clean(mm.Path), filepath.Clean(cfg.StorageDir))
+			isSubOrSame := (err == nil && !strings.HasPrefix(rel, ".."))
+			if !isSubOrSame {
+				if mStore, err := fractal.OpenStore(mm.Path); err == nil {
+					mView := fractal.NewView(mStore, viewCfg)
+					memoryMgr.Mount(mm.Name, mStore, mView, mm.ReadOnly)
+				}
 			}
 		}
 	}
