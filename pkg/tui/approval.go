@@ -108,7 +108,7 @@ func (m *Model) resumeAgentTurnCmd(ctx context.Context, callID string, approved 
 		}
 	}()
 
-	return listenStreamCmd(msgChan)
+	return listenStreamCmd(m.activeSessionID, msgChan)
 }
 
 // renderApprovalModalView draws the confirmation prompt. It shows the exact

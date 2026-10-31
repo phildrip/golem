@@ -21,6 +21,7 @@ import (
 	"github.com/user/golem/pkg/approval"
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
+	"github.com/user/golem/pkg/graph"
 	"github.com/user/golem/pkg/importer"
 	"github.com/user/golem/pkg/sandbox"
 	"github.com/user/golem/pkg/tools"
@@ -361,7 +362,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 				// Run turn tied to the session's cancelable context
 				go func(sess *Session, p string) {
 					defer sess.ReleaseTurn()
-					turnCtx, cancel := context.WithTimeout(sess.ctx, 10*time.Minute)
+					turnCtx, cancel := context.WithTimeout(sess.Context(), 10*time.Minute)
 					defer cancel()
 					if _, err := s.sessions.SendPrompt(turnCtx, sessionID, p); err != nil {
 						// The HTTP caller already has its 202; the turn failing is
@@ -383,7 +384,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 					writeError(w, http.StatusNotFound, "session not found")
 					return
 				}
-				req, pending := sess.Agent.PendingApproval()
+				var req approval.Request
+				var pending bool
+				if sess.Agent != nil {
+					req, pending = sess.Agent.PendingApproval()
+				}
 				if !pending {
 					writeJSON(w, http.StatusOK, map[string]any{"pending": false})
 					return
@@ -414,7 +419,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 				}
 				go func(sess *Session, callID string, approved bool) {
 					defer sess.ReleaseTurn()
-					turnCtx, cancel := context.WithTimeout(sess.ctx, 10*time.Minute)
+					turnCtx, cancel := context.WithTimeout(sess.Context(), 10*time.Minute)
 					defer cancel()
 					if _, err := s.sessions.SendApproval(turnCtx, sessionID, callID, approved); err != nil {
 						log.Printf("server: resuming session %s after approval failed: %v", sessionID, err)
@@ -431,7 +436,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 					writeError(w, http.StatusNotFound, "session not found")
 					return
 				}
-				events := sess.Agent.Store().GetAllEvents()
+				events := sess.Events()
 				writeJSON(w, http.StatusOK, events)
 			} else {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -536,6 +541,39 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Provider models discovery endpoint
 	mux.HandleFunc("/api/models", func(w http.ResponseWriter, r *http.Request) {
 		s.handleGetModels(w, r)
+	})
+
+	// Subagent workflow graphs & recent run records endpoint (golem-cfj.5)
+	mux.HandleFunc("/api/graphs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var specs []*graph.Spec
+		var runs []*graph.RunRecord
+		if activeSess, ok := s.sessions.ActiveSession(); ok && activeSess != nil && activeSess.Agent != nil && activeSess.Agent.Graphs() != nil {
+			gm := activeSess.Agent.Graphs()
+			if entries, err := gm.List(); err == nil {
+				for _, e := range entries {
+					if sp, err := gm.Load(e.Name); err == nil {
+						specs = append(specs, sp)
+					}
+				}
+			}
+			if rList, err := gm.ListRuns(); err == nil {
+				runs = rList
+			}
+		}
+		if specs == nil {
+			specs = []*graph.Spec{}
+		}
+		if runs == nil {
+			runs = []*graph.RunRecord{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"specs": specs,
+			"runs":  runs,
+		})
 	})
 
 	// Embedded UI SPA or placeholder static file handler
@@ -1072,10 +1110,8 @@ func (s *Server) applyActiveProfile(ctx context.Context, profileName string, fil
 	s.SetBaseAgentCfg(base)
 	s.sessions.UpdateBaseConfig(base)
 
-	if activeSess, ok := s.sessions.ActiveSession(); ok && activeSess.Agent != nil {
-		activeSess.mu.Lock()
-		defer activeSess.mu.Unlock()
-		if _, err := activeSess.Agent.SwitchProfile(ctx, name); err != nil {
+	if activeSess, ok := s.sessions.ActiveSession(); ok && !activeSess.IsSuspended() {
+		if _, err := activeSess.SwitchProfile(ctx, name); err != nil {
 			// The profile is stored either way; the live agent keeps its old
 			// model until the next turn, so say so rather than fail silently.
 			log.Printf("server: profile %q saved but the active session did not switch: %v", name, err)

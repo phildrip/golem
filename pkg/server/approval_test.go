@@ -141,13 +141,8 @@ func TestApprovalRouteWithoutPendingCall(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		sess, ok := srv.sessions.GetSession(sessInfo.ID)
-		if ok {
-			sess.mu.Lock()
-			busy := sess.isBusy
-			sess.mu.Unlock()
-			if !busy {
-				break
-			}
+		if ok && !sess.IsBusy() {
+			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the session stayed busy after a stray approval")

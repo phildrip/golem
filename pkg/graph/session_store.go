@@ -55,9 +55,12 @@ type RunRecord struct {
 	Status       RunStatus          `json:"status"`
 	Waiting      []WaitingInterrupt `json:"waiting,omitempty"`
 	Output       string             `json:"output,omitempty"`
-	Nodes        []NodeResult       `json:"nodes,omitempty"`
-	Tokens       int64              `json:"tokens,omitempty"`
-	Duration     time.Duration      `json:"duration,omitempty"`
+	Nodes         []NodeResult       `json:"nodes,omitempty"`
+	Tokens        int64              `json:"tokens,omitempty"`
+	CachedTokens  int64              `json:"cached_tokens,omitempty"`
+	CacheHitRatio float64            `json:"cache_hit_ratio,omitempty"`
+	Activations   int                `json:"activations,omitempty"`
+	Duration      time.Duration      `json:"duration,omitempty"`
 	Err          string             `json:"error,omitempty"`
 	CreatedAt    time.Time          `json:"created_at"`
 	UpdatedAt    time.Time          `json:"updated_at"`

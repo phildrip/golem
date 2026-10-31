@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/user/golem/pkg/config"
+	"github.com/user/golem/pkg/runtime"
 )
 
 // WSEventType distinguishes realtime WebSocket events streamed to UI clients.
@@ -44,25 +45,22 @@ const (
 
 	// Human-in-the-Loop sandbox confirmation
 	WSEventApprovalRequest WSEventType = "approval_request"
+
+	// Stream resume fallback when requested sequence aged out of ring buffer
+	WSEventResumeFailed WSEventType = "resume_failed"
 )
 
 // WSEvent is the standard JSON envelope transmitted over WebSockets.
 type WSEvent struct {
 	Type      WSEventType     `json:"type"`
 	SessionID string          `json:"session_id,omitempty"`
+	Seq       uint64          `json:"seq,omitempty"`
 	Timestamp time.Time       `json:"timestamp"`
 	Payload   json.RawMessage `json:"payload"`
 }
 
 // SessionInfo provides metadata for a managed agent session.
-type SessionInfo struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	IsActive  bool      `json:"is_active"`
-	TurnCount int       `json:"turn_count"`
-}
+type SessionInfo = runtime.SessionInfo
 
 // CreateSessionRequest is the payload for creating a new session.
 type CreateSessionRequest struct {

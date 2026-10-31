@@ -10,6 +10,7 @@ class RealtimeClient {
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private url: string = '';
 	public isConnected: boolean = false;
+	private lastSeqBySession: Map<string, number> = new Map();
 
 	constructor() {
 		if (typeof window !== 'undefined') {
@@ -50,12 +51,28 @@ class RealtimeClient {
 					clearTimeout(this.reconnectTimer);
 					this.reconnectTimer = null;
 				}
+				// Send resume frames for all known sessions so the server replays
+				// any events missed while the socket was down or backgrounded.
+				for (const [sessionId, lastSeq] of this.lastSeqBySession.entries()) {
+					if (lastSeq > 0) {
+						this.send({ type: 'resume', session_id: sessionId, last_seq: lastSeq });
+					}
+				}
 				this.notifyConnectionState(true);
 			};
 
 			this.ws.onmessage = (event) => {
 				try {
 					const data = JSON.parse(event.data) as WSEvent;
+					if (data.session_id && typeof data.seq === 'number' && data.seq > 0) {
+						const prev = this.lastSeqBySession.get(data.session_id) || 0;
+						if (data.type !== 'resume_failed' && data.seq <= prev) {
+							return;
+						}
+						if (data.seq > prev) {
+							this.lastSeqBySession.set(data.session_id, data.seq);
+						}
+					}
 					for (const cb of this.listeners) {
 						cb(data);
 					}
@@ -203,6 +220,14 @@ export async function getProviderModels(provider: string, baseUrl?: string): Pro
 	if (!res.ok) {
 		const errObj = await res.json().catch(() => null);
 		throw new Error(errObj?.error || res.statusText || 'Failed to fetch models');
+	}
+	return res.json();
+}
+
+export async function getGraphs(): Promise<import('./types').GraphsResponse> {
+	const res = await fetch('/api/graphs');
+	if (!res.ok) {
+		return { specs: [], runs: [] };
 	}
 	return res.json();
 }

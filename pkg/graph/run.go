@@ -272,6 +272,9 @@ func (m *Manager) execute(ctx agent.Context, spec *Spec, rec *RunRecord, resume 
 
 	rec.Nodes = res.Nodes
 	rec.Tokens = res.Tokens
+	rec.CachedTokens = res.CachedTokens
+	rec.CacheHitRatio = res.CacheHitRatio
+	rec.Activations = res.Activations
 	rec.Duration += res.Duration
 	rec.InvocationID = drv.invocationID
 

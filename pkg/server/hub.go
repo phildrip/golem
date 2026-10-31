@@ -54,6 +54,26 @@ func (c *Client) writePump() {
 	}
 }
 
+// DefaultSessionRingBufferSize is the default number of recent events retained
+// per session so reconnecting mobile/web clients can replay missed stream frames.
+const DefaultSessionRingBufferSize = 500
+
+type bufferedEvent struct {
+	seq  uint64
+	data []byte
+}
+
+type sessionEventRing struct {
+	nextSeq uint64
+	events  []bufferedEvent
+}
+
+type wsClientCommand struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	LastSeq   uint64 `json:"last_seq"`
+}
+
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregisterClient(c)
@@ -68,9 +88,14 @@ func (c *Client) readPump() {
 	})
 
 	for {
-		_, _, err := c.conn.ReadMessage()
+		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
 			break
+		}
+		_ = c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		var cmd wsClientCommand
+		if err := json.Unmarshal(raw, &cmd); err == nil && cmd.Type == "resume" && cmd.SessionID != "" {
+			c.hub.handleClientResume(c, cmd.SessionID, cmd.LastSeq)
 		}
 	}
 }
@@ -83,6 +108,8 @@ type Hub struct {
 	closed       bool
 	upgrader     websocket.Upgrader
 	allowOrigins []string
+	ringSize     int
+	rings        map[string]*sessionEventRing
 }
 
 // NewHub constructs a new WebSocket Hub.
@@ -90,6 +117,8 @@ func NewHub() *Hub {
 	h := &Hub{
 		clients:   make(map[*Client]bool),
 		broadcast: make(chan []byte, 1024),
+		ringSize:  DefaultSessionRingBufferSize,
+		rings:     make(map[string]*sessionEventRing),
 	}
 	h.upgrader = websocket.Upgrader{
 		CheckOrigin:     h.originAllowed,
@@ -97,6 +126,16 @@ func NewHub() *Hub {
 		WriteBufferSize: 1024,
 	}
 	return h
+}
+
+// SetRingBufferSize overrides the per-session ring buffer capacity (primarily for tests).
+func (h *Hub) SetRingBufferSize(n int) {
+	if n < 1 {
+		n = 1
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ringSize = n
 }
 
 // SetAllowOrigins adds origins permitted to open a WebSocket beyond the request
@@ -145,17 +184,46 @@ func (h *Hub) Broadcast(evType WSEventType, sessionID string, payload any) error
 		raw = data
 	}
 
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return nil
+	}
+
+	var seq uint64
+	var ring *sessionEventRing
+	if sessionID != "" {
+		ring = h.rings[sessionID]
+		if ring == nil {
+			ring = &sessionEventRing{}
+			h.rings[sessionID] = ring
+		}
+		ring.nextSeq++
+		seq = ring.nextSeq
+	}
+
 	envelope := WSEvent{
 		Type:      evType,
 		SessionID: sessionID,
+		Seq:       seq,
 		Timestamp: time.Now().UTC(),
 		Payload:   raw,
 	}
 
 	bytes, err := json.Marshal(envelope)
 	if err != nil {
+		h.mu.Unlock()
 		return err
 	}
+
+	if ring != nil {
+		ring.events = append(ring.events, bufferedEvent{seq: seq, data: bytes})
+		if len(ring.events) > h.ringSize {
+			excess := len(ring.events) - h.ringSize
+			ring.events = append([]bufferedEvent(nil), ring.events[excess:]...)
+		}
+	}
+	h.mu.Unlock()
 
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -175,6 +243,65 @@ func (h *Hub) Broadcast(evType WSEventType, sessionID string, payload any) error
 			return nil
 		case <-time.After(250 * time.Millisecond):
 			return errors.Errorf("broadcast queue saturated (event dropped: %s)", evType)
+		}
+	}
+}
+
+func (h *Hub) handleClientResume(client *Client, sessionID string, lastSeq uint64) {
+	h.mu.RLock()
+	if h.closed || client.dead {
+		h.mu.RUnlock()
+		return
+	}
+	ring := h.rings[sessionID]
+	if ring == nil || len(ring.events) == 0 || lastSeq >= ring.nextSeq {
+		h.mu.RUnlock()
+		return
+	}
+
+	oldestSeq := ring.events[0].seq
+	currentSeq := ring.nextSeq
+	var toSend [][]byte
+
+	if lastSeq+1 < oldestSeq {
+		// Gap is larger than the ring buffer: notify the client to refetch full session history.
+		payload, _ := json.Marshal(map[string]any{
+			"last_seq":    lastSeq,
+			"oldest_seq":  oldestSeq,
+			"current_seq": currentSeq,
+			"reason":      "gap_overflow",
+		})
+		failBytes, err := json.Marshal(WSEvent{
+			Type:      WSEventResumeFailed,
+			SessionID: sessionID,
+			Seq:       currentSeq,
+			Timestamp: time.Now().UTC(),
+			Payload:   payload,
+		})
+		if err == nil {
+			toSend = append(toSend, failBytes)
+		}
+	} else {
+		for _, ev := range ring.events {
+			if ev.seq > lastSeq {
+				toSend = append(toSend, ev.data)
+			}
+		}
+	}
+	h.mu.RUnlock()
+
+	for _, frame := range toSend {
+		h.mu.RLock()
+		dead := h.closed || client.dead
+		if !dead {
+			select {
+			case client.send <- frame:
+			default:
+			}
+		}
+		h.mu.RUnlock()
+		if dead {
+			return
 		}
 	}
 }

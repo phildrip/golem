@@ -35,7 +35,7 @@
 	}
 </script>
 
-<div class="fixed inset-y-0 right-0 w-[540px] bg-[#090d16] border-l border-slate-800 shadow-2xl z-50 flex flex-col text-xs text-slate-200">
+<div class="fixed inset-0 w-full md:inset-y-0 md:left-auto md:right-0 md:w-[540px] bg-[#090d16] border-l border-slate-800 shadow-2xl z-50 flex flex-col text-xs text-slate-200">
 	<!-- Top Bar -->
 	<div class="flex items-center justify-between px-4 py-3 border-b border-slate-800 bg-slate-950/50">
 		<div class="flex items-center gap-2">
@@ -48,7 +48,7 @@
 		<button
 			type="button"
 			onclick={onClose}
-			class="p-1 rounded hover:bg-slate-800 text-slate-400 hover:text-slate-200"
+			class="p-2 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 md:p-1 flex items-center justify-center rounded hover:bg-slate-800 text-slate-400 hover:text-slate-200"
 			title="Close inspector"
 		>
 			<X class="w-4 h-4" />

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/memory/fractal"
+	"github.com/user/golem/pkg/runtime"
 )
 
 // MessageType distinguishes message kinds in the viewport.
@@ -122,7 +124,8 @@ type subagentDoneMsg struct {
 }
 
 type streamMsg struct {
-	Payload tea.Msg
+	SessionID string
+	Payload   tea.Msg
 }
 
 type agentDoneMsg struct {
@@ -171,6 +174,24 @@ type Model struct {
 	profileContent     string
 	profileViewport    viewport.Model
 	showModelModal     bool
+
+	// Multi-session state (golem-3m4.2 / golem-3m4.3).
+	sessionMgr            *runtime.SessionManager
+	sessions              map[string]*chatState
+	sessionOrder          []string
+	activeSessionID       string
+	showSessionModal      bool
+	sessionSelection      int
+	sessionViewport       viewport.Model
+	confirmCloseSessionID string
+
+	// Graph visualization modal & live telemetry (golem-cfj.5).
+	showGraphModal  bool
+	graphSelection  int
+	graphViewport   viewport.Model
+	graphItems      []graphPickerItem
+	liveGraphNodes  map[string]*liveGraphNode
+	activeGraphName string
 
 	// Sandbox confirmation state: the call waiting for a human answer and the
 	// context of the paused turn that answer resumes.
@@ -252,7 +273,7 @@ func NewModel(agentInstance *golem.Agent, store *fractal.Store, viewEngine *frac
 	cwd, _ := os.Getwd()
 	startupHeader, startupEntries := buildStartupEntries(allEvents, cwd, currentProfile, time.Now())
 
-	return Model{
+	m := Model{
 		agent:          agentInstance,
 		store:          store,
 		viewEngine:     viewEngine,
@@ -268,7 +289,10 @@ func NewModel(agentInstance *golem.Agent, store *fractal.Store, viewEngine *frac
 		memoryStats: memoryStatsMsg{
 			tailLevels: make(map[int]int),
 		},
+		liveGraphNodes: make(map[string]*liveGraphNode),
 	}
+	m.initDefaultSession()
+	return m
 }
 
 // SetMouseEnabled tells the model whether mouse capture is active. The CLI calls
@@ -343,6 +367,10 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if _, isKey := msg.(tea.KeyMsg); !isKey {
 		if m.showModelModal {
 			m.modelViewport, vpCmd = m.modelViewport.Update(msg)
+		} else if m.showSessionModal {
+			m.sessionViewport, vpCmd = m.sessionViewport.Update(msg)
+		} else if m.showGraphModal {
+			m.graphViewport, vpCmd = m.graphViewport.Update(msg)
 		} else if m.showProfileModal {
 			m.profileViewport, vpCmd = m.profileViewport.Update(msg)
 		} else if m.showTreeModal {
@@ -372,8 +400,42 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleApprovalKey(msg)
 		}
 
+		if m.showSessionModal {
+			return m.handleSessionModalKey(msg)
+		}
+
+		if m.showGraphModal {
+			return m.handleGraphModalKey(msg)
+		}
+
 		if m.showModelModal {
 			return m.handleModelModalKey(msg)
+		}
+
+		if m.confirmCloseSessionID != "" {
+			switch msg.String() {
+			case "y", "Y", "enter", "ctrl+w":
+				targetID := m.confirmCloseSessionID
+				m.confirmCloseSessionID = ""
+				return m.CloseSession(targetID, true)
+			case "n", "N", "esc":
+				m.confirmCloseSessionID = ""
+				m.setStatus("Cancelled closing session")
+				return m, nil
+			}
+		}
+
+		if msg.String() == "ctrl+n" {
+			return m.NewSession("")
+		}
+
+		if msg.String() == "ctrl+s" {
+			m.openSessionPicker()
+			return m, nil
+		}
+
+		if msg.String() == "ctrl+w" {
+			return m.CloseSession(m.activeSessionID, false)
 		}
 
 		if msg.String() == "ctrl+g" {
@@ -943,6 +1005,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderAndFollow()
 
 	case subagentStartMsg:
+		m.trackGraphStart(msg.role, msg.model)
 		m.entries = append(m.entries, ChatEntry{
 			Type:           TypeSubagent,
 			SubagentRole:   msg.role,
@@ -953,6 +1016,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderAndFollow()
 
 	case subagentDoneMsg:
+		m.trackGraphDone(msg.role, msg.duration, msg.err)
 		for i := len(m.entries) - 1; i >= 0; i-- {
 			if m.entries[i].Type == TypeSubagent && m.entries[i].SubagentRole == msg.role && m.entries[i].IsRunning {
 				m.entries[i].IsRunning = false
@@ -1005,22 +1069,27 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.updateMemoryStatsCmd()
 
 	case streamMsg:
+		// If this message belongs to a background session, update its isolated chatState
+		// without touching the active session's UI state.
+		if msg.SessionID != "" && msg.SessionID != m.activeSessionID {
+			return m, m.routeBackgroundStreamMsg(msg.SessionID, msg.Payload)
+		}
 		// Forward any stream message (agentChunkMsg, toolStartMsg, toolDoneMsg, agentDoneMsg)
 		// into the standard Update message handler, and keep listening on streamChan if open.
 		innerModel, innerCmd := m.Update(msg.Payload)
 		var nextListenCmd tea.Cmd
 		if innerM, ok := innerModel.(Model); ok {
 			if innerM.streamChan != nil && innerM.isLoading {
-				nextListenCmd = listenStreamCmd(innerM.streamChan)
+				nextListenCmd = listenStreamCmd(innerM.activeSessionID, innerM.streamChan)
 			}
 		} else if m.streamChan != nil && m.isLoading {
-			nextListenCmd = listenStreamCmd(m.streamChan)
+			nextListenCmd = listenStreamCmd(m.activeSessionID, m.streamChan)
 		}
 		return innerModel, tea.Batch(innerCmd, nextListenCmd)
 
 	case tea.FocusMsg:
 		m.isBlurred = false
-		if !m.showTreeModal && !m.showShortcutsModal && !m.showMCPModal && !m.showProfileModal && !m.showModelModal {
+		if !m.showTreeModal && !m.showShortcutsModal && !m.showMCPModal && !m.showProfileModal && !m.showModelModal && !m.showSessionModal && !m.showGraphModal {
 			tiCmd = m.textarea.Focus()
 		}
 
@@ -1080,6 +1149,10 @@ func (m Model) handleMouse(msg tea.MouseMsg) Model {
 	switch {
 	case m.showModelModal:
 		vp = &m.modelViewport
+	case m.showSessionModal:
+		vp = &m.sessionViewport
+	case m.showGraphModal:
+		vp = &m.graphViewport
 	case m.showProfileModal:
 		vp = &m.profileViewport
 	case m.showShortcutsModal:
@@ -1106,6 +1179,14 @@ func (m Model) View() string {
 
 	if m.showApprovalModal {
 		return m.renderApprovalModalView()
+	}
+
+	if m.showSessionModal {
+		return m.renderSessionModalView()
+	}
+
+	if m.showGraphModal {
+		return m.renderGraphModalView()
 	}
 
 	if m.showModelModal {
@@ -1182,11 +1263,15 @@ func (m Model) renderHeader() string {
 		minimap = lipgloss.NewStyle().MaxWidth(m.width).Render(minimap)
 	}
 
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
+	lines := []string{
 		lipgloss.JoinHorizontal(lipgloss.Center, title, sub),
 		StatusBarMemoryStyle.Render(minimap),
-	)
+	}
+	if tabs := m.renderSessionTabs(m.width); tabs != "" {
+		lines = append(lines, tabs)
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
 // renderFooter builds the input box plus the status/key-hint line. relayout
@@ -1440,6 +1525,8 @@ func (m *Model) relayout() {
 		m.mcpViewport = viewport.New(modalW, modalH)
 		m.profileViewport = viewport.New(modalW, modalH)
 		m.modelViewport = viewport.New(modalW, modalH)
+		m.sessionViewport = viewport.New(modalW, modalH)
+		m.graphViewport = viewport.New(modalW, modalH)
 		m.ready = true
 	}
 
@@ -1458,7 +1545,7 @@ func (m *Model) relayout() {
 	// limited; letting the viewports also handle them would double-count.
 	m.viewport.MouseWheelEnabled = false
 
-	for _, vp := range []*viewport.Model{&m.treeViewport, &m.shortcutsViewport, &m.mcpViewport, &m.profileViewport, &m.modelViewport} {
+	for _, vp := range []*viewport.Model{&m.treeViewport, &m.shortcutsViewport, &m.mcpViewport, &m.profileViewport, &m.modelViewport, &m.sessionViewport, &m.graphViewport} {
 		vp.Width = modalW
 		vp.Height = modalH
 		vp.KeyMap = viewport.KeyMap{}
@@ -1487,6 +1574,12 @@ func (m *Model) relayout() {
 	// screen; the modal viewport just changed height.
 	if m.showModelModal {
 		m.syncModelPicker()
+	}
+	if m.showSessionModal {
+		m.syncSessionPicker()
+	}
+	if m.showGraphModal {
+		m.syncGraphModal()
 	}
 }
 
@@ -1646,13 +1739,13 @@ func (m *Model) interruptTurn() {
 }
 
 // listenStreamCmd continuously reads from the stream message channel and returns streamMsg.
-func listenStreamCmd(msgChan <-chan tea.Msg) tea.Cmd {
+func listenStreamCmd(sessionID string, msgChan <-chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
 		msg, ok := <-msgChan
 		if !ok {
 			return nil
 		}
-		return streamMsg{Payload: msg}
+		return streamMsg{SessionID: sessionID, Payload: msg}
 	}
 }
 
@@ -1661,6 +1754,8 @@ func (m *Model) runAgentTurnCmd(ctx context.Context, input string, images []gole
 	msgChan := make(chan tea.Msg, 2048)
 	m.streamChan = msgChan
 	m.turnCtx = ctx
+	sessionID := m.activeSessionID
+	activeAgent := m.agent
 	bridge := &tuiStreamBridge{
 		ctx:     ctx,
 		msgChan: msgChan,
@@ -1681,7 +1776,7 @@ func (m *Model) runAgentTurnCmd(ctx context.Context, input string, images []gole
 			}
 		}()
 
-		reply, err := m.agent.ProcessStreamImages(ctx, input, images, bridge)
+		reply, err := activeAgent.ProcessStreamImages(ctx, input, images, bridge)
 		select {
 		case <-ctx.Done():
 		case msgChan <- agentDoneMsg{
@@ -1692,18 +1787,21 @@ func (m *Model) runAgentTurnCmd(ctx context.Context, input string, images []gole
 		}
 	}()
 
-	return listenStreamCmd(msgChan)
+	return listenStreamCmd(sessionID, msgChan)
 }
 
 // updateMemoryStatsCmd calculates current memory hierarchy stats for the minimap.
 func (m *Model) updateMemoryStatsCmd() tea.Cmd {
+	store := m.store
+	viewEngine := m.viewEngine
+	activeAgent := m.agent
 	return func() tea.Msg {
-		if m.store == nil || m.viewEngine == nil {
+		if store == nil || viewEngine == nil {
 			return memoryStatsMsg{}
 		}
 
-		total := m.store.CountEvents()
-		liveHead := m.viewEngine.LiveHeadEvents()
+		total := store.CountEvents()
+		liveHead := viewEngine.LiveHeadEvents()
 		liveCount := len(liveHead)
 
 		levels := make(map[int]int)
@@ -1721,7 +1819,7 @@ func (m *Model) updateMemoryStatsCmd() tea.Cmd {
 			count := 0
 			maxIdx := tailEnd / step
 			for idx := 0; idx < maxIdx; idx++ {
-				if _, ok := m.store.GetNode(lvl, idx); ok {
+				if _, ok := store.GetNode(lvl, idx); ok {
 					count++
 				}
 			}
@@ -1731,8 +1829,8 @@ func (m *Model) updateMemoryStatsCmd() tea.Cmd {
 		}
 
 		var problems string
-		if m.agent != nil {
-			problems = m.agent.Health().Summary()
+		if activeAgent != nil {
+			problems = activeAgent.Health().Summary()
 		}
 		return memoryStatsMsg{
 			totalEvents: total,
@@ -1950,6 +2048,10 @@ func (m Model) generateShortcutsVisual() string {
 			items: []shortcutItem{
 				{"Ctrl+K", "Shortcuts popup", "Open / close this shortcuts and controls guide"},
 				{"Ctrl+T", "Fractal memory tree", "Open / close the OptChat hierarchical tree modal"},
+				{"Ctrl+N", "New session", "Create and switch to a new session over the shared runtime"},
+				{"Ctrl+S / /sessions", "Session picker", "Switch between sessions (1-9 for quick jump)"},
+				{"Ctrl+W", "Close session", "Close the active session (prompts if a turn is running)"},
+				{"/graph", "Graph DAG inspector", "Inspect subagent graphs and live node status"},
 				{"/profile", "Profile manager", "Inspect active & configured provider profiles"},
 				{"/mcp", "MCP server status", "Open active MCP servers and configuration inspector"},
 			},
@@ -2476,6 +2578,42 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		return m, nil
 
+	case "/sessions", "/session":
+		if len(parts) == 1 || strings.EqualFold(parts[1], "list") {
+			m.openSessionPicker()
+			return m, nil
+		}
+		sub := strings.ToLower(parts[1])
+		switch sub {
+		case "new", "create":
+			title := ""
+			if len(parts) > 2 {
+				title = strings.Join(parts[2:], " ")
+			}
+			return m.NewSession(title)
+		case "close", "delete", "rm":
+			targetID := m.activeSessionID
+			if len(parts) > 2 {
+				targetID = parts[2]
+			}
+			return m.CloseSession(targetID, false)
+		default:
+			// Allow `/sessions 2` (1-based index) or `/sessions <id>`
+			targetID := parts[1]
+			if idx, err := strconv.Atoi(targetID); err == nil && idx >= 1 && idx <= len(m.sessionOrder) {
+				targetID = m.sessionOrder[idx-1]
+			}
+			return m.SwitchSession(targetID)
+		}
+
+	case "/graph", "/graphs":
+		name := ""
+		if len(parts) > 1 {
+			name = parts[1]
+		}
+		m.openGraphModal(name)
+		return m, nil
+
 	case "/shortcuts", "/keys":
 		m.textarea.Blur()
 		m.showShortcutsModal = true
@@ -2487,6 +2625,8 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		helpText := `Available Slash Commands:
 /model [name]   - Pick from the live list, or switch to a validated <name>
 /profile [name] - View configured profiles or switch active profile
+/sessions [new] - Switch, create, or close sessions (or Ctrl+S / Ctrl+N / Ctrl+W)
+/graph [name]   - Visualize subagent graphs and live node status
 /remember <text>- Record key preference or decision into profile memory
 /tree, /memory  - Visualize the fractal memory binary tree hierarchy
 /zoom [t] id n  - Inspect memory node or raw message (n=1 for verbatim)

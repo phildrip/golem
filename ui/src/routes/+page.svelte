@@ -10,7 +10,7 @@
 	import ImportModal from '$lib/components/ImportModal.svelte';
 	import ProfileModal from '$lib/components/ProfileModal.svelte';
 	import ApprovalBanner from '$lib/components/ApprovalBanner.svelte';
-	import { realtime, getProfiles } from '$lib/client';
+	import { realtime, getProfiles, getGraphs } from '$lib/client';
 	import { fetchAuthStatus, login } from '$lib/auth';
 	import {
 		sessions,
@@ -29,7 +29,7 @@
 		userConfigPath,
 		workspaceConfigPath
 	} from '$lib/stores';
-	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal, SwarmMessage, ResourceLock, SwarmLockEvent, ProfilesResponse, ApprovalPrompt } from '$lib/types';
+	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal, SwarmMessage, ResourceLock, SwarmLockEvent, ProfilesResponse, ApprovalPrompt, GraphSpec, GraphRunRecord } from '$lib/types';
 
 	let activeSession = $derived(
 		$sessions.find((s) => s.id === $activeSessionId) || null
@@ -71,6 +71,33 @@
 	let showPatchInspector = $state(false);
 	let showImportModal = $state(false);
 	let showProfileModal = $state(false);
+	let showSwarmDrawer = $state(false);
+	let graphSpecs = $state<GraphSpec[]>([]);
+	let graphRuns = $state<GraphRunRecord[]>([]);
+
+	// Mobile token coalescing (~30fps / 33ms) so high-throughput streams stay responsive on phones (golem-2yu.5).
+	const CHUNK_COALESCE_MS = 33;
+	let pendingChunks: Map<string, { text: string; timestamp?: string }> = new Map();
+	let chunkFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+	function flushPendingChunks(targetSessionId?: string) {
+		if (chunkFlushTimer && !targetSessionId) {
+			clearTimeout(chunkFlushTimer);
+			chunkFlushTimer = null;
+		}
+		const entries = targetSessionId
+			? (pendingChunks.has(targetSessionId) ? [[targetSessionId, pendingChunks.get(targetSessionId)!] as const] : [])
+			: Array.from(pendingChunks.entries());
+		if (entries.length === 0) return;
+
+		for (const [sessId, buf] of entries) {
+			pendingChunks.delete(sessId);
+			if (!buf.text) continue;
+			const msg = getOrCreateAssistantMessage(sessId, buf.timestamp);
+			msg.content += buf.text;
+			$messages = { ...$messages, [sessId]: [...($messages[sessId] || [])] };
+		}
+	}
 
 	let unsubscribeWS: (() => void) | null = null;
 	let unsubscribeConn: (() => void) | null = null;
@@ -105,6 +132,7 @@
 		realtime.connect();
 		fetchSessions();
 		fetchProfiles();
+		fetchGraphs();
 	}
 
 	async function submitToken(event: Event) {
@@ -132,6 +160,7 @@
 			if (connected) {
 				fetchSessions();
 				fetchProfiles();
+				fetchGraphs();
 				if ($activeSessionId) {
 					fetchSessionMemory($activeSessionId);
 					void refreshPendingApproval($activeSessionId);
@@ -150,18 +179,17 @@
 	});
 
 	onDestroy(() => {
+		flushPendingChunks();
 		if (unsubscribeWS) unsubscribeWS();
 		if (unsubscribeConn) unsubscribeConn();
 		realtime.disconnect();
 	});
 
-	async function fetchProfiles() {
+	async function fetchGraphs() {
 		try {
-			const res = await getProfiles();
-			$activeProfile = res.active_profile || 'default';
-			$profilesList = res.profiles || {};
-			$userConfigPath = res.user_config_path || '';
-			$workspaceConfigPath = res.workspace_config_path || '';
+			const res = await getGraphs();
+			graphSpecs = res.specs || [];
+			graphRuns = res.runs || [];
 		} catch {
 			// ignore
 		}
@@ -452,13 +480,23 @@
 				const text = payload.delta || payload.token || '';
 				if (!text) break;
 
-				const msg = getOrCreateAssistantMessage(sessId, event.timestamp);
-				msg.content += text;
-				$messages = { ...$messages, [sessId]: [...($messages[sessId] || [])] };
+				const prev = pendingChunks.get(sessId);
+				if (prev) {
+					prev.text += text;
+				} else {
+					pendingChunks.set(sessId, { text, timestamp: event.timestamp });
+				}
+				if (!chunkFlushTimer) {
+					chunkFlushTimer = setTimeout(() => {
+						chunkFlushTimer = null;
+						flushPendingChunks();
+					}, CHUNK_COALESCE_MS);
+				}
 				break;
 			}
 
 			case 'agent_done': {
+				flushPendingChunks(sessId);
 				const payload = event.payload as { response?: string; error?: string; awaiting_approval?: boolean };
 				if (payload.awaiting_approval) {
 					// Paused on a confirmation, not finished: the banner is up and
@@ -483,10 +521,21 @@
 					}
 				}
 				fetchSessionMemory(sessId);
+				fetchGraphs();
+				break;
+			}
+
+			case 'resume_failed': {
+				// Gap exceeded the server's 500-event ring buffer: refetch full session transcript.
+				pendingChunks.delete(sessId);
+				$messages = { ...$messages, [sessId]: [] };
+				fetchSessionMemory(sessId);
+				void refreshPendingApproval(sessId);
 				break;
 			}
 
 			case 'approval_request': {
+				flushPendingChunks(sessId);
 				// The sandbox stopped the turn: a tool call is waiting for a human.
 				const payload = event.payload as ApprovalPrompt;
 				$pendingApprovals = { ...$pendingApprovals, [sessId]: payload };
@@ -495,6 +544,7 @@
 			}
 
 			case 'tool_start': {
+				flushPendingChunks(sessId);
 				const payload = event.payload as { tool?: string; command?: string; args?: Record<string, unknown>; tool_call_id?: string };
 				const toolCall = {
 					id: payload.tool_call_id || `tool-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -572,6 +622,7 @@
 					target.currentAction = 'Completed task';
 					$subagents = { ...$subagents, [sessId]: [...current] };
 				}
+				fetchGraphs();
 				break;
 			}
 
@@ -610,7 +661,7 @@
 	}
 </script>
 
-<div class="h-screen w-screen flex flex-col bg-[#0b0f19] text-slate-100 overflow-hidden font-sans">
+<div class="h-[100dvh] w-full flex flex-col bg-[#0b0f19] text-slate-100 overflow-hidden font-sans">
 	{#if authState === 'locked'}
 		<div class="fixed inset-0 z-[100] flex items-center justify-center bg-[#0b0f19] p-6">
 			<form class="w-full max-w-sm flex flex-col gap-3" onsubmit={submitToken}>
@@ -630,7 +681,7 @@
 					type="password"
 					autocomplete="current-password"
 					placeholder="Access token"
-					class="w-full px-3 py-2.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-100 text-base placeholder:text-slate-600 focus:outline-none focus:border-blue-600"
+					class="w-full px-3 py-2.5 min-h-[44px] rounded-lg bg-slate-900 border border-slate-800 text-slate-100 text-base placeholder:text-slate-600 focus:outline-none focus:border-blue-600"
 				/>
 				{#if authError}
 					<p class="text-xs text-red-400">{authError}</p>
@@ -638,7 +689,7 @@
 				<button
 					type="submit"
 					disabled={authSubmitting || !tokenInput.trim()}
-					class="w-full px-3 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+					class="w-full px-3 py-2.5 min-h-[44px] rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm font-medium transition-colors"
 				>
 					{authSubmitting ? 'Checking…' : 'Unlock'}
 				</button>
@@ -647,24 +698,38 @@
 	{/if}
 
 	<!-- Top Navigation Bar -->
-	<header class="flex items-center justify-between h-12 px-4 bg-[#090d16] border-b border-slate-800/80">
-		<div class="flex items-center gap-3">
+	<header class="flex items-center justify-between min-h-[48px] px-2.5 sm:px-4 bg-[#090d16] border-b border-slate-800/80 gap-2">
+		<div class="flex items-center gap-2 shrink-0">
 			<div class="flex items-center gap-2 font-bold tracking-tight text-sm text-white">
 				<div class="h-7 w-7 rounded-lg bg-blue-600 flex items-center justify-center text-white shadow-sm">
 					<Bot class="w-4 h-4" />
 				</div>
 				<span>Golem</span>
 			</div>
-			<span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 font-mono">v0.2.0</span>
+			<span class="hidden sm:inline text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 font-mono">v0.2.0</span>
 		</div>
 
 		<!-- Status & Indicators -->
-		<div class="flex items-center gap-2">
+		<div class="flex items-center gap-1.5 sm:gap-2 overflow-x-auto no-scrollbar">
+			<!-- Mobile Swarm & Graph DAG Toggle (< md) -->
+			<button
+				type="button"
+				onclick={() => {
+					showSwarmDrawer = !showSwarmDrawer;
+					if (showSwarmDrawer) fetchGraphs();
+				}}
+				class="md:hidden flex items-center justify-center gap-1.5 min-h-[44px] min-w-[44px] px-2.5 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-purple-300 font-medium transition-colors"
+				title="Swarm & Workflow Graphs"
+			>
+				<Network class="w-4 h-4 text-purple-400" />
+				<span class="hidden xs:inline">Swarm</span>
+			</button>
+
 			<!-- Profile Settings Button -->
 			<button
 				type="button"
 				onclick={() => (showProfileModal = true)}
-				class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-purple-300 font-medium transition-colors"
+				class="flex items-center justify-center gap-1.5 min-h-[44px] md:min-h-0 px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-purple-300 font-medium transition-colors"
 				title="Manage models, providers, and profiles"
 			>
 				<Settings class="w-3.5 h-3.5 text-purple-400" />
@@ -680,11 +745,11 @@
 						fetchSessionMemory($activeSessionId);
 					}
 				}}
-				class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-slate-300 font-medium transition-colors"
+				class="flex items-center justify-center gap-1.5 min-h-[44px] md:min-h-0 px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-slate-300 font-medium transition-colors"
 				title="Explore bbolt fractal memory"
 			>
 				<Database class="w-3.5 h-3.5 text-emerald-400" />
-				<span>Memory</span>
+				<span class="hidden sm:inline">Memory</span>
 				{#if currentMemory.length > 0}
 					<span class="px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-400 text-[10px] font-mono">
 						{currentMemory.length}
@@ -696,11 +761,11 @@
 			<button
 				type="button"
 				onclick={() => (showPatchInspector = !showPatchInspector)}
-				class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-slate-300 font-medium transition-colors"
+				class="flex items-center justify-center gap-1.5 min-h-[44px] md:min-h-0 px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-slate-300 font-medium transition-colors"
 				title="Inspect hashline patches"
 			>
 				<GitPullRequest class="w-3.5 h-3.5 text-blue-400" />
-				<span>Patches</span>
+				<span class="hidden sm:inline">Patches</span>
 				{#if currentPatches.length > 0}
 					<span class="px-1.5 py-0.2 rounded-full bg-blue-500 text-white text-[10px] font-mono font-bold animate-pulse">
 						{currentPatches.length}
@@ -708,13 +773,13 @@
 				{/if}
 			</button>
 
-			<div class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 border border-slate-800 text-[11px] font-mono">
+			<div class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 border border-slate-800 text-[11px] font-mono shrink-0">
 				{#if $serverConnected}
 					<Wifi class="w-3.5 h-3.5 text-emerald-400" />
-					<span class="text-emerald-400">Live Multiplexer</span>
+					<span class="hidden sm:inline text-emerald-400">Live Multiplexer</span>
 				{:else}
 					<WifiOff class="w-3.5 h-3.5 text-rose-400" />
-					<span class="text-rose-400">Disconnected</span>
+					<span class="hidden sm:inline text-rose-400">Disconnected</span>
 				{/if}
 			</div>
 		</div>
@@ -734,7 +799,7 @@
 	/>
 
 	<!-- Main Workspace Split View -->
-	<div class="flex-1 flex overflow-hidden">
+	<div class="flex-1 flex overflow-hidden relative">
 		<!-- Central Chat & Turn Execution Area -->
 		<main class="flex-1 flex flex-col bg-[#0b0f19] min-w-0">
 			<ChatArea
@@ -754,12 +819,15 @@
 			/>
 		</main>
 
-		<!-- Right Drawer: Swarm Hierarchy & Comms -->
-		<aside class="flex-shrink-0">
+		<!-- Right Drawer: Swarm Hierarchy, Graph DAG & Comms (desktop side-by-side, mobile full-bleed sheet) -->
+		<aside class={showSwarmDrawer ? "fixed inset-0 z-50 md:static md:block flex-shrink-0" : "hidden md:block flex-shrink-0"}>
 			<SwarmTree
 				subagents={currentSubagents}
 				swarmMessages={currentSwarmMessages}
 				locks={currentSwarmLocks}
+				{graphSpecs}
+				{graphRuns}
+				onClose={() => (showSwarmDrawer = false)}
 			/>
 		</aside>
 	</div>

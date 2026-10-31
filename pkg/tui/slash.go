@@ -62,6 +62,8 @@ func (c slashCommand) isCommand(token string) bool {
 // slashCommands returns the palette in display order.
 func slashCommands() []slashCommand {
 	return []slashCommand{
+		{Name: "/sessions", Args: "[new|close|<n>]", Desc: "Open session picker, or create/switch/close sessions (Ctrl+S)", Aliases: []string{"/session"}},
+		{Name: "/graph", Args: "[name]", Desc: "Inspect workflow graphs and live/recent DAG runs", Aliases: []string{"/graphs"}},
 		{Name: "/model", Args: "[name]", Desc: "Pick a model, or switch to a named one", Aliases: []string{"/models"}},
 		{Name: "/profile", Args: "[name]", Desc: "Inspect profiles, or switch provider+model", Aliases: []string{"/profiles"}},
 		{Name: "/remember", Args: "<text>", Desc: "Record a preference or decision into memory"},

@@ -16,7 +16,8 @@ export type WSEventType =
 	| 'swarm_message'
 	| 'swarm_lock'
 	| 'approval_request'
-	| 'profile_changed';
+	| 'profile_changed'
+	| 'resume_failed';
 
 // ApprovalPrompt is a sandbox confirmation waiting for a human: the exact
 // command or patch, plus why the policy asked.
@@ -56,8 +57,62 @@ export interface SwarmLockEvent {
 export interface WSEvent<T = unknown> {
 	type: WSEventType;
 	session_id?: string;
+	seq?: number;
 	timestamp: string;
 	payload: T;
+}
+
+export interface GraphNode {
+	id: string;
+	kind: 'agent' | 'tool' | 'join';
+	role?: string;
+	model?: string;
+	tool?: string;
+}
+
+export interface GraphSpec {
+	name: string;
+	description?: string;
+	max_concurrency?: number;
+	budgets?: {
+		max_nodes?: number;
+		max_wall_seconds?: number;
+		max_tokens?: number;
+	};
+	nodes: GraphNode[];
+	edges: string[][];
+}
+
+export interface GraphNodeResult {
+	id: string;
+	role?: string;
+	kind: string;
+	text?: string;
+	tokens?: number;
+	cached_tokens?: number;
+	activations?: number;
+	duration?: number;
+	error?: string;
+}
+
+export interface GraphRunRecord {
+	run_id: string;
+	graph: string;
+	spec?: GraphSpec;
+	status: 'running' | 'waiting' | 'completed' | 'failed';
+	nodes?: GraphNodeResult[];
+	tokens?: number;
+	cached_tokens?: number;
+	cache_hit_ratio?: number;
+	activations?: number;
+	duration?: number;
+	error?: string;
+	updated_at?: string;
+}
+
+export interface GraphsResponse {
+	specs: GraphSpec[];
+	runs: GraphRunRecord[];
 }
 
 export interface SessionInfo {

@@ -122,6 +122,7 @@ type Agent struct {
 	currentTurnID       string // transaction GUID of the in-flight turn
 	compactorTrigger    chan struct{}
 	workerCancel        context.CancelFunc
+	workerWg            sync.WaitGroup
 	dynModel            *dynamicModel
 	modelFactory        *subagent.ModelFactory
 	currentProfileMount string
@@ -972,7 +973,11 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 
 	// Start background compactor loop if configured or for trigger events
-	go agentPtr.startCompactorWorker(workerCtx)
+	agentPtr.workerWg.Add(1)
+	go func() {
+		defer agentPtr.workerWg.Done()
+		agentPtr.startCompactorWorker(workerCtx)
+	}()
 
 	return agentPtr, nil
 }
@@ -1202,6 +1207,7 @@ func (a *Agent) Close() error {
 	if a.workerCancel != nil {
 		a.workerCancel()
 	}
+	a.workerWg.Wait()
 	if a.swarmBus != nil {
 		_ = a.swarmBus.Close()
 	}

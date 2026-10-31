@@ -23,6 +23,7 @@ import (
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/golem"
 	"github.com/user/golem/pkg/importer"
+	"github.com/user/golem/pkg/runtime"
 	"github.com/user/golem/pkg/sandbox"
 	"github.com/user/golem/pkg/server"
 	"github.com/user/golem/pkg/tui"
@@ -43,6 +44,7 @@ type CLIOptions struct {
 	Mouse             bool
 	Theme             string
 	Serve             bool
+	Attach            string
 	WebHost           string
 	WebPort           int
 	WebPortSet        bool
@@ -75,6 +77,7 @@ func parseFlags(args []string) (CLIOptions, error) {
 	themeFlag := fs.String("theme", "", "TUI palette: 'terminal' (default, uses your terminal's own colours) or 'nord' (bundled, adaptive)")
 	serveFlag := fs.Bool("serve", false, "Launch realtime Web UI multiplexer server")
 	webFlag := fs.Bool("web", false, "Launch realtime Web UI multiplexer server (alias for -serve)")
+	attachFlag := fs.String("attach", "", "Attach to a running golem -serve instance by URL (e.g. http://127.0.0.1:8080)")
 	portFlag := fs.Int("port", 8080, "Port for realtime Web UI server (default: 8080)")
 	hostFlag := fs.String("host", "", "Interface to bind the web server to (default 127.0.0.1; use your tailscale IP or 0.0.0.0 to reach it from a phone)")
 	tokenFlag := fs.String("token", "", "Web auth token (default: generated once and stored in config.json)")
@@ -106,6 +109,7 @@ func parseFlags(args []string) (CLIOptions, error) {
 		Mouse:             *mouseFlag,
 		Theme:             *themeFlag,
 		Serve:             *serveFlag || *webFlag,
+		Attach:            *attachFlag,
 		WebHost:           *hostFlag,
 		WebPort:           *portFlag,
 		WebPortSet:        setFlags["port"],
@@ -468,6 +472,43 @@ func main() {
 		return
 	}
 
+	if opts.Attach != "" {
+		token := opts.WebToken
+		if token == "" {
+			token = serverCfg.Token
+		}
+		client, err := runtime.NewAttachClient(runtime.AttachConfig{
+			BaseURL: opts.Attach,
+			Token:   token,
+		})
+		if err != nil {
+			log.Fatalf("Attach client error: %v", err)
+		}
+		defer client.Close()
+
+		sessions, err := client.ListSessions(ctx)
+		if err != nil {
+			log.Fatalf("Failed to attach to %s: %v", opts.Attach, err)
+		}
+		fmt.Printf("\n🔗 Attached to Golem server at %s (%d shared session(s))\n", opts.Attach, len(sessions))
+		activeID := ""
+		for _, s := range sessions {
+			mark := " "
+			if s.IsActive {
+				mark = "*"
+				activeID = s.ID
+			}
+			fmt.Printf("  %s %s — %s (%d turns)\n", mark, s.ID, s.Title, s.TurnCount)
+		}
+		if activeID == "" && len(sessions) > 0 {
+			activeID = sessions[0].ID
+		}
+		if err := client.ConnectWS(ctx, activeID); err != nil {
+			log.Printf("Note: WebSocket stream attach warning: %v", err)
+		}
+		return
+	}
+
 	isTTY := isatty.IsTerminal(os.Stdout.Fd()) && isatty.IsTerminal(os.Stdin.Fd())
 	useTUI := determineUseTUI(isTTY, opts.TUI, opts.NoTUI)
 
@@ -523,7 +564,12 @@ func main() {
 		if captureMouse {
 			programOpts = append(programOpts, tea.WithMouseCellMotion())
 		}
+		sm := runtime.NewSessionManager(cfg, nil)
+		defer sm.Close()
+		sm.AdoptSession("default", "Main Session", agentInstance, cfg)
+
 		model := tui.NewModel(agentInstance, agentInstance.Store(), agentInstance.View())
+		model.SetSessionManager(sm)
 		model.SetMouseEnabled(captureMouse)
 		p := tea.NewProgram(model, programOpts...)
 		if _, err := p.Run(); err != nil {
