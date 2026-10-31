@@ -41,18 +41,20 @@ type EventListener func(Event)
 
 // Store manages the append-only events log and binary summary tree on disk using bbolt.
 type Store struct {
-	dir           string
-	db            *bbolt.DB
-	mu            sync.RWMutex
-	closed        bool
-	events        []Event
-	nodes         map[NodeKey]Node
-	listeners     []EventListener
-	dispatchMu    sync.Mutex
-	dispatchCond  *sync.Cond
-	dispatchQueue []Event
+	dir            string
+	db             *bbolt.DB
+	mu             sync.RWMutex
+	closed         bool
+	events         []Event
+	nodes          map[NodeKey]Node
+	turnIndex      map[string][]int
+	sessionIndex   map[string][]int
+	listeners      []EventListener
+	dispatchMu     sync.Mutex
+	dispatchCond   *sync.Cond
+	dispatchQueue  []Event
 	dispatchClosed bool
-	dispatchWg    sync.WaitGroup
+	dispatchWg     sync.WaitGroup
 }
 
 func encodeUint64(v uint64) []byte {
@@ -111,10 +113,12 @@ func OpenStore(dir string) (*Store, error) {
 	}
 
 	s := &Store{
-		dir:    dir,
-		db:     db,
-		events: make([]Event, 0),
-		nodes:  make(map[NodeKey]Node),
+		dir:          dir,
+		db:           db,
+		events:       make([]Event, 0),
+		nodes:        make(map[NodeKey]Node),
+		turnIndex:    make(map[string][]int),
+		sessionIndex: make(map[string][]int),
 	}
 	s.dispatchCond = sync.NewCond(&s.dispatchMu)
 
@@ -251,6 +255,12 @@ func (s *Store) loadFromDB() error {
 				}
 				if ev.ID >= 0 && ev.ID < len(s.events) {
 					s.events[ev.ID] = ev
+					if ev.TurnID != "" {
+						s.turnIndex[ev.TurnID] = append(s.turnIndex[ev.TurnID], ev.ID)
+					}
+					if ev.SessionID != "" {
+						s.sessionIndex[ev.SessionID] = append(s.sessionIndex[ev.SessionID], ev.ID)
+					}
 				}
 			}
 		}
@@ -340,8 +350,13 @@ func (s *Store) AppendEvent(kind EventKind, text string, opts ...AppendEventOpts
 	}
 
 	ts := time.Now().UTC()
-	if len(opts) > 0 && !opts[0].Timestamp.IsZero() {
-		ts = opts[0].Timestamp.UTC()
+	var sessionID, turnID string
+	if len(opts) > 0 {
+		if !opts[0].Timestamp.IsZero() {
+			ts = opts[0].Timestamp.UTC()
+		}
+		sessionID = opts[0].SessionID
+		turnID = opts[0].TurnID
 	}
 
 	id := len(s.events)
@@ -354,6 +369,8 @@ func (s *Store) AppendEvent(kind EventKind, text string, opts ...AppendEventOpts
 		Text:      text,
 		Timestamp: ts,
 		Size:      size,
+		SessionID: sessionID,
+		TurnID:    turnID,
 	}
 
 	data, err := json.Marshal(ev)
@@ -372,6 +389,12 @@ func (s *Store) AppendEvent(kind EventKind, text string, opts ...AppendEventOpts
 	}
 
 	s.events = append(s.events, ev)
+	if ev.TurnID != "" {
+		s.turnIndex[ev.TurnID] = append(s.turnIndex[ev.TurnID], ev.ID)
+	}
+	if ev.SessionID != "" {
+		s.sessionIndex[ev.SessionID] = append(s.sessionIndex[ev.SessionID], ev.ID)
+	}
 
 	// Enqueue for strictly ordered, non-blocking background listener dispatch
 	s.dispatchMu.Lock()
@@ -626,6 +649,85 @@ func (s *Store) GetNodeByAddress(id, n int) (Node, bool) {
 		return Node{}, false
 	}
 	return s.GetNode(level, index)
+}
+
+// GetAllNodes returns a snapshot of all summary nodes in the store.
+func (s *Store) GetAllNodes() []Node {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed || len(s.nodes) == 0 {
+		return nil
+	}
+	out := make([]Node, 0, len(s.nodes))
+	for _, n := range s.nodes {
+		out = append(out, n)
+	}
+	return out
+}
+
+// GetEventsByTurn returns all events belonging to the given turn/transaction GUID in chronological order.
+func (s *Store) GetEventsByTurn(turnID string) []Event {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed || turnID == "" {
+		return nil
+	}
+	ids := s.turnIndex[turnID]
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]Event, 0, len(ids))
+	for _, id := range ids {
+		if id >= 0 && id < len(s.events) {
+			out = append(out, s.events[id])
+		}
+	}
+	return out
+}
+
+// GetEventsBySession returns all events belonging to the given session GUID in chronological order.
+func (s *Store) GetEventsBySession(sessionID string) []Event {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed || sessionID == "" {
+		return nil
+	}
+	ids := s.sessionIndex[sessionID]
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]Event, 0, len(ids))
+	for _, id := range ids {
+		if id >= 0 && id < len(s.events) {
+			out = append(out, s.events[id])
+		}
+	}
+	return out
+}
+
+// GetEventsByTimeRange returns all events whose Timestamp is within [since, until].
+// Zero values for since or until are treated as unbounded on that side.
+func (s *Store) GetEventsByTimeRange(since, until time.Time) []Event {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed || len(s.events) == 0 {
+		return nil
+	}
+	var out []Event
+	for _, ev := range s.events {
+		if !since.IsZero() && ev.Timestamp.Before(since) {
+			continue
+		}
+		if !until.IsZero() && ev.Timestamp.After(until) {
+			continue
+		}
+		out = append(out, ev)
+	}
+	return out
 }
 
 // Close flushes and closes open bbolt database handle idempotently.

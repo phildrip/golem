@@ -865,3 +865,39 @@ func TestClient_RetriesRequestTimeout(t *testing.T) {
 		t.Errorf("requests = %d, want 2 (408 retried once)", requests)
 	}
 }
+
+func TestClient_ParsesUsageAndCachedTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"cached reply"},"finish_reason":"stop"}],
+			"usage":{
+				"prompt_tokens": 1200,
+				"completion_tokens": 80,
+				"total_tokens": 1280,
+				"prompt_tokens_details": {"cached_tokens": 1024}
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	c := NewClient("m", server.URL, "k", server.Client())
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{{Role: "user", Parts: []*genai.Part{{Text: "hi"}}}},
+	}
+	var got *genai.GenerateContentResponseUsageMetadata
+	for resp, err := range c.GenerateContent(context.Background(), req, false) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp != nil && resp.UsageMetadata != nil {
+			got = resp.UsageMetadata
+		}
+	}
+	if got == nil {
+		t.Fatalf("expected UsageMetadata to be populated")
+	}
+	if got.PromptTokenCount != 1200 || got.CandidatesTokenCount != 80 || got.TotalTokenCount != 1280 || got.CachedContentTokenCount != 1024 {
+		t.Errorf("unexpected UsageMetadata: %+v", got)
+	}
+}

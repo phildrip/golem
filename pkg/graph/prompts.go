@@ -107,12 +107,19 @@ report a self-contained result: the orchestrator sees only your final message.`)
 }
 
 // nodePrompt is the complete system instruction for an agent node.
-func nodePrompt(n Node, memoryContext string) string {
+func nodePrompt(n Node, memoryContext string, routes ...string) string {
 	var sb strings.Builder
 	sb.WriteString(rolePrompt(n.Role, n.Tools))
 	sb.WriteString("\n\n## Your brief\n")
 	sb.WriteString(strings.TrimSpace(n.Instruction))
 	sb.WriteString(outputContract)
+	if len(routes) > 0 {
+		sb.WriteString("\n\n## Routing\n")
+		sb.WriteString("Downstream edges from this node are conditionally routed. ")
+		sb.WriteString("End your final message with a single line in the exact format:\n")
+		sb.WriteString("ROUTE: <label>\n")
+		sb.WriteString("where <label> is one of: " + strings.Join(routes, ", "))
+	}
 	if memoryContext != "" {
 		sb.WriteString(memoryGuidance)
 	}

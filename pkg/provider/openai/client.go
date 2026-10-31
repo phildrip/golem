@@ -201,9 +201,35 @@ type openAIChatChoice struct {
 }
 
 type openAIUsage struct {
-	PromptTokens     int32 `json:"prompt_tokens"`
-	CompletionTokens int32 `json:"completion_tokens"`
-	TotalTokens      int32 `json:"total_tokens"`
+	PromptTokens         int32 `json:"prompt_tokens"`
+	CompletionTokens     int32 `json:"completion_tokens"`
+	TotalTokens          int32 `json:"total_tokens"`
+	PromptCacheHitTokens int32 `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptTokensDetails  *struct {
+		CachedTokens int32 `json:"cached_tokens"`
+	} `json:"prompt_tokens_details,omitempty"`
+}
+
+func toUsageMetadata(u *openAIUsage) *genai.GenerateContentResponseUsageMetadata {
+	if u == nil || (u.TotalTokens <= 0 && u.PromptTokens <= 0 && u.CompletionTokens <= 0) {
+		return nil
+	}
+	total := u.TotalTokens
+	if total <= 0 {
+		total = u.PromptTokens + u.CompletionTokens
+	}
+	var cached int32
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 {
+		cached = u.PromptTokensDetails.CachedTokens
+	} else if u.PromptCacheHitTokens > 0 {
+		cached = u.PromptCacheHitTokens
+	}
+	return &genai.GenerateContentResponseUsageMetadata{
+		PromptTokenCount:        u.PromptTokens,
+		CandidatesTokenCount:    u.CompletionTokens,
+		TotalTokenCount:         total,
+		CachedContentTokenCount: cached,
+	}
 }
 
 type openAIChatResponse struct {
@@ -593,14 +619,7 @@ func (c *Client) handleUnaryResponse(r io.Reader, yield func(*model.LLMResponse,
 		return
 	}
 
-	var usage *genai.GenerateContentResponseUsageMetadata
-	if resp.Usage != nil && resp.Usage.TotalTokens > 0 {
-		usage = &genai.GenerateContentResponseUsageMetadata{
-			PromptTokenCount:     resp.Usage.PromptTokens,
-			CandidatesTokenCount: resp.Usage.CompletionTokens,
-			TotalTokenCount:      resp.Usage.TotalTokens,
-		}
-	}
+	usage := toUsageMetadata(resp.Usage)
 
 	if len(resp.Choices) == 0 {
 		yield(&model.LLMResponse{TurnComplete: true, UsageMetadata: usage}, nil)
@@ -697,12 +716,8 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 			return
 		}
 
-		if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
-			lastUsage = &genai.GenerateContentResponseUsageMetadata{
-				PromptTokenCount:     chunk.Usage.PromptTokens,
-				CandidatesTokenCount: chunk.Usage.CompletionTokens,
-				TotalTokenCount:      chunk.Usage.TotalTokens,
-			}
+		if u := toUsageMetadata(chunk.Usage); u != nil {
+			lastUsage = u
 		}
 
 		if len(chunk.Choices) == 0 {

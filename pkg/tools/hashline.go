@@ -149,9 +149,11 @@ type HashlinePatchArgs struct {
 
 // HashlinePatchResult defines output after applying a patch.
 type HashlinePatchResult struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	Diff    string `json:"diff,omitempty"`
+	Success        bool     `json:"success"`
+	Message        string   `json:"message"`
+	Diff           string   `json:"diff,omitempty"`
+	UpdatedContext string   `json:"updated_context,omitempty" jsonschema:"Hashline-anchored lines around the patched region with updated line:hash anchors"`
+	Diagnostics    []string `json:"diagnostics,omitempty" jsonschema:"Post-edit syntax diagnostics, if any errors were detected"`
 }
 
 // HashlineFindBlockArgs defines input for finding the structural block around an anchor.
@@ -329,7 +331,17 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 			if err := os.WriteFile(safePath, []byte(outputStr), 0644); err != nil {
 				return HashlinePatchResult{}, errors.Wrapf(err, "writing patched file %s", safePath)
 			}
-			return HashlinePatchResult{Success: true, Message: msg}, nil
+			diags := PostEditDiagnostics(filePath, []byte(outputStr))
+			win := RenderHashlineWindow(filePath, newBodyLines, 1, min(len(newBodyLines), 30))
+			if len(diags) > 0 {
+				msg += fmt.Sprintf(" (WARNING: %d syntax error(s) detected: %s)", len(diags), strings.Join(diags, "; "))
+			}
+			return HashlinePatchResult{
+				Success:        true,
+				Message:        msg,
+				UpdatedContext: win,
+				Diagnostics:    diags,
+			}, nil
 		}
 		return HashlinePatchResult{}, errors.Errorf("cannot apply %s on empty file", op)
 	}
@@ -496,9 +508,28 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 		return HashlinePatchResult{}, errors.Wrapf(err, "writing patched file %s", safePath)
 	}
 
+	winStart := startAnchor.LineNum - 3
+	if winStart < 1 {
+		winStart = 1
+	}
+	winEnd := startAnchor.LineNum + len(newBodyLines) + 3
+	if normOp == "INS.POST" || normOp == "INSERT_AFTER" || normOp == "INS.BLK.POST" {
+		winEnd = endAnchor.LineNum + len(newBodyLines) + 3
+	}
+	if winEnd > len(resultLines) {
+		winEnd = len(resultLines)
+	}
+	updatedCtx := RenderHashlineWindow(filePath, resultLines, winStart, winEnd)
+	diags := PostEditDiagnostics(filePath, []byte(outputStr))
+	if len(diags) > 0 {
+		msg += fmt.Sprintf(" (WARNING: %d syntax error(s) detected: %s)", len(diags), strings.Join(diags, "; "))
+	}
+
 	return HashlinePatchResult{
-		Success: true,
-		Message: msg,
+		Success:        true,
+		Message:        msg,
+		UpdatedContext: updatedCtx,
+		Diagnostics:    diags,
 	}, nil
 }
 

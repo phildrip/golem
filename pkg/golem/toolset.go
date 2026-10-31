@@ -29,6 +29,7 @@ type toolSet struct {
 	hashlineRead    tool.Tool
 	hashlineFindBlk tool.Tool
 	hashlinePatch   tool.Tool
+	symbolOutline   tool.Tool
 	webSearch       tool.Tool
 	webFetch        tool.Tool
 }
@@ -70,6 +71,9 @@ func newToolSet(workDir string, policy *sandbox.Policy, webCfg config.WebConfig,
 	}
 	if ts.hashlinePatch, err = tools.NewHashlinePatchTool(workDir, opts...); err != nil {
 		return ts, errors.Wrap(err, "creating hashline_patch tool")
+	}
+	if ts.symbolOutline, err = tools.NewSymbolOutlineTool(workDir, opts...); err != nil {
+		return ts, errors.Wrap(err, "creating symbol_outline tool")
 	}
 	searchProvider := web.NewGoogleCSE(webCfg.APIKey, webCfg.CX, webCfg.BaseURL)
 	if ts.webSearch, err = web.NewWebSearchTool(searchProvider, webOpts...); err != nil {

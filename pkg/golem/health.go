@@ -150,11 +150,11 @@ type eventAppender interface {
 
 // appendMemoryEvent writes one memory event and reports a failure instead of
 // dropping it: a lost tool event means the work never reaches the view.
-func appendMemoryEvent(h *Health, store eventAppender, kind fractal.EventKind, text string) {
+func appendMemoryEvent(h *Health, store eventAppender, kind fractal.EventKind, text string, opts ...fractal.AppendEventOpts) {
 	if store == nil {
 		return
 	}
-	if _, err := store.AppendEvent(kind, text); err != nil {
+	if _, err := store.AppendEvent(kind, text, opts...); err != nil {
 		h.Record("memory", "append "+string(kind), err)
 	}
 }

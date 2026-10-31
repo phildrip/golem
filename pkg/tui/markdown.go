@@ -2,6 +2,7 @@ package tui
 
 import (
 	"reflect"
+	"strings"
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/ansi"
@@ -266,8 +267,16 @@ func markdownStyleConfig(dark bool) ansi.StyleConfig {
 	cfg.Link = ansi.StylePrimitive{Color: colorPtr(p.accent), Underline: boolPtr(true)}
 	cfg.LinkText = ansi.StylePrimitive{Color: colorPtr(p.teal), Bold: boolPtr(true)}
 
-	cfg.Item = ansi.StylePrimitive{Color: colorPtr(p.accent)}
-	cfg.Enumeration = ansi.StylePrimitive{Color: colorPtr(p.accentAlt)}
+	// Preserve BlockPrefix ("• " for Item, ". " for Enumeration) from the base
+	// style so ordered lists render as "1. Text" rather than "1Text".
+	cfg.Item.Color = colorPtr(p.accent)
+	if cfg.Item.BlockPrefix == "" {
+		cfg.Item.BlockPrefix = "• "
+	}
+	cfg.Enumeration.Color = colorPtr(p.accentAlt)
+	if cfg.Enumeration.BlockPrefix == "" {
+		cfg.Enumeration.BlockPrefix = ". "
+	}
 
 	// Inline code: a quiet teal chip rather than glamour's red-on-grey.
 	cfg.Code = ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{
@@ -335,4 +344,32 @@ func newMarkdownRenderer(width int) *glamour.TermRenderer {
 		return nil
 	}
 	return renderer
+}
+
+// closeUnbalancedCodeFence appends a closing ``` fence when streaming text is
+// mid-way through a fenced code block so Glamour renders the live code block
+// instead of treating the fence line as plain text.
+func closeUnbalancedCodeFence(text string) string {
+	var inFence bool
+	var fenceMarker string
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimLeft(line, " \t")
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			marker := trimmed[:3]
+			if !inFence {
+				inFence = true
+				fenceMarker = marker
+			} else if marker == fenceMarker && strings.TrimSpace(trimmed[3:]) == "" {
+				inFence = false
+				fenceMarker = ""
+			}
+		}
+	}
+	if !inFence {
+		return text
+	}
+	if !strings.HasSuffix(text, "\n") {
+		return text + "\n" + fenceMarker
+	}
+	return text + fenceMarker
 }

@@ -138,8 +138,10 @@ type WriteFileArgs struct {
 
 // WriteFileResult defines output after writing a file.
 type WriteFileResult struct {
-	BytesWritten int  `json:"bytes_written" jsonschema:"Number of bytes written"`
-	Success      bool `json:"success" jsonschema:"Whether the write succeeded"`
+	BytesWritten   int      `json:"bytes_written" jsonschema:"Number of bytes written"`
+	Success        bool     `json:"success" jsonschema:"Whether the write succeeded"`
+	UpdatedContext string   `json:"updated_context,omitempty" jsonschema:"Hashline-anchored preview of the written file"`
+	Diagnostics    []string `json:"diagnostics,omitempty" jsonschema:"Post-edit syntax diagnostics, if any errors were detected"`
 }
 
 // WriteFile writes the given content to path, creating or truncating it, ensuring it remains within baseDir.
@@ -164,12 +166,20 @@ func NewWriteFileTool(baseDir string, opts ...Option) (tool.Tool, error) {
 		if err := o.checkWrite(ctx, "write_file", args.FilePath, "write_file "+args.FilePath); err != nil {
 			return WriteFileResult{}, err
 		}
-		if err := WriteFile(o.effectiveBaseDir(baseDir, args.FilePath, false), args.FilePath, args.Content); err != nil {
+		effBase := o.effectiveBaseDir(baseDir, args.FilePath, false)
+		if err := WriteFile(effBase, args.FilePath, args.Content); err != nil {
 			return WriteFileResult{}, errors.Wrap(err, "writing file")
 		}
+		lines := SplitFileLines(args.Content)
+		endLine := len(lines)
+		if endLine > 40 {
+			endLine = 40
+		}
 		return WriteFileResult{
-			BytesWritten: len(args.Content),
-			Success:      true,
+			BytesWritten:   len(args.Content),
+			Success:        true,
+			UpdatedContext: RenderHashlineWindow(args.FilePath, lines, 1, endLine),
+			Diagnostics:    PostEditDiagnostics(args.FilePath, []byte(args.Content)),
 		}, nil
 	})
 	if err != nil {
@@ -187,8 +197,9 @@ type ReplaceRegexArgs struct {
 
 // ReplaceRegexResult defines output after regex replacement.
 type ReplaceRegexResult struct {
-	Matched bool `json:"matched" jsonschema:"Whether any matches were replaced"`
-	Success bool `json:"success" jsonschema:"Whether the operation completed successfully"`
+	Matched     bool     `json:"matched" jsonschema:"Whether any matches were replaced"`
+	Success     bool     `json:"success" jsonschema:"Whether the operation completed successfully"`
+	Diagnostics []string `json:"diagnostics,omitempty" jsonschema:"Post-edit syntax diagnostics, if any errors were detected"`
 }
 
 // ReplaceStringWithRegex replaces all occurrences of pattern in path with replacement, ensuring path is within baseDir.
@@ -232,13 +243,21 @@ func NewReplaceRegexTool(baseDir string, opts ...Option) (tool.Tool, error) {
 			"replace_regex "+args.FilePath+" /"+args.Pattern+"/"); err != nil {
 			return ReplaceRegexResult{}, err
 		}
-		matched, err := ReplaceStringWithRegex(o.effectiveBaseDir(baseDir, args.FilePath, false), args.FilePath, args.Pattern, args.Replacement)
+		effBase := o.effectiveBaseDir(baseDir, args.FilePath, false)
+		matched, err := ReplaceStringWithRegex(effBase, args.FilePath, args.Pattern, args.Replacement)
 		if err != nil {
 			return ReplaceRegexResult{}, errors.Wrap(err, "replacing regex in file")
 		}
+		var diags []string
+		if matched {
+			if safePath, err := resolveSafePath(effBase, args.FilePath); err == nil {
+				diags = CheckFileDiagnosticsOnDisk(args.FilePath, safePath)
+			}
+		}
 		return ReplaceRegexResult{
-			Matched: matched,
-			Success: true,
+			Matched:     matched,
+			Success:     true,
+			Diagnostics: diags,
 		}, nil
 	})
 	if err != nil {

@@ -654,6 +654,102 @@ func TestModel_CtrlCAndCtrlD(t *testing.T) {
 		}
 	})
 
+	t.Run("Ctrl+C keeps the text the turn had already produced", func(t *testing.T) {
+		m := NewModel(nil, store, view)
+		m.isLoading = true
+		m.cancelTurn = func() {}
+		m.streamingReply = "I read the diff and found three things\n"
+		m.entries = append(m.entries, ChatEntry{Type: TypeUser, Content: "look at agy's changes"})
+
+		newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+		res := newM.(Model)
+
+		var reply *ChatEntry
+		for i := range res.entries {
+			if res.entries[i].Type == TypeAgent {
+				reply = &res.entries[i]
+			}
+		}
+		if reply == nil {
+			t.Fatalf("interrupt threw away the streamed reply: %+v", res.entries)
+		}
+		if !strings.Contains(reply.Content, "found three things") {
+			t.Errorf("partial reply = %q, want the text streamed before ^C", reply.Content)
+		}
+		if res.streamingReply != "" {
+			t.Errorf("streamingReply should be folded into the transcript, got %q", res.streamingReply)
+		}
+		last := res.entries[len(res.entries)-1]
+		if last.Type != TypeSystem || !strings.Contains(last.Content, "interrupted") {
+			t.Errorf("expected the interrupt marker last, got %+v", last)
+		}
+	})
+
+	t.Run("Ctrl+C stops cards the turn was still inside", func(t *testing.T) {
+		m := NewModel(nil, store, view)
+		m.isLoading = true
+		m.cancelTurn = func() {}
+		m.entries = append(m.entries,
+			ChatEntry{Type: TypeTool, ToolName: "shell", Command: "sleep 999", IsRunning: true},
+			ChatEntry{Type: TypeSubagent, SubagentRole: "researcher", IsRunning: true},
+		)
+
+		newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+		res := newM.(Model)
+
+		tool, sub := res.entries[0], res.entries[1]
+		if tool.IsRunning {
+			t.Errorf("tool card still spinning after interrupt: %+v", tool)
+		}
+		if tool.ExitCode != ExitCodeUnknown {
+			t.Errorf("tool exit code = %d, want ExitCodeUnknown (never observed)", tool.ExitCode)
+		}
+		if !strings.Contains(RenderToolCard(tool.ToolName, tool.Command, tool.Content, tool.ExitCode, tool.IsRunning, 80), "EXIT ?") {
+			t.Errorf("interrupted tool card should not claim a status")
+		}
+		if sub.IsRunning || !sub.Interrupted {
+			t.Errorf("subagent card = %+v, want stopped and marked interrupted", sub)
+		}
+		if !strings.Contains(RenderSubagentCard(sub.SubagentRole, "m", "p", "", false, sub.Interrupted, 80), "INTERRUPTED") {
+			t.Errorf("interrupted subagent card should say INTERRUPTED")
+		}
+	})
+
+	t.Run("A superseded turn's done message cannot finish the next turn", func(t *testing.T) {
+		m := NewModel(nil, store, view)
+		m.isLoading = true
+		m.turnSeq = 4
+		m.cancelTurn = func() {}
+		newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+		res := newM.(Model)
+
+		// The next turn starts while the interrupted goroutine is still unwinding.
+		res.isLoading = true
+		res.turnSeq = 5
+		res.streamChan = make(<-chan tea.Msg)
+
+		newM2, _ := res.Update(agentDoneMsg{reply: "the turn you cut off", seq: 4})
+		after := newM2.(Model)
+		if !after.isLoading {
+			t.Errorf("a stale done message cleared the running turn")
+		}
+		for _, e := range after.entries {
+			if e.Type == TypeAgent && strings.Contains(e.Content, "cut off") {
+				t.Errorf("stale reply leaked into the transcript: %+v", e)
+			}
+		}
+
+		// The current turn's own message still lands.
+		newM3, _ := after.Update(agentDoneMsg{reply: "the new answer", seq: 5})
+		done := newM3.(Model)
+		if done.isLoading {
+			t.Errorf("current turn's done message was ignored")
+		}
+		if last := done.entries[len(done.entries)-1]; last.Type != TypeAgent || last.Content != "the new answer" {
+			t.Errorf("current reply not appended: %+v", last)
+		}
+	})
+
 	t.Run("Ctrl+C clears non-empty line without quitting", func(t *testing.T) {
 		m := NewModel(nil, store, view)
 		m.textarea.SetValue("partially typed command")

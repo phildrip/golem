@@ -462,7 +462,17 @@ func (v *View) renderParts(parts []ViewPart) string {
 	return sb.String()
 }
 
+// TailTo returns the event index [0, TailTo) currently covered by the summary view.
+func (v *View) TailTo() int {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.tailTo
+}
+
 // LiveHeadEvents returns the recent raw events not covered by the fractal tail.
+// Starting at v.tailTo ensures there is never a gap between <chat> and
+// <recent_live_head>, and keeps the live-head start boundary stable during an
+// in-flight turn while v.Sync() is deferred.
 func (v *View) LiveHeadEvents() []Event {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -471,6 +481,9 @@ func (v *View) LiveHeadEvents() []Event {
 	tailEnd := total - v.cfg.LiveHeadCount
 	if tailEnd < 0 {
 		tailEnd = 0
+	}
+	if v.tailTo > 0 && v.tailTo < tailEnd {
+		tailEnd = v.tailTo
 	}
 	return v.store.EventsSlice(tailEnd, total)
 }

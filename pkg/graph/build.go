@@ -15,6 +15,7 @@ import (
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/workflow"
 	"google.golang.org/genai"
@@ -101,11 +102,15 @@ func (b *Builder) Build(ctx context.Context, spec *Spec) (*workflow.Workflow, *r
 	registry := b.ToolNames()
 
 	for _, n := range spec.Nodes {
+		routes := spec.outgoingRoutes(n.ID)
 		switch n.Kind {
 		case KindAgent:
-			node, err := b.buildAgentNode(ctx, spec, n, budget)
+			node, err := b.buildAgentNode(ctx, spec, n, budget, routes)
 			if err != nil {
 				return nil, nil, errors.Wrapf(err, "node %q", n.ID)
+			}
+			if len(routes) > 0 {
+				node = &routingNode{Node: node, routes: routes}
 			}
 			nodes[n.ID] = node
 		case KindTool:
@@ -120,13 +125,28 @@ func (b *Builder) Build(ctx context.Context, spec *Spec) (*workflow.Workflow, *r
 				node:   n.ID,
 				budget: budget,
 			}
+			var node workflow.Node
 			node, err := workflow.NewNamedToolNode(n.ID, wrapped, workflow.NodeConfig{})
 			if err != nil {
 				return nil, nil, errors.Wrapf(err, "node %q", n.ID)
 			}
+			if len(routes) > 0 {
+				node = &routingNode{Node: node, routes: routes}
+			}
 			nodes[n.ID] = node
 		case KindJoin:
 			nodes[n.ID] = workflow.NewJoinNode(n.ID)
+		}
+	}
+
+	// Count unconditional incoming edges per node so non-JoinNode reconvergence
+	// (from mutually exclusive routed branches) can use workflow.Default instead
+	// of nil Route, satisfying ADK's validateFanIn check while leaving loop-back
+	// routed edges and single-entry START edges untouched.
+	unconditionalIn := make(map[string]int, len(spec.Nodes))
+	for _, e := range spec.Edges {
+		if len(e) == 2 {
+			unconditionalIn[e[1]]++
 		}
 	}
 
@@ -138,7 +158,13 @@ func (b *Builder) Build(ctx context.Context, spec *Spec) (*workflow.Workflow, *r
 		}
 		to := nodes[e[1]]
 		if len(e) == 3 {
-			eb.AddRoute(from, to, workflow.StringRoute(e[2]))
+			if e[2] == "default" || e[2] == "else" {
+				eb.AddRoute(from, to, workflow.Default)
+			} else {
+				eb.AddRoute(from, to, workflow.StringRoute(e[2]))
+			}
+		} else if unconditionalIn[e[1]] > 1 && e[0] != Start && spec.kindOf(e[1]) != KindJoin && len(spec.outgoingRoutes(e[0])) == 0 {
+			eb.AddRoute(from, to, workflow.Default)
 		} else {
 			eb.Add(from, to)
 		}
@@ -172,7 +198,7 @@ func (b *Builder) lookupTool(name string) tool.Tool {
 	return nil
 }
 
-func (b *Builder) buildAgentNode(ctx context.Context, spec *Spec, n Node, budget *runBudget) (workflow.Node, error) {
+func (b *Builder) buildAgentNode(ctx context.Context, spec *Spec, n Node, budget *runBudget, routes []string) (workflow.Node, error) {
 	requested := n.Model
 	if requested == "" {
 		requested = b.cfg.DefaultModel
@@ -198,7 +224,7 @@ func (b *Builder) buildAgentNode(ctx context.Context, spec *Spec, n Node, budget
 	if b.cfg.MemoryContext != nil {
 		memory = b.cfg.MemoryContext()
 	}
-	prompt := nodePrompt(n, memory)
+	prompt := nodePrompt(n, memory, routes...)
 
 	description := firstLine(n.Instruction)
 	if description == "" {
@@ -216,7 +242,9 @@ func (b *Builder) buildAgentNode(ctx context.Context, spec *Spec, n Node, budget
 		},
 		BeforeAgentCallbacks: []agent.BeforeAgentCallback{
 			func(agent.Context) (*genai.Content, error) {
-				budget.startNode(spec.Name, n, resolved)
+				if err := budget.startNode(spec.Name, n, resolved); err != nil {
+					return nil, err
+				}
 				return nil, nil
 			},
 		},
@@ -259,9 +287,8 @@ func firstLine(s string) string {
 	return ""
 }
 
-// fixedArgsTool runs a tool node with the arguments the spec pins, ignoring the
-// upstream value: a tool node is a deterministic step ("read this file"), not a
-// function of its predecessor.
+// fixedArgsTool runs a tool node with the arguments the spec pins, interpolating
+// any {{input}} or {{<predecessor>}} placeholders from the upstream node's output.
 type fixedArgsTool struct {
 	tool.Tool
 	args   map[string]any
@@ -270,8 +297,10 @@ type fixedArgsTool struct {
 	budget *runBudget
 }
 
-func (f fixedArgsTool) Run(ctx agent.Context, _ any) (map[string]any, error) {
-	f.budget.startTool(f.graph, f.node)
+func (f fixedArgsTool) Run(ctx agent.Context, input any) (map[string]any, error) {
+	if err := f.budget.startTool(f.graph, f.node); err != nil {
+		return nil, err
+	}
 	runnable, ok := f.Tool.(interface {
 		Run(agent.Context, any) (map[string]any, error)
 	})
@@ -280,17 +309,202 @@ func (f fixedArgsTool) Run(ctx agent.Context, _ any) (map[string]any, error) {
 		f.budget.finishTool(f.graph, f.node, err)
 		return nil, err
 	}
-	out, err := runnable.Run(ctx, f.args)
+	resolvedArgs := interpolateToolArgs(f.args, input)
+	out, err := runnable.Run(ctx, resolvedArgs)
 	f.budget.finishTool(f.graph, f.node, err)
 	return out, err
+}
+
+// interpolateToolArgs clones args and replaces {{input}} and {{<key>}}
+// placeholders in string values with values from the upstream node output.
+func interpolateToolArgs(args map[string]any, input any) map[string]any {
+	if len(args) == 0 {
+		return args
+	}
+	inputStr, inputMap := extractInputValues(input)
+	out := make(map[string]any, len(args))
+	for k, v := range args {
+		out[k] = interpolateValue(v, inputStr, inputMap)
+	}
+	return out
+}
+
+func extractInputValues(input any) (string, map[string]string) {
+	if input == nil {
+		return "", nil
+	}
+	switch v := input.(type) {
+	case string:
+		return v, nil
+	case map[string]any:
+		m := make(map[string]string, len(v))
+		for k, val := range v {
+			if s, ok := val.(string); ok {
+				m[k] = s
+			} else {
+				m[k] = fmt.Sprint(val)
+			}
+		}
+		for _, primaryKey := range []string{"output", "result", "content", "text"} {
+			if s, ok := m[primaryKey]; ok && s != "" {
+				return s, m
+			}
+		}
+		var parts []string
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			parts = append(parts, m[k])
+		}
+		return strings.Join(parts, "\n"), m
+	default:
+		return fmt.Sprint(v), nil
+	}
+}
+
+func interpolateValue(v any, inputStr string, inputMap map[string]string) any {
+	switch val := v.(type) {
+	case string:
+		if !strings.Contains(val, "{{") {
+			return val
+		}
+		res := strings.ReplaceAll(val, "{{input}}", inputStr)
+		for k, mv := range inputMap {
+			res = strings.ReplaceAll(res, "{{"+k+"}}", mv)
+			res = strings.ReplaceAll(res, "{{input."+k+"}}", mv)
+			res = strings.ReplaceAll(res, "{{nodes."+k+".output}}", mv)
+		}
+		return res
+	case map[string]any:
+		m := make(map[string]any, len(val))
+		for k, child := range val {
+			m[k] = interpolateValue(child, inputStr, inputMap)
+		}
+		return m
+	case []any:
+		s := make([]any, len(val))
+		for i, child := range val {
+			s[i] = interpolateValue(child, inputStr, inputMap)
+		}
+		return s
+	default:
+		return v
+	}
+}
+
+// routingNode wraps an AgentNode or ToolNode that has outgoing routed edges
+// and stamps Event.Routes on its final output event so the ADK workflow
+// scheduler dispatches matching conditional edges.
+type routingNode struct {
+	workflow.Node
+	routes []string
+}
+
+func (r *routingNode) Run(ctx agent.Context, input any) iter.Seq2[*session.Event, error] {
+	return func(yield func(*session.Event, error) bool) {
+		for ev, err := range r.Node.Run(ctx, input) {
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			if ev != nil && !ev.LLMResponse.Partial && ev.Routes == nil && (ev.Output != nil || ev.Content != nil) {
+				if matched := matchNodeRoutes(ev, r.routes); len(matched) > 0 {
+					ev.Routes = matched
+				}
+			}
+			if !yield(ev, nil) {
+				return
+			}
+		}
+	}
+}
+
+// matchNodeRoutes extracts route label(s) from a node's event output or text
+// and matches them case-insensitively against the node's declared outgoing routes.
+func matchNodeRoutes(ev *session.Event, allowed []string) []string {
+	if len(allowed) == 0 || ev == nil {
+		return nil
+	}
+	canon := func(candidate string) (string, bool) {
+		c := strings.Trim(strings.TrimSpace(candidate), "`*\"'.,;:()[]{}")
+		if c == "" {
+			return "", false
+		}
+		for _, a := range allowed {
+			if strings.EqualFold(c, a) {
+				return a, true
+			}
+		}
+		return "", false
+	}
+
+	// 1. Check structured map output (e.g. from a tool node: {"route": "pass"}).
+	if m, ok := ev.Output.(map[string]any); ok {
+		for _, key := range []string{"route", "status", "result", "output"} {
+			if v, ok := m[key].(string); ok {
+				if matched, ok := canon(v); ok {
+					return []string{matched}
+				}
+			}
+		}
+	}
+
+	// 2. Collect text from Content.Parts and/or string Output.
+	var text strings.Builder
+	if ev.Content != nil {
+		for _, p := range ev.Content.Parts {
+			if p != nil && p.Text != "" && !p.Thought {
+				text.WriteString(p.Text)
+			}
+		}
+	}
+	if text.Len() == 0 {
+		if s, ok := ev.Output.(string); ok {
+			text.WriteString(s)
+		}
+	}
+	raw := strings.TrimSpace(text.String())
+	if raw != "" {
+		// Scan lines bottom-up for "ROUTE: <label>"
+		lines := strings.Split(raw, "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			line := strings.Trim(strings.TrimSpace(lines[i]), "`*_#>- ")
+			upper := strings.ToUpper(line)
+			if strings.HasPrefix(upper, "ROUTE:") {
+				val := strings.TrimSpace(line[len("ROUTE:"):])
+				if matched, ok := canon(val); ok {
+					return []string{matched}
+				}
+			}
+		}
+		// Or the entire trimmed output is the route token itself.
+		if matched, ok := canon(raw); ok {
+			return []string{matched}
+		}
+	}
+
+	// 3. Fallback to "default" or "else" route if declared on an outgoing edge.
+	for _, fallback := range []string{"default", "else"} {
+		if matched, ok := canon(fallback); ok {
+			return []string{matched}
+		}
+	}
+	return nil
 }
 
 // runBudget enforces the spec's ceilings and reports progress. One budget is
 // shared by every node in a run, so a fan-out cannot multiply the ceiling.
 type runBudget struct {
-	spec  *Spec
-	limit int64
-	spent atomic.Int64
+	spec         *Spec
+	limit        int64
+	maxNodes     int
+	spent        atomic.Int64
+	cached       atomic.Int64
+	promptTokens atomic.Int64
+	activations  atomic.Int64
 
 	onEvent func(Event)
 
@@ -298,25 +512,55 @@ type runBudget struct {
 	// transport rendering them should not have to be goroutine-safe itself.
 	emitMu sync.Mutex
 
-	mu        sync.Mutex
-	started   map[string]time.Time
-	finished  map[string]bool
-	nodeSpent map[string]int64
-	deadline  time.Time
+	mu              sync.Mutex
+	started         map[string]time.Time
+	finished        map[string]bool
+	nodeElapsed     map[string]time.Duration
+	nodeSpent       map[string]int64
+	nodeCached      map[string]int64
+	nodeActivations map[string]int
+	deadline        time.Time
 }
 
 func newRunBudget(spec *Spec, onEvent func(Event)) *runBudget {
+	var limit int64
+	var maxNodes int
+	if spec != nil && spec.Budgets != nil {
+		limit = int64(spec.Budgets.MaxTokens)
+		maxNodes = spec.Budgets.MaxNodes
+	}
 	return &runBudget{
-		spec:      spec,
-		limit:     int64(spec.Budgets.MaxTokens),
-		onEvent:   onEvent,
-		started:   map[string]time.Time{},
-		finished:  map[string]bool{},
-		nodeSpent: map[string]int64{},
+		spec:            spec,
+		limit:           limit,
+		maxNodes:        maxNodes,
+		onEvent:         onEvent,
+		started:         map[string]time.Time{},
+		finished:        map[string]bool{},
+		nodeElapsed:     map[string]time.Duration{},
+		nodeSpent:       map[string]int64{},
+		nodeCached:      map[string]int64{},
+		nodeActivations: map[string]int{},
 	}
 }
 
-func (b *runBudget) Tokens() int64 { return b.spent.Load() }
+func (b *runBudget) Tokens() int64       { return b.spent.Load() }
+func (b *runBudget) CachedTokens() int64 { return b.cached.Load() }
+func (b *runBudget) Activations() int    { return int(b.activations.Load()) }
+
+func (b *runBudget) CacheHitRatio() float64 {
+	c := b.cached.Load()
+	if c <= 0 {
+		return 0
+	}
+	denom := b.promptTokens.Load()
+	if denom < c {
+		denom = b.spent.Load()
+	}
+	if denom <= 0 {
+		return 0
+	}
+	return float64(c) / float64(denom)
+}
 
 func (b *runBudget) add(node string, n int) {
 	b.spent.Add(int64(n))
@@ -328,11 +572,38 @@ func (b *runBudget) add(node string, n int) {
 	b.mu.Unlock()
 }
 
+func (b *runBudget) addCached(node string, cached, prompt int) {
+	if cached > 0 {
+		b.cached.Add(int64(cached))
+	}
+	if prompt > 0 {
+		b.promptTokens.Add(int64(prompt))
+	}
+	if node == "" || cached <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.nodeCached[node] += int64(cached)
+	b.mu.Unlock()
+}
+
 // nodeTokens reports what one node spent, for the per-node digest.
 func (b *runBudget) nodeTokens(node string) int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.nodeSpent[node]
+}
+
+func (b *runBudget) nodeCachedTokens(node string) int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.nodeCached[node]
+}
+
+func (b *runBudget) nodeActivationCount(node string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.nodeActivations[node]
 }
 
 // setDeadline arms the wall-clock ceiling. The engine has no per-run deadline
@@ -358,29 +629,49 @@ func (b *runBudget) emit(ev Event) {
 	b.onEvent(ev)
 }
 
-func (b *runBudget) startNode(graph string, n Node, model string) {
+func (b *runBudget) startNode(graph string, n Node, model string) error {
+	total := int(b.activations.Add(1))
 	b.mu.Lock()
 	b.started[n.ID] = time.Now()
+	b.finished[n.ID] = false
+	b.nodeActivations[n.ID]++
 	b.mu.Unlock()
+	if b.maxNodes > 0 && total > b.maxNodes {
+		return fmt.Errorf("graph node activation budget exhausted (%d of %d node runs used) at node %q", total, b.maxNodes, n.ID)
+	}
 	b.emit(Event{Graph: graph, Node: n.ID, Role: n.Role, Model: model, Kind: EventStart, Prompt: firstLine(n.Instruction)})
+	return nil
 }
 
 func (b *runBudget) finishNode(graph string, n Node, model string) {
 	b.mu.Lock()
+	if t, ok := b.started[n.ID]; ok && !b.finished[n.ID] {
+		b.nodeElapsed[n.ID] += time.Since(t)
+	}
 	b.finished[n.ID] = true
 	b.mu.Unlock()
 	b.emit(Event{Graph: graph, Node: n.ID, Role: n.Role, Model: model, Kind: EventDone, Duration: b.elapsed(n.ID)})
 }
 
-func (b *runBudget) startTool(graph, node string) {
+func (b *runBudget) startTool(graph, node string) error {
+	total := int(b.activations.Add(1))
 	b.mu.Lock()
 	b.started[node] = time.Now()
+	b.finished[node] = false
+	b.nodeActivations[node]++
 	b.mu.Unlock()
+	if b.maxNodes > 0 && total > b.maxNodes {
+		return fmt.Errorf("graph node activation budget exhausted (%d of %d node runs used) at node %q", total, b.maxNodes, node)
+	}
 	b.emit(Event{Graph: graph, Node: node, Kind: EventStart})
+	return nil
 }
 
 func (b *runBudget) finishTool(graph, node string, err error) {
 	b.mu.Lock()
+	if t, ok := b.started[node]; ok && !b.finished[node] {
+		b.nodeElapsed[node] += time.Since(t)
+	}
 	b.finished[node] = true
 	b.mu.Unlock()
 	kind := EventDone
@@ -411,11 +702,11 @@ func (b *runBudget) inFlight() []string {
 func (b *runBudget) elapsed(node string) time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	t, ok := b.started[node]
-	if !ok {
-		return 0
+	dur := b.nodeElapsed[node]
+	if t, ok := b.started[node]; ok && !b.finished[node] {
+		dur += time.Since(t)
 	}
-	return time.Since(t)
+	return dur
 }
 
 // budgetModel stops a run at the token ceiling instead of at the provider's
@@ -441,12 +732,46 @@ func (m *budgetModel) GenerateContent(ctx context.Context, req *model.LLMRequest
 			return
 		}
 		var accounted int
+		var accountedCached int
+		var accountedPrompt int
+		var respBytes int
 		for resp, err := range m.inner.GenerateContent(ctx, req, stream) {
-			if resp != nil && resp.UsageMetadata != nil {
-				total := int(resp.UsageMetadata.TotalTokenCount)
-				if total > accounted {
-					m.budget.add(m.node, total-accounted)
-					accounted = total
+			if resp != nil {
+				if resp.UsageMetadata != nil {
+					total := int(resp.UsageMetadata.TotalTokenCount)
+					if total > accounted {
+						m.budget.add(m.node, total-accounted)
+						accounted = total
+					}
+					cached := int(resp.UsageMetadata.CachedContentTokenCount)
+					prompt := int(resp.UsageMetadata.PromptTokenCount)
+					if cached > accountedCached || prompt > accountedPrompt {
+						dc := cached - accountedCached
+						if dc < 0 {
+							dc = 0
+						}
+						dp := prompt - accountedPrompt
+						if dp < 0 {
+							dp = 0
+						}
+						m.budget.addCached(m.node, dc, dp)
+						if cached > accountedCached {
+							accountedCached = cached
+						}
+						if prompt > accountedPrompt {
+							accountedPrompt = prompt
+						}
+					}
+				}
+				if !resp.Partial && resp.Content != nil {
+					for _, p := range resp.Content.Parts {
+						if p != nil {
+							respBytes += len(p.Text)
+							if p.FunctionCall != nil {
+								respBytes += len(p.FunctionCall.Name) + 32
+							}
+						}
+					}
 				}
 			}
 			if !yield(resp, err) {
@@ -461,5 +786,46 @@ func (m *budgetModel) GenerateContent(ctx context.Context, req *model.LLMRequest
 				return
 			}
 		}
+		if accounted == 0 {
+			m.budget.add(m.node, estimateCallTokens(req, respBytes))
+		}
 	}
+}
+
+// estimateCallTokens approximates token usage (~4 bytes/token) when a provider
+// omits UsageMetadata on the response, so node digests and max_tokens ceilings
+// remain functional (golem-4uu).
+func estimateCallTokens(req *model.LLMRequest, respBytes int) int {
+	reqBytes := 0
+	if req != nil {
+		if req.Config != nil && req.Config.SystemInstruction != nil {
+			for _, p := range req.Config.SystemInstruction.Parts {
+				if p != nil {
+					reqBytes += len(p.Text)
+				}
+			}
+		}
+		for _, c := range req.Contents {
+			if c == nil {
+				continue
+			}
+			for _, p := range c.Parts {
+				if p == nil {
+					continue
+				}
+				reqBytes += len(p.Text)
+				if p.FunctionCall != nil {
+					reqBytes += len(p.FunctionCall.Name) + 32
+				}
+				if p.FunctionResponse != nil {
+					reqBytes += len(p.FunctionResponse.Name) + 64
+				}
+			}
+		}
+	}
+	totalBytes := reqBytes + respBytes
+	if totalBytes <= 0 {
+		return 1
+	}
+	return (totalBytes + 3) / 4
 }

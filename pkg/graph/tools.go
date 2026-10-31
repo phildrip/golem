@@ -335,8 +335,13 @@ func renderResult(res *Result) string {
 			"or answer=... for a question. The run keeps everything it has already finished: "+
 			"only the parked node and the nodes after it run again.\n\n", res.RunID)
 	}
-	fmt.Fprintf(&sb, "<graph_result name=%q nodes=%d tokens=%d duration=%s>\n",
-		res.Graph, len(res.Nodes), res.Tokens, res.Duration.Round(time.Millisecond))
+	if res.CachedTokens > 0 {
+		fmt.Fprintf(&sb, "<graph_result name=%q nodes=%d tokens=%d cached_tokens=%d duration=%s>\n",
+			res.Graph, len(res.Nodes), res.Tokens, res.CachedTokens, res.Duration.Round(time.Millisecond))
+	} else {
+		fmt.Fprintf(&sb, "<graph_result name=%q nodes=%d tokens=%d duration=%s>\n",
+			res.Graph, len(res.Nodes), res.Tokens, res.Duration.Round(time.Millisecond))
+	}
 	sb.WriteString(res.Output)
 	if sb.Len() > 0 && !strings.HasSuffix(res.Output, "\n") {
 		sb.WriteString("\n")
@@ -351,6 +356,9 @@ func renderResult(res *Result) string {
 		kind := n.Kind
 		if n.Role != "" {
 			kind = n.Role
+		}
+		if n.Activations > 1 {
+			kind = fmt.Sprintf("%s(x%d)", kind, n.Activations)
 		}
 		preview := firstLine(n.Text)
 		if preview == "" {

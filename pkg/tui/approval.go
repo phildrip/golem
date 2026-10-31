@@ -79,11 +79,11 @@ func (m Model) answerApproval(approved bool) (tea.Model, tea.Cmd) {
 		m.setStatus("Approval not delivered: the turn is no longer running")
 		return m, nil
 	}
-	return m, m.resumeAgentTurnCmd(ctx, req.CallID, approved)
+	return m, m.resumeAgentTurnCmd(ctx, req.CallID, approved, m.turnSeq)
 }
 
 // resumeAgentTurnCmd continues a paused turn with the user's answer.
-func (m *Model) resumeAgentTurnCmd(ctx context.Context, callID string, approved bool) tea.Cmd {
+func (m *Model) resumeAgentTurnCmd(ctx context.Context, callID string, approved bool, seq int) tea.Cmd {
 	msgChan := make(chan tea.Msg, 2048)
 	m.streamChan = msgChan
 	bridge := &tuiStreamBridge{ctx: ctx, msgChan: msgChan}
@@ -96,6 +96,7 @@ func (m *Model) resumeAgentTurnCmd(ctx context.Context, callID string, approved 
 				case <-ctx.Done():
 				case msgChan <- agentDoneMsg{
 					err: fmt.Errorf("agent internal error: %v", r),
+					seq: seq,
 				}:
 				}
 			}
@@ -103,7 +104,7 @@ func (m *Model) resumeAgentTurnCmd(ctx context.Context, callID string, approved 
 		reply, err := m.agent.RespondToApproval(ctx, callID, approved, bridge)
 		select {
 		case <-ctx.Done():
-		case msgChan <- agentDoneMsg{reply: reply, err: err}:
+		case msgChan <- agentDoneMsg{reply: reply, err: err, seq: seq}:
 		}
 	}()
 

@@ -162,3 +162,33 @@ func TestNewMarkdownRenderer_ClampsWidth(t *testing.T) {
 		}
 	}
 }
+
+// TestMarkdownStyleConfig_PreservesListPrefixes guards against overwriting
+// Item.BlockPrefix ("• ") and Enumeration.BlockPrefix (". "), which caused
+// ordered lists to render as "1Commit" instead of "1. Commit".
+func TestMarkdownStyleConfig_PreservesListPrefixes(t *testing.T) {
+	out := RenderMarkdown(72, "1. Commit this?\n2. Should the log keep the partial reply?\n\n- Alpha\n- Beta\n")
+	if strings.Contains(out, "1Commit") || strings.Contains(out, "2Should") {
+		t.Fatalf("ordered list lost Enumeration.BlockPrefix ('. '):\n%s", out)
+	}
+	if !strings.Contains(out, ". ") {
+		t.Fatalf("expected '. ' enumeration separator in rendered output:\n%s", out)
+	}
+	if !strings.Contains(out, "• ") {
+		t.Fatalf("expected '• ' bullet prefix in rendered output:\n%s", out)
+	}
+}
+
+func TestCloseUnbalancedCodeFence(t *testing.T) {
+	unclosed := "Here is code:\n```go\nfunc main() {"
+	got := closeUnbalancedCodeFence(unclosed)
+	if !strings.HasSuffix(got, "\n```") {
+		t.Fatalf("expected unclosed fence to be closed, got %q", got)
+	}
+
+	closed := "Here is code:\n```go\nfunc main() {}\n```\nDone."
+	if got := closeUnbalancedCodeFence(closed); got != closed {
+		t.Fatalf("already-closed fence should be untouched, got %q", got)
+	}
+}
+

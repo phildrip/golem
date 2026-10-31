@@ -75,6 +75,16 @@ type ChatEntry struct {
 	SubagentRole   string
 	SubagentModel  string
 	SubagentPrompt string
+	// Interrupted marks a card whose turn was cut off before its tool or
+	// subagent reported back, so it stops spinning and says why.
+	Interrupted bool
+
+	// cachedRender memoizes glamour output for completed TypeAgent entries at a
+	// specific width and theme so streaming chunks do not re-parse all prior
+	// agent turns on every token.
+	cachedRender      string
+	cachedRenderWidth int
+	cachedRenderTheme string
 }
 
 // Custom Bubbletea Messages
@@ -118,6 +128,10 @@ type streamMsg struct {
 type agentDoneMsg struct {
 	reply string
 	err   error
+	// seq is the turn that produced this message. A turn cut short by ^C is
+	// superseded by the next one, and its in-flight done-message must not
+	// finish the turn that replaced it.
+	seq int
 }
 
 type memoryStatsMsg struct {
@@ -175,8 +189,11 @@ type Model struct {
 	statusMessageAt   time.Time
 	cancelTurn        context.CancelFunc
 	streamChan        <-chan tea.Msg
-	isBlurred         bool
-	expandTools       bool
+	// turnSeq numbers turns. Every stream message is stamped with the turn it
+	// came from; interrupting bumps it so late frames are recognised as stale.
+	turnSeq     int
+	isBlurred   bool
+	expandTools bool
 
 	// mouseEnabled tracks whether the terminal has been asked to send mouse
 	// events to Golem. Ctrl+G toggles it so tmux/terminal scrolling and native
@@ -718,18 +735,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC:
 			// 1. If LLM turn is running: interrupt it
 			if m.isLoading {
-				if m.cancelTurn != nil {
-					m.cancelTurn()
-					m.cancelTurn = nil
-				}
-				m.isLoading = false
-				m.streamingReply = ""
-				m.entries = append(m.entries, ChatEntry{
-					Type:    TypeSystem,
-					Content: "^C (turn interrupted)",
-				})
-				m.renderConversationToViewport()
-				m.viewport.GotoBottom()
+				m.interruptTurn()
 				return m, nil
 			}
 
@@ -874,8 +880,10 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			m.cancelTurn = cancel
+			m.turnSeq++
+			seq := m.turnSeq
 
-			turnCmd := m.runAgentTurnCmd(ctx, message, images)
+			turnCmd := m.runAgentTurnCmd(ctx, message, images, seq)
 
 			return m, tea.Batch(
 				turnCmd,
@@ -961,6 +969,11 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderAndFollow()
 
 	case agentDoneMsg:
+		if msg.seq != 0 && msg.seq != m.turnSeq {
+			// A turn that was interrupted and replaced is reporting in: its
+			// reply belongs to the turn the user cut off, not this one.
+			return m, nil
+		}
 		if awaitingApproval(msg.err) {
 			// The turn is paused on a sandbox confirmation, not finished: the
 			// prompt is already open and answering it resumes this same turn.
@@ -1261,8 +1274,13 @@ func (m *Model) renderConversationToViewport() {
 		case TypeAgent:
 			sb.WriteString(AgentBadgeStyle.Render("GOLEM") + "\n")
 			if m.renderer != nil {
-				rendered, err := m.renderer.Render(entry.Content)
-				if err == nil {
+				theme := CurrentTheme()
+				if entry.cachedRender != "" && entry.cachedRenderWidth == m.width && entry.cachedRenderTheme == theme {
+					sb.WriteString(entry.cachedRender)
+				} else if rendered, err := m.renderer.Render(entry.Content); err == nil {
+					m.entries[i].cachedRender = rendered
+					m.entries[i].cachedRenderWidth = m.width
+					m.entries[i].cachedRenderTheme = theme
 					sb.WriteString(rendered)
 				} else {
 					sb.WriteString(entry.Content + "\n")
@@ -1290,7 +1308,7 @@ func (m *Model) renderConversationToViewport() {
 			}
 
 		case TypeSubagent:
-			card := RenderSubagentCard(entry.SubagentRole, entry.SubagentModel, entry.SubagentPrompt, entry.Content, entry.IsRunning, m.viewport.Width)
+			card := RenderSubagentCard(entry.SubagentRole, entry.SubagentModel, entry.SubagentPrompt, entry.Content, entry.IsRunning, entry.Interrupted, m.viewport.Width)
 			sb.WriteString(card + "\n")
 
 		case TypeSystem:
@@ -1298,10 +1316,21 @@ func (m *Model) renderConversationToViewport() {
 		}
 	}
 
-	// If streaming reply is currently active
+	// If streaming reply is currently active, render it live through the
+	// markdown renderer (closing any unbalanced code fence on a scratch copy so
+	// in-flight code blocks highlight cleanly as tokens arrive).
 	if len(m.streamingReply) > 0 {
 		sb.WriteString(AgentBadgeStyle.Render("GOLEM") + " " + m.spinner.View() + "\n")
-		sb.WriteString(m.streamingReply + "\n")
+		if m.renderer != nil {
+			liveMD := closeUnbalancedCodeFence(m.streamingReply)
+			if rendered, err := m.renderer.Render(liveMD); err == nil {
+				sb.WriteString(rendered)
+			} else {
+				sb.WriteString(m.streamingReply + "\n")
+			}
+		} else {
+			sb.WriteString(m.streamingReply + "\n")
+		}
 	}
 
 	m.viewport.SetContent(sb.String())
@@ -1573,6 +1602,49 @@ func (b *tuiStreamBridge) OnSubagentDone(role, model, result string, duration ti
 	})
 }
 
+// interruptTurn stops the running turn while keeping what it already produced.
+// The streamed text is folded into the transcript as an ordinary reply, because
+// a turn that was worth reading before ^C is still worth reading after it. Any
+// card still spinning is marked as cut off (a cancelled turn never receives the
+// toolDoneMsg/subagentDoneMsg of the call it was inside), and the turn number
+// moves on so a done-message still in flight cannot finish the next turn.
+func (m *Model) interruptTurn() {
+	if m.cancelTurn != nil {
+		m.cancelTurn()
+		m.cancelTurn = nil
+	}
+	m.isLoading = false
+	m.streamChan = nil
+	m.turnCtx = nil
+	m.turnSeq++
+	m.pendingApproval = nil
+	m.showApprovalModal = false
+
+	if partial := strings.TrimRight(m.streamingReply, "\n"); strings.TrimSpace(partial) != "" {
+		m.entries = append(m.entries, ChatEntry{Type: TypeAgent, Content: partial})
+	}
+	m.streamingReply = ""
+
+	for i := range m.entries {
+		e := &m.entries[i]
+		if !e.IsRunning {
+			continue
+		}
+		e.IsRunning = false
+		e.Interrupted = true
+		if e.Type == TypeTool {
+			e.ExitCode = ExitCodeUnknown
+		}
+	}
+
+	m.entries = append(m.entries, ChatEntry{
+		Type:    TypeSystem,
+		Content: "^C (turn interrupted)",
+	})
+	m.renderConversationToViewport()
+	m.viewport.GotoBottom()
+}
+
 // listenStreamCmd continuously reads from the stream message channel and returns streamMsg.
 func listenStreamCmd(msgChan <-chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
@@ -1585,7 +1657,7 @@ func listenStreamCmd(msgChan <-chan tea.Msg) tea.Cmd {
 }
 
 // runAgentTurnCmd launches an agent turn in a background goroutine with streaming.
-func (m *Model) runAgentTurnCmd(ctx context.Context, input string, images []golem.ImageInput) tea.Cmd {
+func (m *Model) runAgentTurnCmd(ctx context.Context, input string, images []golem.ImageInput, seq int) tea.Cmd {
 	msgChan := make(chan tea.Msg, 2048)
 	m.streamChan = msgChan
 	m.turnCtx = ctx
@@ -1603,6 +1675,7 @@ func (m *Model) runAgentTurnCmd(ctx context.Context, input string, images []gole
 				case <-ctx.Done():
 				case msgChan <- agentDoneMsg{
 					err: fmt.Errorf("agent internal error: %v", r),
+					seq: seq,
 				}:
 				}
 			}
@@ -1614,6 +1687,7 @@ func (m *Model) runAgentTurnCmd(ctx context.Context, input string, images []gole
 		case msgChan <- agentDoneMsg{
 			reply: reply,
 			err:   err,
+			seq:   seq,
 		}:
 		}
 	}()
@@ -2241,9 +2315,9 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			ctx := context.Background()
 			n, err := m.agent.Compactor().Pump(ctx)
 			if err != nil {
-				return agentDoneMsg{reply: fmt.Sprintf("Compaction error: %v", err)}
+				return agentDoneMsg{reply: fmt.Sprintf("Compaction error: %v", err), seq: m.turnSeq}
 			}
-			return agentDoneMsg{reply: fmt.Sprintf("Compaction pass complete: %d nodes built/merged.", n)}
+			return agentDoneMsg{reply: fmt.Sprintf("Compaction pass complete: %d nodes built/merged.", n), seq: m.turnSeq}
 		}
 
 	case "/clear":
@@ -2339,6 +2413,69 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		return m, nil
 
+	case "/diff":
+		ref := ""
+		if len(parts) > 1 {
+			ref = parts[1]
+		}
+		var text string
+		if m.agent == nil || m.agent.Checkpoints() == nil {
+			text = "No workspace checkpoint manager available."
+		} else {
+			diff, snap, err := m.agent.Checkpoints().Diff(ref)
+			if err != nil {
+				text = fmt.Sprintf("Diff error: %v", err)
+			} else if diff == "" {
+				text = fmt.Sprintf("No workspace changes since checkpoint %s (%s).", snap.ID, snap.Label)
+			} else {
+				text = fmt.Sprintf("Workspace diff since %s (%s):\n%s", snap.ID, snap.Label, diff)
+			}
+		}
+		m.entries = append(m.entries, ChatEntry{
+			Type:    TypeSystem,
+			Content: text,
+		})
+		m.renderConversationToViewport()
+		m.viewport.GotoBottom()
+		return m, nil
+
+	case "/undo", "/rewind":
+		ref := ""
+		if len(parts) > 1 {
+			ref = parts[1]
+		}
+		var text string
+		if m.agent == nil || m.agent.Checkpoints() == nil {
+			text = "No workspace checkpoint manager available."
+		} else if strings.EqualFold(ref, "list") || strings.EqualFold(ref, "ls") {
+			snaps := m.agent.Checkpoints().List()
+			if len(snaps) == 0 {
+				text = "No workspace checkpoints recorded yet."
+			} else {
+				var lines []string
+				lines = append(lines, "Workspace Checkpoints (newest first):")
+				for _, s := range snaps {
+					lines = append(lines, fmt.Sprintf("  %s • %s (%s)", s.ID, s.Label, s.CreatedAt.Format(time.RFC3339)))
+				}
+				text = strings.Join(lines, "\n")
+			}
+		} else {
+			snap, err := m.agent.Checkpoints().Restore(ref)
+			if err != nil {
+				text = fmt.Sprintf("Undo error: %v", err)
+			} else {
+				text = fmt.Sprintf("Restored workspace to checkpoint %s (%s).", snap.ID, snap.Label)
+				m.setStatus("Restored checkpoint " + snap.ID)
+			}
+		}
+		m.entries = append(m.entries, ChatEntry{
+			Type:    TypeSystem,
+			Content: text,
+		})
+		m.renderConversationToViewport()
+		m.viewport.GotoBottom()
+		return m, nil
+
 	case "/shortcuts", "/keys":
 		m.textarea.Blur()
 		m.showShortcutsModal = true
@@ -2354,6 +2491,8 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 /tree, /memory  - Visualize the fractal memory binary tree hierarchy
 /zoom [t] id n  - Inspect memory node or raw message (n=1 for verbatim)
 /compact        - Trigger an immediate background compaction pass
+/diff [ref]     - Show workspace changes since the last checkpoint
+/undo [ref]     - Restore workspace to a checkpoint (or '/undo list')
 /clear          - Clear viewport chat history (disk storage untouched)
 /tools          - Toggle expanded/collapsed tool call cards (or Ctrl+O)
 /mcp            - Inspect active MCP servers, tools count, and configs

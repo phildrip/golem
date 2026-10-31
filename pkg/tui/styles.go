@@ -359,7 +359,9 @@ func RenderToolCard(toolName string, commandOrArgs string, output string, exitCo
 }
 
 // RenderSubagentCard formats a subagent execution and result as a styled card.
-func RenderSubagentCard(role, model, prompt, output string, isRunning bool, width int) string {
+// interrupted marks a subagent whose turn was cut off before it reported, so the
+// badge says so instead of claiming DONE.
+func RenderSubagentCard(role, model, prompt, output string, isRunning, interrupted bool, width int) string {
 	roleBadge := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(ColorSecondary).
@@ -371,9 +373,12 @@ func RenderSubagentCard(role, model, prompt, output string, isRunning bool, widt
 		Render("[" + model + "]")
 
 	var statusBadge string
-	if isRunning {
+	switch {
+	case isRunning:
 		statusBadge = ToolRunningBadge.Render("RUNNING")
-	} else {
+	case interrupted:
+		statusBadge = lipgloss.NewStyle().Foreground(ColorWarning).Bold(true).Render("INTERRUPTED")
+	default:
 		statusBadge = ToolSuccessBadge.Render("DONE")
 	}
 

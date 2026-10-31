@@ -14,6 +14,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/user/golem/pkg/approval"
+	"github.com/user/golem/pkg/checkpoint"
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/graph"
 	"github.com/user/golem/pkg/mcp"
@@ -106,6 +107,7 @@ type Agent struct {
 	mcpToolsets         []mcp.NamedToolset
 	subagentRunner      *subagent.Runner
 	graphs              *graph.Manager
+	checkpoints         *checkpoint.Manager
 	runner              *runner.Runner
 	adkAgent            agent.Agent
 	userID              string
@@ -114,9 +116,10 @@ type Agent struct {
 	activeHandlerMu     sync.RWMutex
 	activeHandler       StreamHandler
 	turnStateMu         sync.Mutex
-	turnStartEventID    int  // first event ID of the in-flight turn, or -1
-	turnToolCalls       int  // tool calls executed in the in-flight turn
-	turnActive          bool // whether a turn is currently running
+	turnStartEventID    int    // first event ID of the in-flight turn, or -1
+	turnToolCalls       int    // tool calls executed in the in-flight turn
+	turnActive          bool   // whether a turn is currently running
+	currentTurnID       string // transaction GUID of the in-flight turn
 	compactorTrigger    chan struct{}
 	workerCancel        context.CancelFunc
 	dynModel            *dynamicModel
@@ -188,6 +191,7 @@ Memory Navigation & Scopes:
 - For normal requests and coding tasks, focus directly on the user's immediate prompt and project files.
 - Only use zoom(id, n) (with optional target) when you specifically need historical context, past user rulings, or earlier conversation details not in the immediate context. Never call zoom repeatedly in loops.
 - zoom(id, 1) returns the exact verbatim message in full.
+- Use memory_search(query, ...) to search across all historical events (id+1) and summary nodes (id+n) by BM25 keyword ranking, turn_id/session_id GUID, or timestamp range (since/until) to quickly locate exact id+n addresses to zoom.
 - Use date(id) to check the timestamp of any message.
 - Use remember(text, scope) to persist important user preferences, architectural decisions, or conventions into profile memory.
 
@@ -238,6 +242,7 @@ Swarm (multi-agent coordination):
 const (
 	liveHeadMaxEventBytes = 600
 	liveHeadMaxTotalBytes = 8000
+	liveHeadLowWaterBytes = 6000
 )
 
 // clipHeadTail keeps the start and the end of s, in at most limit bytes (thesis
@@ -317,10 +322,13 @@ func formatLiveHead(events []fractal.Event, excludeFrom int) string {
 		lines = append(lines, line)
 		total += len(line)
 	}
-	// Drop from the front, keeping the most recent events in view.
-	for total > liveHeadMaxTotalBytes && len(lines) > 1 {
-		total -= len(lines[0])
-		lines = lines[1:]
+	// Drop from the front using a high/low-water sawtooth so a large live-head
+	// window trims in a batch rather than shifting every line on each turn.
+	if total > liveHeadMaxTotalBytes {
+		for total > liveHeadLowWaterBytes && len(lines) > 1 {
+			total -= len(lines[0])
+			lines = lines[1:]
+		}
 	}
 	if len(lines) == 0 {
 		return ""
@@ -329,17 +337,32 @@ func formatLiveHead(events []fractal.Event, excludeFrom int) string {
 	return "<recent_live_head>\n" + strings.Join(lines, "") + "</recent_live_head>"
 }
 
-// buildInstruction assembles the Golem system instruction: the static guidance,
-// the fractal summary view, the recent verbatim live head, and swarm state.
-// excludeFrom >= 0 omits events with ID >= excludeFrom (the in-flight turn).
+// buildInstruction assembles the Golem system instruction ordered from coldest
+// (most static) to hottest (most volatile) to maximize KV-prefix cache hits:
+//  1. Static system guidance (golemSystemPrompt)
+//  2. Saved graph catalog (changes only when graphs are saved/deleted)
+//  3. Fractal summary view (<memory_context>, frozen during an in-flight turn)
+//  4. Recent verbatim live head (<recent_live_head>, frozen during an in-flight turn)
+//  5. Closing instruction + ephemeral swarm inbox notification (<swarm_inbox>)
+//
+// excludeFrom >= 0 omits events with ID >= excludeFrom (the in-flight turn) and
+// skips memoryMgr.SyncAll() so mid-turn tool calls never shift the prefix.
 func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swarmBus *swarm.Bus, excludeFrom int, graphCatalog string) string {
-	if memoryMgr != nil {
+	if memoryMgr != nil && excludeFrom < 0 {
 		memoryMgr.SyncAll()
 	}
 
 	var sb strings.Builder
 	sb.WriteString(golemSystemPrompt)
 
+	// Layer 0b: Graph catalog sits immediately after static guidance so the
+	// static prefix above <memory_context> stays 100% cacheable across turns.
+	if graphCatalog != "" {
+		sb.WriteString(graphCatalog)
+		sb.WriteString("\n")
+	}
+
+	// Layer 1: Multi-resolution fractal summary view.
 	if memoryMgr != nil {
 		if renderedView := memoryMgr.RenderCombined(); renderedView != "" {
 			sb.WriteString(renderedView)
@@ -347,6 +370,7 @@ func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swar
 		}
 	}
 
+	// Layer 2: Verbatim live head of recent events prior to the current turn.
 	if view != nil {
 		if live := formatLiveHead(view.LiveHeadEvents(), excludeFrom); live != "" {
 			sb.WriteString(live)
@@ -354,21 +378,16 @@ func buildInstruction(memoryMgr *fractal.MemoryManager, view *fractal.View, swar
 		}
 	}
 
+	sb.WriteString("Now assist the user with their request accurately and effectively.")
+
+	// Layer 3: Ephemeral turn notifications at the very tail so they never
+	// invalidate the cached prefix of Layers 0-2.
 	if swarmBus != nil {
 		if n := swarmBus.UnreadCount(swarm.OrchestratorID); n > 0 {
 			sb.WriteString(fmt.Sprintf("\n\n<swarm_inbox>You have %d unread swarm message(s). Call check_inbox to read them.</swarm_inbox>\n", n))
 		}
 	}
 
-	// The catalog is the recall half of the graph skill: the agent cannot think
-	// to run a procedure it does not know exists. It sits after the live head so
-	// the static prefix above it stays cacheable.
-	if graphCatalog != "" {
-		sb.WriteString(graphCatalog)
-		sb.WriteString("\n")
-	}
-
-	sb.WriteString("Now assist the user with their request accurately and effectively.")
 	return sb.String()
 }
 
@@ -607,6 +626,23 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		return nil, errors.Wrap(err, "creating remember tool")
 	}
 
+	memorySearchTool, err := fractal.NewMemorySearchTool(memoryMgr)
+	if err != nil {
+		memoryMgr.Close()
+		return nil, errors.Wrap(err, "creating memory_search tool")
+	}
+
+	wsRoot := cfg.WorkspaceDir
+	if wsRoot == "" {
+		wsRoot = workDir
+	}
+	checkpointMgr := checkpoint.NewManager(wsRoot)
+	checkpointTool, err := checkpoint.NewTool(checkpointMgr)
+	if err != nil {
+		memoryMgr.Close()
+		return nil, errors.Wrap(err, "creating workspace_checkpoint tool")
+	}
+
 	// A subagent runs with nobody watching, so the same tools are built
 	// unattended: anything the policy would ask about is refused instead of
 	// waiting for an approval no one can give.
@@ -626,9 +662,12 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		hostTools.hashlineRead,
 		hostTools.hashlineFindBlk,
 		hostTools.hashlinePatch,
+		hostTools.symbolOutline,
 		zoomTool,
 		dateTool,
 		rememberTool,
+		memorySearchTool,
+		checkpointTool,
 		hostTools.webSearch,
 		hostTools.webFetch,
 	}
@@ -698,7 +737,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	subagentRunner := subagent.NewRunner(subagent.RunnerConfig{
 		ModelFactory:   modelFactory,
 		WorkspaceDir:   workDir,
-		ReadOnlyTools:  []tool.Tool{delegateTools.readFile, delegateTools.findFiles, delegateTools.grepFiles, delegateTools.hashlineRead, delegateTools.hashlineFindBlk, zoomTool, dateTool, delegateTools.webSearch, delegateTools.webFetch},
+		ReadOnlyTools:  []tool.Tool{delegateTools.readFile, delegateTools.findFiles, delegateTools.grepFiles, delegateTools.hashlineRead, delegateTools.hashlineFindBlk, delegateTools.symbolOutline, zoomTool, dateTool, memorySearchTool, delegateTools.webSearch, delegateTools.webFetch},
 		ReadWriteTools: []tool.Tool{delegateTools.writeFile, delegateTools.replaceRegex, delegateTools.hashlinePatch, delegateTools.shell, rememberTool},
 		MCPToolsets:    delegateToolsets,
 		SwarmBus:       swarmBus,
@@ -749,7 +788,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 	graphMgr := graph.NewManager(filepath.Join(workDir, graph.GraphsDir), graph.BuilderConfig{
 		Models:        modelFactory,
-		ReadOnlyTools: []tool.Tool{graphTools.readFile, graphTools.findFiles, graphTools.grepFiles, graphTools.hashlineRead, graphTools.hashlineFindBlk, zoomTool, dateTool, graphTools.webSearch, graphTools.webFetch},
+		ReadOnlyTools: []tool.Tool{graphTools.readFile, graphTools.findFiles, graphTools.grepFiles, graphTools.hashlineRead, graphTools.hashlineFindBlk, graphTools.symbolOutline, zoomTool, dateTool, memorySearchTool, graphTools.webSearch, graphTools.webFetch},
 		WriteTools:    []tool.Tool{graphTools.writeFile, graphTools.replaceRegex, graphTools.hashlinePatch, graphTools.shell, rememberTool},
 		Toolsets:      graphToolsets,
 		MemoryContext: func() string {
@@ -819,8 +858,12 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 				if lockErr := swarm.CheckToolLock(swarmBus, swarm.OrchestratorID, t.Name(), args); lockErr != nil {
 					return nil, lockErr
 				}
-				if t.Name() != "zoom" && t.Name() != "date" {
-					appendMemoryEvent(health, store, fractal.KindTool, fmt.Sprintf("%s: %s", t.Name(), string(argsBytes)))
+				if t.Name() != "zoom" && t.Name() != "date" && t.Name() != "memory_search" {
+					var opts fractal.AppendEventOpts
+					if agentPtr != nil {
+						opts = agentPtr.currentEventOpts()
+					}
+					appendMemoryEvent(health, store, fractal.KindTool, fmt.Sprintf("%s: %s", t.Name(), string(argsBytes)), opts)
 				}
 
 				if agentPtr != nil {
@@ -861,8 +904,12 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 					// Clip huge output to its head and tail (thesis section 1).
 					out = clipHeadTail(out, 30000)
 				}
-				if t.Name() != "zoom" && t.Name() != "date" {
-					appendMemoryEvent(health, store, fractal.KindEcho, fmt.Sprintf("%s: %s", t.Name(), out))
+				if t.Name() != "zoom" && t.Name() != "date" && t.Name() != "memory_search" {
+					var opts fractal.AppendEventOpts
+					if agentPtr != nil {
+						opts = agentPtr.currentEventOpts()
+					}
+					appendMemoryEvent(health, store, fractal.KindEcho, fmt.Sprintf("%s: %s", t.Name(), out), opts)
 				}
 
 				if agentPtr != nil {
@@ -908,6 +955,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		mcpToolsets:      mcpToolsets,
 		subagentRunner:   subagentRunner,
 		graphs:           graphMgr,
+		checkpoints:      checkpointMgr,
 		runner:           adkRunner,
 		adkAgent:         adkAgent,
 		userID:           "user",
@@ -984,11 +1032,16 @@ func (a *Agent) triggerCompactor() {
 
 // beginTurn marks the start of a turn. startEventID is the user event's ID, so
 // every event appended during the turn is >= it.
-func (a *Agent) beginTurn(startEventID int) {
+func (a *Agent) beginTurn(startEventID int, turnID ...string) {
 	a.turnStateMu.Lock()
 	a.turnStartEventID = startEventID
 	a.turnToolCalls = 0
 	a.turnActive = true
+	if len(turnID) > 0 {
+		a.currentTurnID = turnID[0]
+	} else {
+		a.currentTurnID = ""
+	}
 	a.turnStateMu.Unlock()
 }
 
@@ -998,7 +1051,19 @@ func (a *Agent) endTurn() {
 	a.turnStartEventID = -1
 	a.turnToolCalls = 0
 	a.turnActive = false
+	a.currentTurnID = ""
 	a.turnStateMu.Unlock()
+}
+
+// currentEventOpts returns the SessionID and active TurnID for stamping events.
+func (a *Agent) currentEventOpts() fractal.AppendEventOpts {
+	a.turnStateMu.Lock()
+	turnID := a.currentTurnID
+	a.turnStateMu.Unlock()
+	return fractal.AppendEventOpts{
+		SessionID: a.sessionID,
+		TurnID:    turnID,
+	}
 }
 
 // noteToolCall records that a tool ran, so the turn is known to have made
@@ -1067,15 +1132,34 @@ func (a *Agent) ProcessStreamImages(ctx context.Context, input string, images []
 		a.activeHandlerMu.Unlock()
 	}()
 
-	// 1. Log user message to fractal store
-	userEvent, err := a.store.AppendEvent(fractal.KindUser, input)
+	// 1. Sync view to the pre-turn boundary before logging the in-flight user
+	// message so <memory_context> and <recent_live_head> stay frozen across all
+	// tool steps of this turn.
+	if a.memoryMgr != nil {
+		a.memoryMgr.SyncAll()
+	} else if a.view != nil {
+		a.view.Sync()
+	}
+
+	// 2. Log user message to fractal store with the turn's transaction GUID, and
+	// take a lightweight shadow-index workspace checkpoint so /diff and /undo can
+	// inspect or revert any file edits made during this turn.
+	turnSessionID := fmt.Sprintf("turn-%d", time.Now().UnixNano())
+	if a.checkpoints != nil && a.checkpoints.Available() {
+		_, _ = a.checkpoints.Create(turnSessionID, "pre-turn "+turnSessionID)
+	}
+	evOpts := fractal.AppendEventOpts{
+		SessionID: a.sessionID,
+		TurnID:    turnSessionID,
+	}
+	userEvent, err := a.store.AppendEvent(fractal.KindUser, input, evOpts)
 	if err != nil {
 		return "", errors.Wrap(err, "logging user event")
 	}
 	// Mark the turn: every event appended from here on has ID >= userEvent.ID, so
 	// the live head can exclude the in-flight turn (the runner passes it in the
 	// conversation) for the whole turn, including mid-turn model calls.
-	a.beginTurn(userEvent.ID)
+	a.beginTurn(userEvent.ID, turnSessionID)
 	turnParked := false
 	defer func() {
 		if !turnParked {
@@ -1083,13 +1167,7 @@ func (a *Agent) ProcessStreamImages(ctx context.Context, input string, images []
 		}
 	}()
 
-	// Sync view
-	a.view.Sync()
-
-	// 2. Content was prepared above (text + any inline images).
-
 	// 3. Run the model, retrying transient server spikes (503 / 429).
-	turnSessionID := fmt.Sprintf("turn-%d", time.Now().UnixNano())
 	finalResponse, err := a.streamPass(ctx, turnSessionID, content, handler)
 	if err != nil {
 		return "", err
@@ -1105,7 +1183,7 @@ func (a *Agent) ProcessStreamImages(ctx context.Context, input string, images []
 
 	// 4. Log agent response to fractal store
 	if finalResponse != "" {
-		if _, err := a.store.AppendEvent(fractal.KindTalk, finalResponse); err != nil {
+		if _, err := a.store.AppendEvent(fractal.KindTalk, finalResponse, evOpts); err != nil {
 			return finalResponse, errors.Wrap(err, "logging agent response event")
 		}
 	}
@@ -1397,6 +1475,14 @@ func (a *Agent) Graphs() *graph.Manager {
 		return nil
 	}
 	return a.graphs
+}
+
+// Checkpoints exposes the shadow-index workspace checkpoint manager.
+func (a *Agent) Checkpoints() *checkpoint.Manager {
+	if a == nil {
+		return nil
+	}
+	return a.checkpoints
 }
 
 // dispatchGraphEvent renders a running graph node the way transports already

@@ -44,7 +44,9 @@ type GrepFilesArgs struct {
 type GrepMatch struct {
 	File    string `json:"file" jsonschema:"File path relative to workspace"`
 	LineNum int    `json:"line_num" jsonschema:"Line number (1-based)"`
+	Anchor  string `json:"anchor,omitempty" jsonschema:"Hashline anchor (e.g. '42:a3') ready for hashline_patch or hashline_find_block"`
 	Content string `json:"content" jsonschema:"Line text content"`
+	Snippet string `json:"snippet,omitempty" jsonschema:"Hashline-anchored surrounding lines ('41:f0| ...') for 1-hop editing without reading the file"`
 }
 
 // GrepFilesResult defines output from content searching.
@@ -265,16 +267,32 @@ func GrepFiles(baseDir, subDir, pattern, filePattern string, maxResults int) (Gr
 
 	// 1. Primary: native pure Go gg grep engine (SIMD-optimized bytes.Index & regex)
 	if ggMatches, err := gg.GrepFiles(context.Background(), searchRoot, gg.GrepOptions{
-		Pattern:     pattern,
-		FilePattern: filePattern,
-		MaxMatches:  maxResults,
+		Pattern:       pattern,
+		FilePattern:   filePattern,
+		ContextBefore: 2,
+		ContextAfter:  2,
+		MaxMatches:    maxResults,
 	}); err == nil {
 		var matches []GrepMatch
 		for _, m := range ggMatches {
+			anchor := fmt.Sprintf("%d:%s", m.LineNum, LineHash(m.Content))
+			var snip strings.Builder
+			startBefore := m.LineNum - len(m.ContextBefore)
+			for idx, row := range m.ContextBefore {
+				ln := startBefore + idx
+				fmt.Fprintf(&snip, "%d:%s| %s\n", ln, LineHash(row), row)
+			}
+			fmt.Fprintf(&snip, "%s| %s\n", anchor, m.Content)
+			for idx, row := range m.ContextAfter {
+				ln := m.LineNum + 1 + idx
+				fmt.Fprintf(&snip, "%d:%s| %s\n", ln, LineHash(row), row)
+			}
 			matches = append(matches, GrepMatch{
 				File:    m.File,
 				LineNum: m.LineNum,
+				Anchor:  anchor,
 				Content: m.Content,
+				Snippet: strings.TrimRight(snip.String(), "\n"),
 			})
 		}
 		return GrepFilesResult{

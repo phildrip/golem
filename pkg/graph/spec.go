@@ -271,18 +271,32 @@ func (s *Spec) Validate(opts ValidateOptions) error {
 		in[to] = append(in[to], edge)
 	}
 
-	// One sink: the graph's result is the single node with no outgoing edge.
+	hasRoutes := false
+	for _, edges := range out {
+		for _, e := range edges {
+			if e.route != "" {
+				hasRoutes = true
+				break
+			}
+		}
+		if hasRoutes {
+			break
+		}
+	}
+
+	// Sink check: an unrouted graph has a single sink node with no outgoing
+	// edge; a conditionally routed graph may terminate at one sink per branch
+	// or reconverge at a single terminal node.
 	var sinks []string
 	for _, n := range s.Nodes {
 		if len(out[n.ID]) == 0 {
 			sinks = append(sinks, n.ID)
 		}
 	}
-	switch len(sinks) {
-	case 0:
+	switch {
+	case len(sinks) == 0:
 		add("every node has an outgoing edge, so the graph has no sink; the result of a run is the one node with no outgoing edge")
-	case 1:
-	default:
+	case len(sinks) > 1 && !hasRoutes:
 		add("the graph has %d sinks (%s); exactly one node may have no outgoing edge, and its output is the graph result", len(sinks), strings.Join(sinks, ", "))
 	}
 
@@ -302,12 +316,13 @@ func (s *Spec) Validate(opts ValidateOptions) error {
 		}
 	}
 
-	// Fan-in must land on a join: the engine has no other merge semantics.
+	// Fan-in must land on a join unless the graph uses conditional routes (where
+	// mutually exclusive branches reconverge on a single downstream node).
 	for to, edges := range in {
 		if len(edges) < 2 {
 			continue
 		}
-		if kind := s.kindOf(to); kind != KindJoin {
+		if kind := s.kindOf(to); kind != KindJoin && !hasRoutes {
 			add("node %q has %d incoming edges but kind=%s; fan-in must land on a join node that merges them", to, len(edges), kind)
 		}
 		if kind := s.kindOf(to); kind == KindJoin {
@@ -389,6 +404,12 @@ func (s *Spec) checkAcyclic(out map[string][]edge) []string {
 		color[node] = grey
 		path = append(path, node)
 		for _, e := range out[node] {
+			// Conditional routed edges ([from, to, route]) may close bounded
+			// verify-fix retry loops enforced by budgets.max_nodes; only
+			// unconditional cycles are rejected (golem-8c6.5).
+			if e.route != "" {
+				continue
+			}
 			switch color[e.to] {
 			case grey:
 				cycle := append([]string{}, path...)
@@ -398,7 +419,7 @@ func (s *Spec) checkAcyclic(out map[string][]edge) []string {
 						break
 					}
 				}
-				found = append(found, fmt.Sprintf("cycle %s: a graph must be a DAG, so the run always terminates", strings.Join(cycle, " -> ")))
+				found = append(found, fmt.Sprintf("cycle %s: an unconditional cycle never terminates; use a routed edge [from, to, route] for bounded retry loops", strings.Join(cycle, " -> ")))
 				return true
 			case white:
 				if visit(e.to) {
@@ -452,20 +473,44 @@ func (s *Spec) checkBudgets() []string {
 	return problems
 }
 
-// Sink returns the id of the node whose output is the graph result.
+// Sink returns the id of the primary node whose output is the graph result.
 func (s *Spec) Sink() string {
+	sinks := s.Sinks()
+	if len(sinks) > 0 {
+		return sinks[0]
+	}
+	return ""
+}
+
+// Sinks returns the ids of all terminal nodes (nodes with no outgoing edges)
+// in spec order.
+func (s *Spec) Sinks() []string {
 	out := map[string]int{}
 	for _, e := range s.Edges {
 		if len(e) >= 2 {
 			out[e[0]]++
 		}
 	}
+	var sinks []string
 	for _, n := range s.Nodes {
 		if out[n.ID] == 0 {
-			return n.ID
+			sinks = append(sinks, n.ID)
 		}
 	}
-	return ""
+	return sinks
+}
+
+// outgoingRoutes returns the non-empty route labels on edges leaving nodeID.
+func (s *Spec) outgoingRoutes(nodeID string) []string {
+	var routes []string
+	for _, e := range s.Edges {
+		if len(e) == 3 && e[0] == nodeID {
+			if r := strings.TrimSpace(e[2]); r != "" {
+				routes = append(routes, r)
+			}
+		}
+	}
+	return routes
 }
 
 // WorkflowName is the engine-level name a run is registered under. The engine

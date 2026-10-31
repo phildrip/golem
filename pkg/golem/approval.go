@@ -210,7 +210,7 @@ func (a *Agent) RespondToApproval(ctx context.Context, callID string, approved b
 
 	// The turn is over: log it and close it out exactly as a normal turn would.
 	if finalResponse != "" {
-		if _, err := a.store.AppendEvent(fractal.KindTalk, finalResponse); err != nil {
+		if _, err := a.store.AppendEvent(fractal.KindTalk, finalResponse, a.currentEventOpts()); err != nil {
 			return finalResponse, errors.Wrap(err, "logging agent response event")
 		}
 	}

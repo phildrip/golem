@@ -462,3 +462,244 @@ func TestPausedNodeIsReportedAsWaiting(t *testing.T) {
 		t.Fatalf("paused run was not recorded as waiting: %+v", runs[0])
 	}
 }
+
+func TestConditionalRoutingBranchesAndReconverges(t *testing.T) {
+	models := stubModels{
+		"m_router": &echoModel{prefix: "analysis done\nROUTE: fail\n", tokens: 50},
+		"m_fast":   &echoModel{prefix: "FAST:", tokens: 50},
+		"m_slow":   &echoModel{prefix: "SLOW:", tokens: 50},
+		"m_final":  &echoModel{prefix: "FINAL:", tokens: 50},
+	}
+	m := NewManager(t.TempDir(), BuilderConfig{Models: models})
+
+	// 1. Multi-sink conditional routing (only one terminal branch executes).
+	multiSinkSpec := &Spec{
+		V: 1, Name: "routed_multi_sink", MaxConcurrency: 2,
+		Budgets: &Budgets{MaxNodes: 5, MaxWallSeconds: 60, MaxTokens: 50_000},
+		Nodes: []Node{
+			{ID: "check", Kind: KindAgent, Role: RoleCritic, Tools: ToolsNone, Instruction: "decide", Model: "m_router"},
+			{ID: "fast", Kind: KindAgent, Role: RoleCoder, Tools: ToolsNone, Instruction: "fast path", Model: "m_fast"},
+			{ID: "slow", Kind: KindAgent, Role: RoleCoder, Tools: ToolsNone, Instruction: "slow path", Model: "m_slow"},
+		},
+		Edges: [][]string{
+			{"START", "check"},
+			{"check", "fast", "pass"},
+			{"check", "slow", "fail"},
+		},
+	}
+	out := invokeGraphRun(t, m, map[string]any{"spec": multiSinkSpec, "input": "task"})
+	if !strings.Contains(out, "SLOW:") {
+		t.Fatalf("expected routed 'fail' branch ('slow' node) to execute, got:\n%s", out)
+	}
+	if strings.Contains(out, "FAST:") {
+		t.Fatalf("unmatched 'pass' branch ('fast' node) should not have executed:\n%s", out)
+	}
+
+	// 2. Reconverging conditional routing (exclusive branches reconverge on a final agent node).
+	reconvergeSpec := &Spec{
+		V: 1, Name: "routed_reconverge", MaxConcurrency: 2,
+		Budgets: &Budgets{MaxNodes: 6, MaxWallSeconds: 60, MaxTokens: 50_000},
+		Nodes: []Node{
+			{ID: "check", Kind: KindAgent, Role: RoleCritic, Tools: ToolsNone, Instruction: "decide", Model: "m_router"},
+			{ID: "fast", Kind: KindAgent, Role: RoleCoder, Tools: ToolsNone, Instruction: "fast path", Model: "m_fast"},
+			{ID: "slow", Kind: KindAgent, Role: RoleCoder, Tools: ToolsNone, Instruction: "slow path", Model: "m_slow"},
+			{ID: "final", Kind: KindAgent, Role: RoleGeneral, Tools: ToolsNone, Instruction: "summarize", Model: "m_final"},
+		},
+		Edges: [][]string{
+			{"START", "check"},
+			{"check", "fast", "pass"},
+			{"check", "slow", "fail"},
+			{"fast", "final"},
+			{"slow", "final"},
+		},
+	}
+	out2 := invokeGraphRun(t, m, map[string]any{"spec": reconvergeSpec, "input": "task"})
+	if !strings.Contains(out2, "FINAL:SLOW:") {
+		t.Fatalf("expected reconverged final node to receive 'slow' output, got:\n%s", out2)
+	}
+}
+
+func TestToolNodeInterpolatesUpstreamInput(t *testing.T) {
+	models := stubModels{
+		"m_up":   &echoModel{prefix: "UP:", tokens: 50},
+		"m_sink": &echoModel{prefix: "SINK:", tokens: 50},
+	}
+	m := NewManager(t.TempDir(), BuilderConfig{
+		Models:        models,
+		ReadOnlyTools: []tool.Tool{newFakeProbe(t)},
+	})
+	spec := &Spec{
+		V: 1, Name: "interpolated_tool", MaxConcurrency: 1,
+		Budgets: &Budgets{MaxNodes: 4, MaxWallSeconds: 60, MaxTokens: 50_000},
+		Nodes: []Node{
+			{ID: "prep", Kind: KindAgent, Role: RoleResearcher, Tools: ToolsNone, Instruction: "prepare query", Model: "m_up"},
+			{ID: "probe", Kind: KindTool, Tool: "fake_probe", Args: map[string]any{"what": "from-upstream:{{input}}"}},
+			{ID: "sink", Kind: KindAgent, Role: RoleGeneral, Tools: ToolsNone, Instruction: "report", Model: "m_sink"},
+		},
+		Edges: [][]string{
+			{"START", "prep"},
+			{"prep", "probe"},
+			{"probe", "sink"},
+		},
+	}
+	out := invokeGraphRun(t, m, map[string]any{"spec": spec, "input": "hello"})
+	if !strings.Contains(out, "probe saw from-upstream:UP:hello") {
+		t.Fatalf("expected tool node to interpolate {{input}} from upstream, got:\n%s", out)
+	}
+}
+
+func TestTokenEstimationWhenProviderOmitsUsage(t *testing.T) {
+	// tokens: 0 omits UsageMetadata completely from the model response.
+	models := stubModels{
+		"m_no_usage": &echoModel{prefix: "OUT:", tokens: 0},
+	}
+	m := NewManager(t.TempDir(), BuilderConfig{Models: models})
+	spec := &Spec{
+		V: 1, Name: "estimated_tokens", MaxConcurrency: 1,
+		Budgets: &Budgets{MaxNodes: 3, MaxWallSeconds: 60, MaxTokens: 50_000},
+		Nodes: []Node{
+			{ID: "only", Kind: KindAgent, Role: RoleGeneral, Tools: ToolsNone, Instruction: "answer", Model: "m_no_usage"},
+		},
+		Edges: [][]string{{"START", "only"}},
+	}
+	_ = invokeGraphRun(t, m, map[string]any{"spec": spec, "input": "estimate my tokens please"})
+	runs, err := m.ListRuns()
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("ListRuns: %v (len=%d)", err, len(runs))
+	}
+	if runs[0].Tokens <= 0 {
+		t.Fatalf("expected non-zero estimated tokens when UsageMetadata is omitted, got %d", runs[0].Tokens)
+	}
+	if len(runs[0].Nodes) != 1 || runs[0].Nodes[0].Tokens <= 0 {
+		t.Fatalf("expected non-zero per-node estimated tokens, got %+v", runs[0].Nodes)
+	}
+}
+
+// sequenceModel yields responses[i] on call i (repeating the last if called more times).
+type sequenceModel struct {
+	name      string
+	responses []string
+	tokens    int32
+	cached    int32
+	calls     int
+}
+
+func (m *sequenceModel) Name() string { return m.name }
+
+func (m *sequenceModel) GenerateContent(_ context.Context, _ *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+	return func(yield func(*model.LLMResponse, error) bool) {
+		idx := m.calls
+		m.calls++
+		if idx >= len(m.responses) {
+			idx = len(m.responses) - 1
+		}
+		resp := &model.LLMResponse{
+			Content: genai.NewContentFromText(m.responses[idx], genai.RoleModel),
+		}
+		if m.tokens > 0 || m.cached > 0 {
+			resp.UsageMetadata = &genai.GenerateContentResponseUsageMetadata{
+				TotalTokenCount:         m.tokens,
+				PromptTokenCount:        m.tokens,
+				CachedContentTokenCount: m.cached,
+			}
+		}
+		yield(resp, nil)
+	}
+}
+
+func TestBoundedCyclicVerifyFixLoop(t *testing.T) {
+	coder := &sequenceModel{
+		name:      "coder",
+		responses: []string{"draft v1 (buggy)", "draft v2 (fixed)"},
+		tokens:    100,
+		cached:    60,
+	}
+	verifier := &sequenceModel{
+		name: "verifier",
+		responses: []string{
+			"test failed on v1\nROUTE: retry",
+			"all tests passed on v2\nROUTE: pass",
+		},
+		tokens: 80,
+		cached: 40,
+	}
+	done := &echoModel{prefix: "DELIVERED:", tokens: 50}
+
+	m := NewManager(t.TempDir(), BuilderConfig{
+		Models: stubModels{
+			"m_coder":    coder,
+			"m_verifier": verifier,
+			"m_done":     done,
+		},
+	})
+	spec := &Spec{
+		V: 1, Name: "verify_fix_loop", MaxConcurrency: 1,
+		Budgets: &Budgets{MaxNodes: 6, MaxWallSeconds: 60, MaxTokens: 50_000},
+		Nodes: []Node{
+			{ID: "coder", Kind: KindAgent, Role: RoleCoder, Tools: ToolsNone, Instruction: "implement feature", Model: "m_coder"},
+			{ID: "verifier", Kind: KindAgent, Role: RoleCritic, Tools: ToolsNone, Instruction: "run verification", Model: "m_verifier"},
+			{ID: "done", Kind: KindAgent, Role: RoleGeneral, Tools: ToolsNone, Instruction: "summarize", Model: "m_done"},
+		},
+		Edges: [][]string{
+			{"START", "coder"},
+			{"coder", "verifier"},
+			{"verifier", "coder", "retry"},
+			{"verifier", "done", "pass"},
+		},
+	}
+
+	out := invokeGraphRun(t, m, map[string]any{"spec": spec, "input": "build widget"})
+	if coder.calls != 2 || verifier.calls != 2 {
+		t.Fatalf("expected coder and verifier to each run twice, got coder=%d verifier=%d\nout:\n%s",
+			coder.calls, verifier.calls, out)
+	}
+	for _, want := range []string{"DELIVERED:all tests passed on v2", "coder(x2)", "critic(x2)", "cached_tokens=200"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected output to contain %q, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestCyclicLoopTripsMaxNodesBudget(t *testing.T) {
+	coder := &sequenceModel{
+		name:      "coder",
+		responses: []string{"still broken"},
+		tokens:    50,
+	}
+	verifier := &sequenceModel{
+		name:      "verifier",
+		responses: []string{"still failing\nROUTE: retry"},
+		tokens:    50,
+	}
+	done := &echoModel{prefix: "DONE:", tokens: 50}
+
+	m := NewManager(t.TempDir(), BuilderConfig{
+		Models: stubModels{
+			"m_coder":    coder,
+			"m_verifier": verifier,
+			"m_done":     done,
+		},
+	})
+	spec := &Spec{
+		V: 1, Name: "infinite_retry_loop", MaxConcurrency: 1,
+		Budgets: &Budgets{MaxNodes: 4, MaxWallSeconds: 60, MaxTokens: 50_000},
+		Nodes: []Node{
+			{ID: "coder", Kind: KindAgent, Role: RoleCoder, Tools: ToolsNone, Instruction: "code", Model: "m_coder"},
+			{ID: "verifier", Kind: KindAgent, Role: RoleCritic, Tools: ToolsNone, Instruction: "verify", Model: "m_verifier"},
+			{ID: "done", Kind: KindAgent, Role: RoleGeneral, Tools: ToolsNone, Instruction: "finish", Model: "m_done"},
+		},
+		Edges: [][]string{
+			{"START", "coder"},
+			{"coder", "verifier"},
+			{"verifier", "coder", "retry"},
+			{"verifier", "done", "pass"},
+		},
+	}
+
+	out := invokeGraphRun(t, m, map[string]any{"spec": spec, "input": "go"})
+	if !strings.Contains(out, "node activation budget exhausted") {
+		t.Fatalf("expected max_nodes ceiling to halt infinite retry loop, got:\n%s", out)
+	}
+}
+
+

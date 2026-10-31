@@ -23,36 +23,42 @@ import (
 // the sink's text plus a per-node digest, so the model learns both the answer
 // and what the answer cost.
 type Result struct {
-	Graph    string             `json:"graph"`
-	RunID    string             `json:"run_id,omitempty"`
-	Status   string             `json:"status,omitempty"`
-	Output   string             `json:"output"`
-	Nodes    []NodeResult       `json:"nodes"`
-	Waiting  []WaitingInterrupt `json:"waiting,omitempty"`
-	Tokens   int64              `json:"tokens"`
-	Duration time.Duration      `json:"duration"`
-	Err      string             `json:"error,omitempty"`
+	Graph         string             `json:"graph"`
+	RunID         string             `json:"run_id,omitempty"`
+	Status        string             `json:"status,omitempty"`
+	Output        string             `json:"output"`
+	Nodes         []NodeResult       `json:"nodes"`
+	Waiting       []WaitingInterrupt `json:"waiting,omitempty"`
+	Tokens        int64              `json:"tokens"`
+	CachedTokens  int64              `json:"cached_tokens,omitempty"`
+	CacheHitRatio float64            `json:"cache_hit_ratio,omitempty"`
+	Activations   int                `json:"activations,omitempty"`
+	Duration      time.Duration      `json:"duration"`
+	Err           string             `json:"error,omitempty"`
 }
 
 // NodeResult is one node's contribution.
 type NodeResult struct {
-	ID       string        `json:"id"`
-	Role     string        `json:"role,omitempty"`
-	Kind     string        `json:"kind"`
-	Text     string        `json:"text,omitempty"`
-	Tokens   int64         `json:"tokens,omitempty"`
-	Duration time.Duration `json:"duration,omitempty"`
-	Err      string        `json:"error,omitempty"`
+	ID           string        `json:"id"`
+	Role         string        `json:"role,omitempty"`
+	Kind         string        `json:"kind"`
+	Text         string        `json:"text,omitempty"`
+	Tokens       int64         `json:"tokens,omitempty"`
+	CachedTokens int64         `json:"cached_tokens,omitempty"`
+	Activations  int           `json:"activations,omitempty"`
+	Duration     time.Duration `json:"duration,omitempty"`
+	Err          string        `json:"error,omitempty"`
 }
 
 // nodeCapture accumulates one node's events.
 type nodeCapture struct {
-	id   string
-	role string
-	kind string
-	text strings.Builder
-	out  any
-	seen bool
+	id         string
+	role       string
+	kind       string
+	text       strings.Builder
+	out        any
+	seen       bool
+	activation int
 }
 
 // maxNodeText bounds what one node may contribute to the tool result: a node
@@ -196,6 +202,11 @@ func (m *Manager) execute(ctx agent.Context, spec *Spec, rec *RunRecord, resume 
 			continue
 		}
 		c := capture(author)
+		if act := budget.nodeActivationCount(author); act > c.activation {
+			c.text.Reset()
+			c.out = nil
+			c.activation = act
+		}
 		c.seen = true
 		seen[author] = true
 		if ev.Output != nil {
@@ -212,6 +223,9 @@ func (m *Manager) execute(ctx agent.Context, spec *Spec, rec *RunRecord, resume 
 
 	res.Duration = time.Since(start)
 	res.Tokens = budget.Tokens()
+	res.CachedTokens = budget.CachedTokens()
+	res.CacheHitRatio = budget.CacheHitRatio()
+	res.Activations = budget.Activations()
 
 	events, evErr := drv.events(ctx)
 	if evErr != nil && runErr == nil {
@@ -230,12 +244,15 @@ func (m *Manager) execute(ctx agent.Context, spec *Spec, rec *RunRecord, resume 
 		nr := NodeResult{ID: n.ID, Role: n.Role, Kind: n.Kind}
 		if old, ok := prior[n.ID]; ok {
 			nr.Tokens, nr.Duration = old.Tokens, old.Duration
+			nr.CachedTokens, nr.Activations = old.CachedTokens, old.Activations
 			nr.Err = old.Err
 		}
 		switch {
 		case c != nil && c.seen && seen[n.ID]:
 			nr.Text = clipRunes(c.text.String(), maxNodeText)
 			nr.Tokens = budget.nodeTokens(n.ID)
+			nr.CachedTokens = budget.nodeCachedTokens(n.ID)
+			nr.Activations = budget.nodeActivationCount(n.ID)
 			nr.Duration = budget.elapsed(n.ID)
 			nr.Err = ""
 		case c != nil && c.seen:
@@ -363,11 +380,21 @@ func eventNodeName(ev *session.Event, spec *Spec) string {
 	return ""
 }
 
-// renderSinkOutput renders the sink node's result. A join sink is rebuilt from
-// its predecessors' captured output: the engine's join event carries the map
-// but is not attributable, and the reconstruction is deterministic anyway.
+// renderSinkOutput renders the sink node's result. In a conditionally routed
+// graph with multiple terminal sinks, the first sink that produced output is
+// rendered. A join sink is rebuilt from its predecessors' captured output: the
+// engine's join event carries the map but is not attributable, and the
+// reconstruction is deterministic anyway.
 func renderSinkOutput(spec *Spec, captures map[string]*nodeCapture) string {
-	sink := spec.Sink()
+	for _, sink := range spec.Sinks() {
+		if out := renderOneSink(spec, sink, captures); out != "" {
+			return out
+		}
+	}
+	return ""
+}
+
+func renderOneSink(spec *Spec, sink string, captures map[string]*nodeCapture) string {
 	c, ok := captures[sink]
 	if !ok && spec.kindOf(sink) != KindJoin {
 		return ""

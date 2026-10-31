@@ -14,6 +14,7 @@ import (
 	"github.com/user/golem/pkg/config"
 	"github.com/user/golem/pkg/graph"
 	"github.com/user/golem/pkg/memory/fractal"
+	"github.com/user/golem/pkg/swarm"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -744,5 +745,67 @@ func TestAgentWiresGraphToolsAndSkill(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("system prompt lacks the graph skill (%q missing)", want)
 		}
+	}
+}
+
+// TestBuildInstructionPrefixCacheStability verifies that during an in-flight
+// turn (excludeFrom >= 0), appending tool calls to the store does not mutate
+// <memory_context> or <recent_live_head>, and that volatile <swarm_inbox> sits
+// at the very end after the static and memory layers.
+func TestBuildInstructionPrefixCacheStability(t *testing.T) {
+	store, err := fractal.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	// Seed 6 events and their level-0 summaries with LiveHeadCount = 3
+	// so events 0..2 are in <chat> and 3..5 are in <recent_live_head>.
+	for i := 0; i < 6; i++ {
+		_, _ = store.AppendEvent(fractal.KindUser, fmt.Sprintf("prior msg %d", i))
+		_ = store.SaveNode(fractal.Node{Level: 0, Index: i, Text: fmt.Sprintf("sum %d", i), Size: 8})
+	}
+	view := fractal.NewView(store, fractal.ViewConfig{LiveHeadCount: 3, ViewBudgetBytes: 4096})
+	mgr := fractal.NewMemoryManager(store, view)
+	bus := swarm.NewBus()
+	defer bus.Close()
+	bus.RegisterAgent(swarm.OrchestratorID, "s1")
+
+	catalog := "\n<graph_catalog>test-graph</graph_catalog>\n"
+
+	// Start a new turn at event 6.
+	mgr.SyncAll()
+	userEv, err := store.AppendEvent(fractal.KindUser, "turn prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	step1 := buildInstruction(mgr, view, bus, userEv.ID, catalog)
+
+	// Simulate 4 tool calls/outputs appended mid-turn.
+	for i := 0; i < 4; i++ {
+		_, _ = store.AppendEvent(fractal.KindTool, fmt.Sprintf("tool call %d", i))
+		_, _ = store.AppendEvent(fractal.KindEcho, fmt.Sprintf("tool output %d", i))
+	}
+
+	step2 := buildInstruction(mgr, view, bus, userEv.ID, catalog)
+	if step1 != step2 {
+		t.Fatalf("mid-turn tool events mutated system instruction prefix:\n--- step1 ---\n%s\n--- step2 ---\n%s", step1, step2)
+	}
+
+	// Delivering a swarm message must only append to the tail, keeping step1 as an exact prefix.
+	_, _ = bus.Send(swarm.Message{Sender: "worker-1", Recipient: swarm.OrchestratorID, Body: "done"})
+	step3 := buildInstruction(mgr, view, bus, userEv.ID, catalog)
+	if !strings.HasPrefix(step3, step1) {
+		t.Errorf("swarm inbox notification invalidated prefix before the tail")
+	}
+
+	// Verify layer ordering: <graph_catalog> -> <chat> -> <recent_live_head> -> <swarm_inbox>
+	catIdx := strings.Index(step3, "<graph_catalog>")
+	memIdx := strings.LastIndex(step3, "<chat>")
+	liveIdx := strings.Index(step3, "<recent_live_head>")
+	inboxIdx := strings.Index(step3, "<swarm_inbox>")
+	if !(catIdx > 0 && memIdx > catIdx && liveIdx > memIdx && inboxIdx > liveIdx) {
+		t.Errorf("unexpected layer order: catalog=%d memory=%d live=%d inbox=%d", catIdx, memIdx, liveIdx, inboxIdx)
 	}
 }

@@ -68,6 +68,8 @@ func slashCommands() []slashCommand {
 		{Name: "/tree", Desc: "Inspect the fractal memory hierarchy", Aliases: []string{"/memory"}},
 		{Name: "/zoom", Args: "[target] <id> <n>", Desc: "Inspect a memory node (n=1 for verbatim)"},
 		{Name: "/compact", Desc: "Run a memory compaction pass now"},
+		{Name: "/diff", Args: "[ref]", Desc: "Show workspace changes since the last checkpoint"},
+		{Name: "/undo", Args: "[ref]", Desc: "Restore workspace to a checkpoint (or 'list')", Aliases: []string{"/rewind"}},
 		{Name: "/clear", Desc: "Clear the chat viewport (disk memory kept)"},
 		{Name: "/tools", Desc: "Toggle expanded tool cards (Ctrl+O)", Aliases: []string{"/expand"}},
 		{Name: "/mcp", Desc: "Inspect MCP servers, tools and configs"},

@@ -71,7 +71,7 @@ func render() string {
 	}) + "\n\n")
 
 	b.WriteString(tui.RenderToolCard("shell", "false", "command failed", 1, false, 64) + "\n")
-	b.WriteString(tui.RenderSubagentCard("researcher", "gemini-flash-latest", "check the shutdown path", "read 3 files, found 1 bug", false, 64) + "\n\n")
+	b.WriteString(tui.RenderSubagentCard("researcher", "gemini-flash-latest", "check the shutdown path", "read 3 files, found 1 bug", false, false, 64) + "\n\n")
 
 	// Markdown goes through the real renderer, which is where a stray red inline
 	// code chip (glamour's default) would show up.
