@@ -67,15 +67,28 @@ func (b *Bus) RegisterAgent(agentID, sessionID string) AgentInfo {
 	return info
 }
 
-// UnregisterAgent marks an agent offline. It returns true if the agent was
-// registered, so callers can use it as a "was alive" probe.
+// UnregisterAgent marks an agent offline and releases any advisory resource
+// locks it held. It returns true if the agent was registered, so callers can
+// use it as a "was alive" probe.
 func (b *Bus) UnregisterAgent(agentID string) bool {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if _, ok := b.agents[agentID]; !ok {
+		b.mu.Unlock()
 		return false
 	}
 	delete(b.agents, agentID)
+	var released []ResourceLock
+	for res, lock := range b.locks {
+		if lock.Owner == agentID {
+			released = append(released, lock)
+			delete(b.locks, res)
+		}
+	}
+	b.mu.Unlock()
+
+	for _, lock := range released {
+		b.notifyLockChange(LockEvent{Type: LockReleased, Lock: lock})
+	}
 	return true
 }
 
@@ -380,6 +393,7 @@ func safeCall(h MessageHandler, msg Message) {
 
 // ClaimResource acquires an advisory lock on a file or resource for an agent.
 func (b *Bus) ClaimResource(ctx context.Context, resource string, owner string, sessionID string, ttl time.Duration) (bool, error) {
+	resource = canonicalResource(resource)
 	b.mu.Lock()
 
 	if b.closed {
@@ -420,6 +434,7 @@ func (b *Bus) ClaimResource(ctx context.Context, resource string, owner string, 
 
 // ReleaseResource releases an advisory lock held by the owner.
 func (b *Bus) ReleaseResource(resource string, owner string) error {
+	resource = canonicalResource(resource)
 	b.mu.Lock()
 
 	if b.closed {

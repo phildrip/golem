@@ -516,3 +516,35 @@ func TestRenderCompactedKeepsOnlyBuiltLines(t *testing.T) {
 		t.Errorf("compaction view collapsed to %q", got)
 	}
 }
+
+func TestViewSawtoothResumesWhenParentsBuilt(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	// Create 4 events, each 40 bytes at level 0 (total 160 bytes > ViewBudgetBytes 140).
+	for i := 0; i < 4; i++ {
+		_, _ = store.AppendEvent(KindUser, strings.Repeat("x", 34))
+		_ = store.SaveNode(Node{Level: 0, Index: i, Text: strings.Repeat("x", 40)})
+	}
+	// Only build level-1 node 0 (20 bytes), leaving level-1 node 1 unbuilt for now.
+	// Merging pair 0 reduces total size from 160 -> 20 + 40 + 40 = 100 bytes,
+	// which is below ViewBudgetBytes (140) but still above LowWaterBytes (60).
+	_ = store.SaveNode(Node{Level: 1, Index: 0, Text: strings.Repeat("y", 20)})
+
+	v := NewView(store, ViewConfig{ViewBudgetBytes: 140, LowWaterBytes: 60, LiveHeadCount: 0})
+	if len(v.parts) != 3 {
+		t.Fatalf("expected 3 parts after partial coarsening, got %d: %v", len(v.parts), v.parts)
+	}
+
+	// Now the compactor finishes building level-1 node 1 (20 bytes) and calls Sync().
+	// Total size becomes 20 + 20 = 40 <= LowWaterBytes (60).
+	_ = store.SaveNode(Node{Level: 1, Index: 1, Text: strings.Repeat("z", 20)})
+	v.Sync()
+
+	if len(v.parts) != 2 {
+		t.Fatalf("expected sawtooth batch to resume and merge second pair on Sync, got %d parts: %v", len(v.parts), v.parts)
+	}
+}

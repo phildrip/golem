@@ -272,7 +272,9 @@ func (s *fileSessionService) AppendEvent(ctx context.Context, curSession session
 				state[k] = v
 			}
 		}
-		_ = writeStateFile(filepath.Join(s.dir, "state.json"), state)
+		if err := writeStateFile(filepath.Join(s.dir, "state.json"), state); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -352,7 +354,11 @@ func writeStateFile(path string, state map[string]any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 var (

@@ -25,10 +25,13 @@ func (s *Server) patchPolicy() *sandbox.Policy {
 	p, err := sandbox.New(sandbox.Config{
 		Mode:           sandbox.Mode(resolved.Mode),
 		AllowWrite:     resolved.AllowWrite,
+		ReadOnly:       resolved.ReadOnly,
+		Network:        resolved.Network,
 		AllowNet:       resolved.AllowNet,
 		RequireConfirm: resolved.RequireConfirm,
 		EnvAllow:       resolved.EnvAllow,
 		ShellTimeout:   resolved.ShellTimeout,
+		MCPAllow:       resolved.MCPAllow,
 	}, ws)
 	if err != nil {
 		return nil

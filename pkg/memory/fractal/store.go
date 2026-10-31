@@ -41,15 +41,18 @@ type EventListener func(Event)
 
 // Store manages the append-only events log and binary summary tree on disk using bbolt.
 type Store struct {
-	dir        string
-	db         *bbolt.DB
-	mu         sync.RWMutex
-	closed     bool
-	events     []Event
-	nodes      map[NodeKey]Node
-	listeners  []EventListener
-	eventChan  chan Event
-	dispatchWg sync.WaitGroup
+	dir           string
+	db            *bbolt.DB
+	mu            sync.RWMutex
+	closed        bool
+	events        []Event
+	nodes         map[NodeKey]Node
+	listeners     []EventListener
+	dispatchMu    sync.Mutex
+	dispatchCond  *sync.Cond
+	dispatchQueue []Event
+	dispatchClosed bool
+	dispatchWg    sync.WaitGroup
 }
 
 func encodeUint64(v uint64) []byte {
@@ -108,12 +111,12 @@ func OpenStore(dir string) (*Store, error) {
 	}
 
 	s := &Store{
-		dir:       dir,
-		db:        db,
-		events:    make([]Event, 0),
-		nodes:     make(map[NodeKey]Node),
-		eventChan: make(chan Event, 1024),
+		dir:    dir,
+		db:     db,
+		events: make([]Event, 0),
+		nodes:  make(map[NodeKey]Node),
 	}
+	s.dispatchCond = sync.NewCond(&s.dispatchMu)
 
 	// 1. Check for legacy migration
 	if err := s.migrateLegacyFilesIfPresent(); err != nil {
@@ -136,24 +139,38 @@ func OpenStore(dir string) (*Store, error) {
 
 func (s *Store) runDispatcher() {
 	defer s.dispatchWg.Done()
-	for ev := range s.eventChan {
-		s.mu.RLock()
-		if len(s.listeners) == 0 {
-			s.mu.RUnlock()
-			continue
+	for {
+		s.dispatchMu.Lock()
+		for len(s.dispatchQueue) == 0 && !s.dispatchClosed {
+			s.dispatchCond.Wait()
 		}
-		listeners := make([]EventListener, len(s.listeners))
-		copy(listeners, s.listeners)
-		s.mu.RUnlock()
+		if len(s.dispatchQueue) == 0 && s.dispatchClosed {
+			s.dispatchMu.Unlock()
+			return
+		}
+		batch := s.dispatchQueue
+		s.dispatchQueue = nil
+		s.dispatchMu.Unlock()
 
-		for _, l := range listeners {
-			// Catch panics in user listeners to prevent crashing agent/server
-			func(fn EventListener, e Event) {
-				defer func() {
-					_ = recover()
-				}()
-				fn(e)
-			}(l, ev)
+		for _, ev := range batch {
+			s.mu.RLock()
+			if len(s.listeners) == 0 {
+				s.mu.RUnlock()
+				continue
+			}
+			listeners := make([]EventListener, len(s.listeners))
+			copy(listeners, s.listeners)
+			s.mu.RUnlock()
+
+			for _, l := range listeners {
+				// Catch panics in user listeners to prevent crashing agent/server
+				func(fn EventListener, e Event) {
+					defer func() {
+						_ = recover()
+					}()
+					fn(e)
+				}(l, ev)
+			}
 		}
 	}
 }
@@ -263,6 +280,7 @@ func loadEventsJSONL(path string) ([]Event, error) {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -290,6 +308,7 @@ func loadNodesJSONL(path string) (map[NodeKey]Node, error) {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -354,15 +373,13 @@ func (s *Store) AppendEvent(kind EventKind, text string, opts ...AppendEventOpts
 
 	s.events = append(s.events, ev)
 
-	// Send to sequential background dispatcher channel non-blockingly
-	select {
-	case s.eventChan <- ev:
-	default:
-		// Channel buffer full: spin off async goroutine to avoid blocking AppendEvent
-		go func(e Event) {
-			s.eventChan <- e
-		}(ev)
+	// Enqueue for strictly ordered, non-blocking background listener dispatch
+	s.dispatchMu.Lock()
+	if !s.dispatchClosed {
+		s.dispatchQueue = append(s.dispatchQueue, ev)
+		s.dispatchCond.Signal()
 	}
+	s.dispatchMu.Unlock()
 
 	s.mu.Unlock()
 	return ev, nil
@@ -620,9 +637,12 @@ func (s *Store) Close() error {
 	}
 	s.closed = true
 
-	// Close dispatcher channel and wait for dispatcher to finish draining
-	if s.eventChan != nil {
-		close(s.eventChan)
+	// Signal dispatcher to drain remaining events and exit
+	if s.dispatchCond != nil {
+		s.dispatchMu.Lock()
+		s.dispatchClosed = true
+		s.dispatchCond.Broadcast()
+		s.dispatchMu.Unlock()
 	}
 
 	var closeErr error

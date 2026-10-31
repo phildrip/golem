@@ -253,6 +253,19 @@ func Remember(registry StoreRegistry, defaultScope string, args RememberArgs) (R
 		targetScope = defaultScope
 	}
 
+	// Refuse writes to read-only mounted reference stores unless targetScope is
+	// the session's active profile defaultScope (which is mounted read-only for
+	// turn transcripts so only explicit remember() calls write to it).
+	cleanScope := strings.ToLower(targetScope)
+	cleanDefault := strings.ToLower(strings.TrimSpace(defaultScope))
+	if cleanScope != "" && cleanScope != "primary" && cleanScope != "workspace" && cleanScope != cleanDefault {
+		for _, ms := range registry.AllMounted() {
+			if ms != nil && strings.EqualFold(ms.Name, cleanScope) && ms.ReadOnly {
+				return RememberResult{}, errors.Errorf("mounted memory store %q is read-only", ms.Name)
+			}
+		}
+	}
+
 	store, ok := registry.GetStore(targetScope)
 	if !ok || store == nil {
 		store = registry.PrimaryStore()
@@ -267,19 +280,26 @@ func Remember(registry StoreRegistry, defaultScope string, args RememberArgs) (R
 		return RememberResult{}, errors.Wrap(err, "appending memory event")
 	}
 
-	// Auto-sync views across registry so new event is immediately reflected in fractal tails
-	if syncable, ok := registry.(interface{ SyncAll() }); ok {
-		syncable.SyncAll()
-	}
-
-	// Auto-fold level 0 node for immediate tree structuring if not yet present
+	// Auto-fold level 0 node for immediate tree structuring if not yet present,
+	// capping to DefaultNodeTargetBytes so mounted stores without a compactor
+	// never store unbounded nodes. Save the node BEFORE SyncAll() so view fitting
+	// sees the real node size rather than the 64-byte unbuilt placeholder.
 	if _, hasNode := store.GetNode(0, ev.ID); !hasNode {
+		nodeText := ev.FormatLine()
+		if len([]byte(nodeText)) > DefaultNodeTargetBytes {
+			nodeText = TruncateUTF8(nodeText, DefaultNodeTargetBytes)
+		}
 		_ = store.SaveNode(Node{
 			Level: 0,
 			Index: ev.ID,
-			Text:  ev.FormatLine(),
-			Size:  ev.Size,
+			Text:  nodeText,
+			Size:  len([]byte(nodeText)),
 		})
+	}
+
+	// Auto-sync views across registry so new event is immediately reflected in fractal tails
+	if syncable, ok := registry.(interface{ SyncAll() }); ok {
+		syncable.SyncAll()
 	}
 
 	return RememberResult{

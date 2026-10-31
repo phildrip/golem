@@ -187,7 +187,10 @@ func (h *Hub) originAllowed(r *http.Request) bool {
 	if strings.EqualFold(u.Host, r.Host) {
 		return true
 	}
-	for _, allowed := range h.allowOrigins {
+	h.mu.RLock()
+	allowOrigins := h.allowOrigins
+	h.mu.RUnlock()
+	for _, allowed := range allowOrigins {
 		if allowed == "" {
 			continue
 		}

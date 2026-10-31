@@ -1656,11 +1656,15 @@ func (m *Model) updateMemoryStatsCmd() tea.Cmd {
 			}
 		}
 
+		var problems string
+		if m.agent != nil {
+			problems = m.agent.Health().Summary()
+		}
 		return memoryStatsMsg{
 			totalEvents: total,
 			tailLevels:  levels,
 			liveCount:   liveCount,
-			problems:    m.agent.Health().Summary(),
+			problems:    problems,
 		}
 	}
 }
@@ -2225,6 +2229,12 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "/compact":
+		if m.agent == nil || m.agent.Compactor() == nil {
+			m.statusMessage = "Compactor is not available."
+			m.statusMessageAt = time.Now()
+			return m, nil
+		}
+		m.isLoading = true
 		m.statusMessage = "Compacting memory tree..."
 		m.statusMessageAt = time.Now()
 		return m, func() tea.Msg {

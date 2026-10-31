@@ -193,9 +193,12 @@ func (h *Hub) HandleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
-	if !h.closed {
-		h.clients[client] = true
+	if h.closed {
+		h.mu.Unlock()
+		_ = conn.Close()
+		return
 	}
+	h.clients[client] = true
 	h.mu.Unlock()
 
 	go client.writePump()

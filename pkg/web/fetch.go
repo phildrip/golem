@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -32,6 +33,7 @@ type Fetcher struct {
 	// self-hosting against a local service; leave false in production.
 	AllowPrivate bool
 
+	mu     sync.Mutex
 	client *http.Client
 }
 
@@ -44,6 +46,8 @@ func NewFetcher(maxBytes int64) *Fetcher {
 }
 
 func (f *Fetcher) httpClient() *http.Client {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.client != nil {
 		return f.client
 	}
@@ -51,15 +55,24 @@ func (f *Fetcher) httpClient() *http.Client {
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
+	var transport http.RoundTripper = ssrfTransport()
+	if f.AllowPrivate {
+		transport = &http.Transport{ForceAttemptHTTP2: true}
+	}
 	f.client = &http.Client{
 		Timeout:   timeout,
-		Transport: ssrfTransport(),
+		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return errors.New("stopped after 5 redirects")
 			}
 			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
 				return errors.Errorf("redirect to unsupported scheme %q", req.URL.Scheme)
+			}
+			if !f.AllowPrivate {
+				if err := ensurePublicHost(req.Context(), req.URL.Hostname()); err != nil {
+					return err
+				}
 			}
 			return nil
 		},
@@ -220,6 +233,14 @@ func isPublicIP(ip net.IP) bool {
 		if v4[0] == 192 && v4[1] == 0 && v4[2] == 0 { // 192.0.0.0/24
 			return false
 		}
+		if v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) { // 198.18.0.0/15 benchmarking
+			return false
+		}
+		return true
+	}
+	if len(ip) == net.IPv6len && ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b {
+		// 64:ff9b::/96 NAT64 well-known prefix (embeds IPv4 addresses in last 32 bits)
+		return false
 	}
 	return true
 }

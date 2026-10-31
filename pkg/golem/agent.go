@@ -96,6 +96,7 @@ func DefaultConfig() Config {
 
 // Agent wraps the ADK Agent, Runner, and the fractal memory subsystem.
 type Agent struct {
+	cfgMu               sync.RWMutex
 	cfg                 Config
 	store               *fractal.Store
 	view                *fractal.View
@@ -490,7 +491,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 
 		gm, err := gemini.NewModel(ctx, cfg.ModelName, clientCfg)
 		if err != nil {
-			store.Close()
+			memoryMgr.Close()
 			return nil, errors.Wrapf(err, "initializing gemini model %s", cfg.ModelName)
 		}
 		modelInstance = gm
@@ -569,7 +570,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	// policy, so accidents are contained by default.
 	sandboxPolicy, err := sandbox.New(sandboxConfig(cfg.FileConfig.Sandbox), workDir)
 	if err != nil {
-		store.Close()
+		memoryMgr.Close()
 		return nil, errors.Wrap(err, "compiling sandbox policy")
 	}
 	webCfg := config.ResolveWebConfig(cfg.FileConfig.Web)
@@ -716,8 +717,11 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	})
 	invokeSubagentTool, err := subagent.NewInvokeTool(subagentRunner)
 	if err != nil {
-		store.Close()
+		for _, ts := range mcpToolsets {
+			ts.Close()
+		}
 		mcpManager.Close()
+		memoryMgr.Close()
 		return nil, errors.Wrap(err, "creating invoke_subagent tool")
 	}
 	allTools = append(allTools, invokeSubagentTool)
@@ -732,8 +736,11 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	// can route around.
 	graphTools, err := newToolSet(workDir, sandboxPolicy, webCfg, approval.Interactive)
 	if err != nil {
-		store.Close()
+		for _, ts := range mcpToolsets {
+			ts.Close()
+		}
 		mcpManager.Close()
+		memoryMgr.Close()
 		return nil, err
 	}
 	var graphToolsets []tool.Toolset
@@ -760,8 +767,11 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	})
 	graphToolset, err := graph.NewTools(graphMgr)
 	if err != nil {
-		store.Close()
+		for _, ts := range mcpToolsets {
+			ts.Close()
+		}
 		mcpManager.Close()
+		memoryMgr.Close()
 		return nil, errors.Wrap(err, "creating graph tools")
 	}
 	allTools = append(allTools, graphToolset...)
@@ -868,14 +878,22 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 		},
 	})
 	if err != nil {
-		store.Close()
+		for _, ts := range mcpToolsets {
+			ts.Close()
+		}
+		mcpManager.Close()
+		memoryMgr.Close()
 		return nil, errors.Wrap(err, "creating adk llm agent")
 	}
 
 	// 7. Initialize Runner
 	adkRunner, err := runner.NewInMemory("golem-app", adkAgent)
 	if err != nil {
-		store.Close()
+		for _, ts := range mcpToolsets {
+			ts.Close()
+		}
+		mcpManager.Close()
+		memoryMgr.Close()
 		return nil, errors.Wrap(err, "creating in-memory adk runner")
 	}
 
@@ -1058,7 +1076,12 @@ func (a *Agent) ProcessStreamImages(ctx context.Context, input string, images []
 	// the live head can exclude the in-flight turn (the runner passes it in the
 	// conversation) for the whole turn, including mid-turn model calls.
 	a.beginTurn(userEvent.ID)
-	defer a.endTurn()
+	turnParked := false
+	defer func() {
+		if !turnParked {
+			a.endTurn()
+		}
+	}()
 
 	// Sync view
 	a.view.Sync()
@@ -1076,6 +1099,7 @@ func (a *Agent) ProcessStreamImages(ctx context.Context, input string, images []
 		// through RespondToApproval, which re-runs the runner on this same
 		// session so the ADK can re-dispatch the held call.
 		a.setPendingApproval(turnSessionID, pending)
+		turnParked = true
 		return "", ErrAwaitingApproval
 	}
 
@@ -1103,6 +1127,9 @@ func (a *Agent) Close() error {
 	if a.swarmBus != nil {
 		_ = a.swarmBus.Close()
 	}
+	for _, ts := range a.mcpToolsets {
+		ts.Close()
+	}
 	if a.mcpManager != nil {
 		a.mcpManager.Close()
 	}
@@ -1122,11 +1149,16 @@ func (a *Agent) MemoryManager() *fractal.MemoryManager {
 
 // Config returns the active agent configuration.
 func (a *Agent) Config() Config {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
 	return a.cfg
 }
 
 // SwitchProfile hot-switches the active profile on the running Agent, mounting the profile memory store if needed.
 func (a *Agent) SwitchProfile(ctx context.Context, profileName string) (config.ProfileConfig, error) {
+	a.cfgMu.Lock()
+	defer a.cfgMu.Unlock()
+
 	name, prof := config.ResolveActiveProfile(profileName, a.cfg.FileConfig)
 	a.cfg.Profile = name
 
@@ -1168,6 +1200,13 @@ func (a *Agent) SwitchProfile(ctx context.Context, profileName string) (config.P
 	}
 	if a.modelFactory != nil {
 		a.modelFactory.UpdateDefaults(a.cfg.ModelName, a.cfg.Provider, a.cfg.BaseURL, a.cfg.APIKey, a.cfg.FileConfig)
+	}
+	if a.compactor != nil && newModel != nil {
+		summarizer := fractal.NewLLMSummarizer(newModel, golemSystemPrompt)
+		if a.cfg.CompactorModel == "" || a.cfg.CompactorModel == a.cfg.ModelName {
+			summarizer.SetTools([]*genai.Tool{{FunctionDeclarations: toolDeclarations(a.tools)}})
+		}
+		a.compactor.SetSummarizer(summarizer)
 	}
 
 	// 2. Mount target profile memory if configured and unmount previous dynamic profile memory
@@ -1271,6 +1310,9 @@ func (a *Agent) newPrimaryModel(ctx context.Context) (model.LLM, error) {
 // credentials, base URL and memory mounts. It is what the TUI's /model command
 // calls, so a model change does not need a restart.
 func (a *Agent) SwitchModel(ctx context.Context, modelName string) (Config, error) {
+	a.cfgMu.Lock()
+	defer a.cfgMu.Unlock()
+
 	name := strings.TrimSpace(modelName)
 	if name == "" {
 		return a.cfg, errors.New("model name must not be empty")
@@ -1320,6 +1362,8 @@ func (a *Agent) MCPToolsets() []mcp.NamedToolset {
 
 // MCPConfigPaths returns the discovered configuration file paths.
 func (a *Agent) MCPConfigPaths() []string {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
 	return a.cfg.MCPConfigPaths
 }
 

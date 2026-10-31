@@ -397,7 +397,7 @@ type shellRule struct {
 var shellRules = []shellRule{
 	{
 		rule:    "git-destructive",
-		re:      regexp.MustCompile(`\bgit\s+(checkout\s+(--\s+)?\.\s*$|reset\s+--hard|clean\s+-[a-zA-Z]*[fdx])`),
+		re:      regexp.MustCompile(`\bgit\s+(?:-\S+(?:\s+\S+)?\s+)*(checkout\s+(--\s+)?\.(\s*[;&|]|\s*$)|restore\s+(--staged\s+)?(--worktree\s+)?\.(\s*[;&|]|\s*$)|reset\s+--hard\b|clean\s+-[a-zA-Z]*[fdx])`),
 		verdict: Deny,
 		reason:  "this discards uncommitted work in the workspace; use git stash or ask the user",
 	},
@@ -457,8 +457,8 @@ var shellRules = []shellRule{
 	},
 }
 
-// rmRecursive matches a recursive rm invocation.
-var rmRecursive = regexp.MustCompile(`\brm\s+(-[a-zA-Z]+\s+)*-[a-zA-Z]*[rR][a-zA-Z]*\b`)
+// rmRecursive matches a recursive rm invocation (-r, -R, or --recursive).
+var rmRecursive = regexp.MustCompile(`\brm\s+((-\S+\s+)*(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\b)`)
 
 // catastrophicPaths are roots a recursive delete must never touch.
 var catastrophicPaths = map[string]bool{
@@ -497,16 +497,26 @@ func (p *Policy) checkRecursiveRemove(cmd string) (Decision, bool) {
 	if !rmRecursive.MatchString(cmd) {
 		return Decision{}, false
 	}
+	home, _ := os.UserHomeDir()
 	for _, field := range strings.Fields(cmd) {
 		target := strings.Trim(field, `"';`)
-		if !catastrophicPaths[target] {
+		if target == "" || strings.HasPrefix(target, "-") {
 			continue
 		}
-		return Decision{
-			Verdict: Deny,
-			Rule:    "rm-recursive-catastrophic",
-			Reason:  fmt.Sprintf("recursive delete of %s would destroy the machine", target),
-		}, true
+		trimmedWildcard := strings.TrimSuffix(target, "/*")
+		trimmedSlash := strings.TrimRight(trimmedWildcard, "/")
+		if trimmedSlash == "" && strings.HasPrefix(target, "/") {
+			trimmedSlash = "/"
+		}
+		cleaned := filepath.Clean(trimmedSlash)
+		if catastrophicPaths[target] || catastrophicPaths[trimmedWildcard] || catastrophicPaths[trimmedSlash] || catastrophicPaths[cleaned] ||
+			(home != "" && (cleaned == home || trimmedWildcard == home)) {
+			return Decision{
+				Verdict: Deny,
+				Rule:    "rm-recursive-catastrophic",
+				Reason:  fmt.Sprintf("recursive delete of %s would destroy the machine", target),
+			}, true
+		}
 	}
 	return Decision{}, false
 }
@@ -609,10 +619,50 @@ func (p *Policy) resolveExistingAncestor(target string) (string, bool) {
 			return "", false
 		}
 		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
-			return filepath.Join(resolved, filepath.Base(dir)), true
+			rel, err := filepath.Rel(parent, target)
+			if err != nil {
+				return filepath.Join(resolved, filepath.Base(dir)), true
+			}
+			return filepath.Join(resolved, rel), true
 		}
 		dir = parent
 	}
+}
+
+// AllowedExternalRoot returns the directory root from allow_write (or read_only
+// when includeReadOnly is true) that covers path, or "" if none matches.
+func (p *Policy) AllowedExternalRoot(path string, includeReadOnly bool) string {
+	if p == nil || p.mode == ModeOff {
+		return ""
+	}
+	target := p.resolvePath(path)
+	for _, pattern := range p.allowWrite {
+		resolvedPattern := p.resolvePath(pattern)
+		if matchPath(resolvedPattern, target) || matchPath(pattern, target) {
+			if strings.ContainsAny(resolvedPattern, "*?[") {
+				return filepath.Dir(resolvedPattern)
+			}
+			if info, err := os.Stat(resolvedPattern); err == nil && !info.IsDir() {
+				return filepath.Dir(resolvedPattern)
+			}
+			return resolvedPattern
+		}
+	}
+	if includeReadOnly {
+		for _, pattern := range p.readOnly {
+			resolvedPattern := p.resolvePath(pattern)
+			if matchPath(resolvedPattern, target) || matchPath(pattern, target) {
+				if strings.ContainsAny(resolvedPattern, "*?[") {
+					return filepath.Dir(resolvedPattern)
+				}
+				if info, err := os.Stat(resolvedPattern); err == nil && !info.IsDir() {
+					return filepath.Dir(resolvedPattern)
+				}
+				return resolvedPattern
+			}
+		}
+	}
+	return ""
 }
 
 func (p *Policy) underWorkspace(target string) bool {

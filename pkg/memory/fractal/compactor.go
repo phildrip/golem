@@ -334,6 +334,16 @@ func NewCompactor(store *Store, view *View, summarizer Summarizer, cfg Compactor
 	return c
 }
 
+// SetSummarizer hot-swaps the summarizer used by the compactor (e.g. on profile switch).
+func (c *Compactor) SetSummarizer(summarizer Summarizer) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.summarizer = summarizer
+}
+
 // BuildNode builds or verifies the summary node at coordinate (level, index).
 func (c *Compactor) BuildNode(ctx context.Context, level, index int) (Node, error) {
 	if existing, ok := c.store.GetNode(level, index); ok {
@@ -494,7 +504,7 @@ func (c *Compactor) PumpStatus() (int, error) {
 // pumpLocked is Pump's body; the caller holds c.mu.
 func (c *Compactor) pumpLocked(ctx context.Context) (int, error) {
 	total := c.store.CountEvents()
-	tailEnd := total - c.view.cfg.LiveHeadCount
+	tailEnd := total - c.view.LiveHeadCount()
 	if tailEnd <= 0 {
 		return 0, nil
 	}

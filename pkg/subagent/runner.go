@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/user/golem/pkg/memory/fractal"
 	"github.com/user/golem/pkg/swarm"
 	"github.com/user/golem/pkg/tools"
 	"google.golang.org/adk/v2/agent"
@@ -252,7 +253,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 							exitCode = ec
 						}
 						if len(out) > 20000 {
-							out = out[:20000] + "... [truncated]"
+							out = fractal.TruncateUTF8(out, 20000) + "... [truncated]"
 						}
 					}
 					r.cfg.EventHandler(Event{
@@ -336,7 +337,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 			}
 			if ev != nil && ev.Content != nil {
 				for _, part := range ev.Content.Parts {
-					if part.Text != "" {
+					if part.Text != "" && !part.Thought {
 						responseBuilder.WriteString(part.Text)
 					}
 				}
@@ -348,7 +349,7 @@ func (r *Runner) Invoke(ctx context.Context, args InvokeArgs) (InvokeResult, err
 			break
 		}
 
-		if isTransient(runErr) && attempt < maxRetries {
+		if isTransient(runErr) && attempt < maxRetries && atomic.LoadInt32(&toolCallsCount) == 0 {
 			select {
 			case <-ctx.Done():
 				return InvokeResult{

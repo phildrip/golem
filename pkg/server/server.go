@@ -205,7 +205,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 			return
 		}
 		cleanPath := filepath.Clean(req.Path)
-		fi, err := os.Stat(cleanPath)
+		resolvedPath, err := filepath.EvalSymlinks(cleanPath)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid import path: file not found or inaccessible")
+			return
+		}
+		fi, err := os.Stat(resolvedPath)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid import path: file not found or inaccessible")
 			return
@@ -215,7 +220,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 			return
 		}
 
-		// Ensure cleanPath resides within permitted roots: workspace, AGY brain dir, or Cursor workspaceStorage
+		// Ensure resolvedPath resides within permitted roots: workspace, AGY brain dir, or Cursor workspaceStorage
 		allowedRoots := []string{
 			filepath.Clean(s.WorkspaceDir()),
 			filepath.Clean(importer.DefaultAGYBrainDir()),
@@ -223,7 +228,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		}
 		allowed := false
 		for _, root := range allowedRoots {
-			if root != "" && (cleanPath == root || strings.HasPrefix(cleanPath, root+string(filepath.Separator))) {
+			if root == "" {
+				continue
+			}
+			if evalRoot, err := filepath.EvalSymlinks(root); err == nil {
+				root = evalRoot
+			}
+			if resolvedPath == root || strings.HasPrefix(resolvedPath, root+string(filepath.Separator)) {
 				allowed = true
 				break
 			}
@@ -233,7 +244,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 			return
 		}
 
-		sess, err := s.sessions.CreateSessionWithImport(r.Context(), req.Title, cleanPath, req.ID)
+		sess, err := s.sessions.CreateSessionWithImport(r.Context(), req.Title, resolvedPath, req.ID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -301,7 +312,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 					Title:     sess.Title,
 					CreatedAt: sess.CreatedAt,
 					UpdatedAt: sess.UpdatedAt,
-					IsActive:  s.sessions.activeID == sess.ID,
+					IsActive:  s.sessions.ActiveSessionID() == sess.ID,
 					TurnCount: sess.TurnCount,
 				})
 			case http.MethodDelete:
@@ -348,16 +359,16 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 				}
 
 				// Run turn tied to the session's cancelable context
-				go func(sessCtx context.Context, p string) {
-					defer s.sessions.ReleaseTurn(sessionID)
-					turnCtx, cancel := context.WithTimeout(sessCtx, 10*time.Minute)
+				go func(sess *Session, p string) {
+					defer sess.ReleaseTurn()
+					turnCtx, cancel := context.WithTimeout(sess.ctx, 10*time.Minute)
 					defer cancel()
 					if _, err := s.sessions.SendPrompt(turnCtx, sessionID, p); err != nil {
 						// The HTTP caller already has its 202; the turn failing is
 						// logged (and streamed as agent_done) instead of dropped.
 						log.Printf("server: turn for session %s failed: %v", sessionID, err)
 					}
-				}(sess.ctx, req.Prompt)
+				}(sess, req.Prompt)
 
 				writeJSON(w, http.StatusAccepted, map[string]string{"status": "processing"})
 			} else {
@@ -401,14 +412,14 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 					}
 					return
 				}
-				go func(sessCtx context.Context, callID string, approved bool) {
-					defer s.sessions.ReleaseTurn(sessionID)
-					turnCtx, cancel := context.WithTimeout(sessCtx, 10*time.Minute)
+				go func(sess *Session, callID string, approved bool) {
+					defer sess.ReleaseTurn()
+					turnCtx, cancel := context.WithTimeout(sess.ctx, 10*time.Minute)
 					defer cancel()
 					if _, err := s.sessions.SendApproval(turnCtx, sessionID, callID, approved); err != nil {
 						log.Printf("server: resuming session %s after approval failed: %v", sessionID, err)
 					}
-				}(sess.ctx, req.CallID, req.Approved)
+				}(sess, req.CallID, req.Approved)
 				writeJSON(w, http.StatusAccepted, map[string]string{"status": "processing"})
 			default:
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -692,22 +703,24 @@ func (s *Server) handleGetModels(w http.ResponseWriter, r *http.Request) {
 		client := &http.Client{Timeout: 5 * time.Second}
 		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, baseURL+"/models", nil)
 		if err == nil {
-			if resp, err := client.Do(req); err == nil && resp.StatusCode == http.StatusOK {
-				var data struct {
-					Data []struct {
-						ID string `json:"id"`
-					} `json:"data"`
-				}
-				if err := json.NewDecoder(resp.Body).Decode(&data); err == nil && len(data.Data) > 0 {
-					_ = resp.Body.Close()
-					models := make([]string, 0, len(data.Data))
-					for _, m := range data.Data {
-						if m.ID != "" {
-							models = append(models, m.ID)
-						}
+			if resp, err := client.Do(req); err == nil {
+				if resp.StatusCode == http.StatusOK {
+					var data struct {
+						Data []struct {
+							ID string `json:"id"`
+						} `json:"data"`
 					}
-					writeJSON(w, http.StatusOK, ModelsResponse{Provider: "opencode", Models: models})
-					return
+					if err := json.NewDecoder(resp.Body).Decode(&data); err == nil && len(data.Data) > 0 {
+						_ = resp.Body.Close()
+						models := make([]string, 0, len(data.Data))
+						for _, m := range data.Data {
+							if m.ID != "" {
+								models = append(models, m.ID)
+							}
+						}
+						writeJSON(w, http.StatusOK, ModelsResponse{Provider: "opencode", Models: models})
+						return
+					}
 				}
 				_ = resp.Body.Close()
 			}

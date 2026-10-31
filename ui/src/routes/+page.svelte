@@ -86,10 +86,10 @@
 
 	// Auth gate: the SPA shell loads unauthenticated, so ask the server whether a
 	// token is needed before opening the WebSocket or fetching any session data.
-	let authState: 'checking' | 'locked' | 'open' = 'checking';
-	let tokenInput = '';
-	let authError = '';
-	let authSubmitting = false;
+	let authState = $state<'checking' | 'locked' | 'open'>('checking');
+	let tokenInput = $state('');
+	let authError = $state('');
+	let authSubmitting = $state(false);
 
 	async function checkAuthThenConnect() {
 		try {
@@ -103,6 +103,8 @@
 		}
 		authState = 'open';
 		realtime.connect();
+		fetchSessions();
+		fetchProfiles();
 	}
 
 	async function submitToken(event: Event) {
@@ -145,9 +147,6 @@
 		unsubscribeWS = realtime.subscribe((event: WSEvent) => {
 			handleRealtimeEvent(event);
 		});
-
-		fetchSessions();
-		fetchProfiles();
 	});
 
 	onDestroy(() => {
@@ -605,13 +604,6 @@
 						? current.filter((l) => l.resource !== payload.lock.resource)
 						: [...current.filter((l) => l.resource !== payload.lock.resource), payload.lock];
 				$swarmLocks = { ...$swarmLocks, [sessId]: next };
-				break;
-			}
-
-			case 'profile_changed': {
-				const payload = event.payload as ProfilesResponse;
-				if (payload.active_profile) $activeProfile = payload.active_profile;
-				if (payload.profiles) $profilesList = payload.profiles;
 				break;
 			}
 		}

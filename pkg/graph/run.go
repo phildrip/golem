@@ -129,6 +129,12 @@ func (m *Manager) execute(ctx agent.Context, spec *Spec, rec *RunRecord, resume 
 
 	timeout := time.Duration(spec.Budgets.MaxWallSeconds) * time.Second
 	budget.setDeadline(time.Now().Add(timeout))
+	runCtx := context.Context(ctx)
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	if resume != nil {
 		// Tokens spent by earlier turns still count against the ceiling.
 		budget.add("", int(rec.Tokens))
@@ -160,7 +166,7 @@ func (m *Manager) execute(ctx agent.Context, spec *Spec, rec *RunRecord, resume 
 	// the function responses from its own tool calls and re-calls the same
 	// tool until the wall clock kills the run. The session is the run's durable
 	// memory, so it outlives this turn when the graph pauses.
-	seq, drv, err := m.drive(ctx, spec, rec, wf, resume)
+	seq, drv, err := m.drive(ctx, runCtx, spec, rec, wf, resume)
 	if err != nil {
 		res.Duration = time.Since(start)
 		res.Err = fmt.Sprintf("graph failed to start: %v", err)
@@ -501,7 +507,7 @@ func (d *runDriver) events(ctx context.Context) ([]*session.Event, error) {
 // The session is durable — it lives at .golem/graphs/runs/<run-id>/session — and
 // is what a resumed turn reads back, so a graph that paused on a human approval
 // continues where it stopped instead of starting over.
-func (m *Manager) drive(ctx agent.Context, spec *Spec, rec *RunRecord, wf *workflow.Workflow, resume *Decision) (iter.Seq2[*session.Event, error], *runDriver, error) {
+func (m *Manager) drive(ctx agent.Context, runCtx context.Context, spec *Spec, rec *RunRecord, wf *workflow.Workflow, resume *Decision) (iter.Seq2[*session.Event, error], *runDriver, error) {
 	svc, sess, err := openFileSessionService(ctx, m.sessionDir(rec.RunID), graphAppName, m.userID, rec.SessionID)
 	if err != nil {
 		return nil, nil, err
@@ -545,7 +551,7 @@ func (m *Manager) drive(ctx agent.Context, spec *Spec, rec *RunRecord, wf *workf
 		return nil, nil, errors.Wrap(err, "creating the graph runner")
 	}
 
-	seq := r.Run(ctx, m.userID, rec.SessionID, content, agent.RunConfig{
+	seq := r.Run(runCtx, m.userID, rec.SessionID, content, agent.RunConfig{
 		StreamingMode: agent.StreamingModeNone,
 	})
 	return seq, drv, nil

@@ -62,3 +62,19 @@ func (o options) checkWrite(ctx approval.Approver, toolName, path, action string
 func (o options) checkShell(ctx approval.Approver, command string) error {
 	return o.gate(ctx, "shell", o.policy.CheckShell(command, o.policy.Workspace()), command)
 }
+
+// effectiveBaseDir returns baseDir unless the path is outside baseDir and
+// explicitly granted by the sandbox policy's allow_write (or read_only when
+// allowReadOnly is true), in which case it returns the matched policy root so
+// resolveSafePath confines the operation to that allowed tree.
+func (o options) effectiveBaseDir(baseDir, path string, allowReadOnly bool) string {
+	if _, err := resolveSafePath(baseDir, path); err == nil {
+		return baseDir
+	}
+	if o.policy != nil {
+		if allowedRoot := o.policy.AllowedExternalRoot(path, allowReadOnly); allowedRoot != "" {
+			return allowedRoot
+		}
+	}
+	return baseDir
+}

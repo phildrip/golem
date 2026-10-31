@@ -129,6 +129,18 @@ func TestFileOperations(t *testing.T) {
 				if err == nil {
 					t.Errorf("expected error writing outside baseDir, got nil")
 				}
+				outsideDir := t.TempDir()
+				outsideFile := filepath.Join(outsideDir, "secret.txt")
+				_ = os.WriteFile(outsideFile, []byte("secret"), 0644)
+				symPath := filepath.Join(tempDir, "sym_secret.txt")
+				if err := os.Symlink(outsideFile, symPath); err == nil {
+					if _, err := ReadFile(tempDir, "sym_secret.txt"); err == nil {
+						t.Errorf("expected error reading symlink pointing outside baseDir, got nil")
+					}
+					if err := WriteFile(tempDir, "sym_secret.txt", "overwrite"); err == nil {
+						t.Errorf("expected error writing symlink pointing outside baseDir, got nil")
+					}
+				}
 			},
 			verify: func(t *testing.T) {},
 		},

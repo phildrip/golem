@@ -176,7 +176,7 @@ func decodeSpec(raw string) (Spec, error) {
 // up. They are readable and executable, and anything not listed is invisible.
 var defaultReadOnlyPaths = []string{
 	"/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32",
-	"/etc", "/opt", "/usr/local", "/nix", "/run/current-system",
+	"/etc", "/opt", "/usr/local", "/nix", "/run/current-system", "~/.gitconfig",
 }
 
 // defaultReadWritePaths are paths that must stay writable for ordinary work to
@@ -184,7 +184,7 @@ var defaultReadOnlyPaths = []string{
 // writes to, and the build caches that turn a cold build into a fast one.
 var defaultReadWritePaths = []string{
 	"/tmp", "/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom",
-	"~/.cache/go-build", "~/.cache/pip", "~/.npm", "~/.cargo/registry", "~/.gitconfig",
+	"~/.cache/go-build", "~/.cache/pip", "~/.npm", "~/.cargo/registry",
 }
 
 // expandHome turns a leading ~ into the user's home directory.
@@ -228,7 +228,8 @@ func goToolchainPaths() (readOnly, readWrite []string) {
 		readOnly = append(readOnly, goroot)
 	}
 	if gopath := os.Getenv("GOPATH"); gopath != "" {
-		readWrite = append(readWrite, gopath)
+		readOnly = append(readOnly, gopath)
+		readWrite = append(readWrite, filepath.Join(gopath, "pkg", "mod"))
 	}
 	if cache := os.Getenv("GOCACHE"); cache != "" {
 		readWrite = append(readWrite, cache)

@@ -181,6 +181,13 @@ func (a *Agent) RespondToApproval(ctx context.Context, callID string, approved b
 	a.pendingApproval = nil
 	a.approvalMu.Unlock()
 
+	turnParked := false
+	defer func() {
+		if !turnParked {
+			a.endTurn()
+		}
+	}()
+
 	content := genai.NewContentFromParts([]*genai.Part{{
 		FunctionResponse: &genai.FunctionResponse{
 			ID:   pending.CallID,
@@ -197,6 +204,7 @@ func (a *Agent) RespondToApproval(ctx context.Context, callID string, approved b
 	}
 	if next := a.pendingApprovalRequest(); next != nil {
 		a.setPendingApproval(sessionID, next)
+		turnParked = true
 		return "", ErrAwaitingApproval
 	}
 

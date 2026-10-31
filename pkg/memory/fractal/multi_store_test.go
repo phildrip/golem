@@ -123,4 +123,25 @@ func TestMultiZoomAndRememberTools(t *testing.T) {
 	if !hasNode || !strings.Contains(node.Text, "always run gofumpt") {
 		t.Errorf("expected level 0 node auto-folded in mountedStore, got: %+v", node)
 	}
+
+	// 4. Verify non-default read-only mounted store refuses Remember writes
+	roStore, _ := OpenStore(t.TempDir())
+	defer roStore.Close()
+	mgr.Mount("docs", roStore, NewView(roStore, DefaultViewConfig()), true)
+	if _, err := Remember(mgr, "work", RememberArgs{Text: "do not write here", Scope: "docs"}); err == nil {
+		t.Errorf("expected error when writing to read-only mounted store 'docs', got nil")
+	}
+
+	// 5. Verify oversized Remember text is capped in the level-0 node
+	longText := strings.Repeat("a", DefaultNodeTargetBytes+200)
+	if _, err := Remember(mgr, "work", RememberArgs{Text: longText, Scope: "work"}); err != nil {
+		t.Fatalf("Remember long text failed: %v", err)
+	}
+	cappedNode, ok := mountedStore.GetNode(0, 2)
+	if !ok {
+		t.Fatalf("expected level 0 node at index 2")
+	}
+	if len([]byte(cappedNode.Text)) > DefaultNodeTargetBytes {
+		t.Errorf("expected level 0 node <= %d bytes, got %d", DefaultNodeTargetBytes, len([]byte(cappedNode.Text)))
+	}
 }

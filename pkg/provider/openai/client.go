@@ -200,8 +200,15 @@ type openAIChatChoice struct {
 	FinishReason string                    `json:"finish_reason"`
 }
 
+type openAIUsage struct {
+	PromptTokens     int32 `json:"prompt_tokens"`
+	CompletionTokens int32 `json:"completion_tokens"`
+	TotalTokens      int32 `json:"total_tokens"`
+}
+
 type openAIChatResponse struct {
 	Choices []openAIChatChoice `json:"choices"`
+	Usage   *openAIUsage       `json:"usage,omitempty"`
 	Error   *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
@@ -424,7 +431,6 @@ func (c *Client) convertRequest(req *model.LLMRequest, stream bool) (*openAIChat
 				callID := part.FunctionCall.ID
 				if callID == "" {
 					callID = fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, time.Now().UnixNano())
-					part.FunctionCall.ID = callID
 				}
 				toolCalls = append(toolCalls, openAIToolCall{
 					ID:   callID,
@@ -587,8 +593,17 @@ func (c *Client) handleUnaryResponse(r io.Reader, yield func(*model.LLMResponse,
 		return
 	}
 
+	var usage *genai.GenerateContentResponseUsageMetadata
+	if resp.Usage != nil && resp.Usage.TotalTokens > 0 {
+		usage = &genai.GenerateContentResponseUsageMetadata{
+			PromptTokenCount:     resp.Usage.PromptTokens,
+			CandidatesTokenCount: resp.Usage.CompletionTokens,
+			TotalTokenCount:      resp.Usage.TotalTokens,
+		}
+	}
+
 	if len(resp.Choices) == 0 {
-		yield(&model.LLMResponse{TurnComplete: true}, nil)
+		yield(&model.LLMResponse{TurnComplete: true, UsageMetadata: usage}, nil)
 		return
 	}
 
@@ -639,8 +654,9 @@ func (c *Client) handleUnaryResponse(r io.Reader, yield func(*model.LLMResponse,
 	}
 
 	yield(&model.LLMResponse{
-		Content:      content,
-		TurnComplete: true,
+		Content:       content,
+		TurnComplete:  true,
+		UsageMetadata: usage,
 	}, nil)
 }
 
@@ -658,6 +674,7 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 
 	var accumulatedText strings.Builder
 	var accumulatedReasoning strings.Builder
+	var lastUsage *genai.GenerateContentResponseUsageMetadata
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data:") {
@@ -678,6 +695,14 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 		if chunk.Error != nil && chunk.Error.Message != "" {
 			yield(nil, errors.New(chunk.Error.Message))
 			return
+		}
+
+		if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
+			lastUsage = &genai.GenerateContentResponseUsageMetadata{
+				PromptTokenCount:     chunk.Usage.PromptTokens,
+				CandidatesTokenCount: chunk.Usage.CompletionTokens,
+				TotalTokenCount:      chunk.Usage.TotalTokens,
+			}
 		}
 
 		if len(chunk.Choices) == 0 {
@@ -811,7 +836,8 @@ func (c *Client) handleStreamingResponse(r io.Reader, yield func(*model.LLMRespo
 	}
 
 	yield(&model.LLMResponse{
-		Content:      finalContent,
-		TurnComplete: true,
+		Content:       finalContent,
+		TurnComplete:  true,
+		UsageMetadata: lastUsage,
 	}, scanner.Err())
 }

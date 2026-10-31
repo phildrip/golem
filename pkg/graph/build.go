@@ -440,14 +440,24 @@ func (m *budgetModel) GenerateContent(ctx context.Context, req *model.LLMRequest
 				m.budget.Tokens(), m.budget.limit, m.node))
 			return
 		}
+		var accounted int
 		for resp, err := range m.inner.GenerateContent(ctx, req, stream) {
 			if resp != nil && resp.UsageMetadata != nil {
-				m.budget.add(m.node, int(resp.UsageMetadata.TotalTokenCount))
+				total := int(resp.UsageMetadata.TotalTokenCount)
+				if total > accounted {
+					m.budget.add(m.node, total-accounted)
+					accounted = total
+				}
 			}
 			if !yield(resp, err) {
 				return
 			}
 			if err != nil {
+				return
+			}
+			if m.budget.exhausted() {
+				yield(nil, fmt.Errorf("graph token budget exhausted (%d of %d tokens spent) at node %q",
+					m.budget.Tokens(), m.budget.limit, m.node))
 				return
 			}
 		}

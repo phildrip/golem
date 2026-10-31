@@ -15,7 +15,8 @@ export type WSEventType =
 	| 'patch_applied'
 	| 'swarm_message'
 	| 'swarm_lock'
-	| 'approval_request';
+	| 'approval_request'
+	| 'profile_changed';
 
 // ApprovalPrompt is a sandbox confirmation waiting for a human: the exact
 // command or patch, plus why the policy asked.
@@ -70,7 +71,7 @@ export interface SessionInfo {
 
 export interface DiscoveredSession {
 	id: string;
-	format: 'agy' | 'cursor';
+	format: 'agy' | 'cursor' | 'opencode';
 	title: string;
 	path: string;
 	workspace?: string;

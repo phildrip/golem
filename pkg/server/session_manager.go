@@ -270,6 +270,13 @@ func (sm *SessionManager) ActiveSession() (*Session, bool) {
 	return sess, ok
 }
 
+// ActiveSessionID returns the current active session ID under read lock.
+func (sm *SessionManager) ActiveSessionID() string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.activeID
+}
+
 // UpdateBaseConfig updates the base configuration for future sessions.
 func (sm *SessionManager) UpdateBaseConfig(cfg golem.Config) {
 	sm.mu.Lock()
@@ -294,12 +301,20 @@ func (sm *SessionManager) TryAcquireTurn(sessionID string) (*Session, bool) {
 }
 
 // ReleaseTurn marks the session turn execution as completed.
+func (s *Session) ReleaseTurn() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.isBusy = false
+	s.mu.Unlock()
+	s.turnWg.Done()
+}
+
+// ReleaseTurn marks the session turn execution as completed by session ID.
 func (sm *SessionManager) ReleaseTurn(sessionID string) {
 	if sess, ok := sm.GetSession(sessionID); ok {
-		sess.mu.Lock()
-		sess.isBusy = false
-		sess.mu.Unlock()
-		sess.turnWg.Done()
+		sess.ReleaseTurn()
 	}
 }
 
@@ -520,10 +535,17 @@ func (a *sessionStreamAdapter) OnSubagentDone(role, model, result string, durati
 // Close gracefully closes all active sessions.
 func (sm *SessionManager) Close() {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
+	sessions := make([]*Session, 0, len(sm.sessions))
 	for id, s := range sm.sessions {
 		s.cancel()
+		sessions = append(sessions, s)
+		delete(sm.sessions, id)
+	}
+	sm.activeID = ""
+	sm.mu.Unlock()
+
+	for _, s := range sessions {
+		s.turnWg.Wait()
 		if s.unsubSwarm != nil {
 			s.unsubSwarm()
 		}
@@ -531,6 +553,5 @@ func (sm *SessionManager) Close() {
 			s.unsubLock()
 		}
 		_ = s.Agent.Close()
-		delete(sm.sessions, id)
 	}
 }

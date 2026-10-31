@@ -16,7 +16,7 @@ import (
 var ErrPathOutOfBounds = errors.New("file path is outside allowed directory")
 
 // resolveSafePath ensures path is evaluated relative to baseDir (defaulting to current working dir)
-// and does not escape baseDir via directory traversal.
+// and does not escape baseDir via directory traversal or symlinks.
 func resolveSafePath(baseDir, path string) (string, error) {
 	if baseDir == "" {
 		var err error
@@ -29,23 +29,55 @@ func resolveSafePath(baseDir, path string) (string, error) {
 	if err != nil {
 		return "", errors.Wrapf(err, "resolving absolute path for base %s", baseDir)
 	}
+	if resolvedBase, err := filepath.EvalSymlinks(absBase); err == nil {
+		absBase = resolvedBase
+	}
 
 	target := path
+	if strings.HasPrefix(target, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			target = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(target, "~"), "/"))
+		}
+	}
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(absBase, target)
 	}
 	cleanedTarget := filepath.Clean(target)
+	resolvedTarget := evalPathWithExistingAncestor(cleanedTarget)
 
-	rel, err := filepath.Rel(absBase, cleanedTarget)
+	rel, err := filepath.Rel(absBase, resolvedTarget)
 	if err != nil {
-		return "", errors.Wrapf(err, "computing relative path from %s to %s", absBase, cleanedTarget)
+		return "", errors.Wrapf(err, "computing relative path from %s to %s", absBase, resolvedTarget)
 	}
 
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", errors.Wrapf(ErrPathOutOfBounds, "path %q escapes workspace root %q", path, absBase)
 	}
 
-	return cleanedTarget, nil
+	return resolvedTarget, nil
+}
+
+// evalPathWithExistingAncestor resolves symlinks on target, or on its deepest
+// existing ancestor when the target leaf (or intermediate dirs) do not exist yet.
+func evalPathWithExistingAncestor(target string) string {
+	if resolved, err := filepath.EvalSymlinks(target); err == nil {
+		return resolved
+	}
+	dir := target
+	for {
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return target
+		}
+		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+			rel, err := filepath.Rel(parent, target)
+			if err != nil {
+				return filepath.Join(resolved, filepath.Base(target))
+			}
+			return filepath.Join(resolved, rel)
+		}
+		dir = parent
+	}
 }
 
 // ReadFileArgs defines input for reading a file.
@@ -82,7 +114,7 @@ func NewReadFileTool(baseDir string, opts ...Option) (tool.Tool, error) {
 		if err := o.checkRead(ctx, "read_file", args.FilePath); err != nil {
 			return ReadFileResult{}, err
 		}
-		content, err := ReadFile(baseDir, args.FilePath)
+		content, err := ReadFile(o.effectiveBaseDir(baseDir, args.FilePath, true), args.FilePath)
 
 		if err != nil {
 			return ReadFileResult{}, errors.Wrap(err, "reading file")
@@ -132,7 +164,7 @@ func NewWriteFileTool(baseDir string, opts ...Option) (tool.Tool, error) {
 		if err := o.checkWrite(ctx, "write_file", args.FilePath, "write_file "+args.FilePath); err != nil {
 			return WriteFileResult{}, err
 		}
-		if err := WriteFile(baseDir, args.FilePath, args.Content); err != nil {
+		if err := WriteFile(o.effectiveBaseDir(baseDir, args.FilePath, false), args.FilePath, args.Content); err != nil {
 			return WriteFileResult{}, errors.Wrap(err, "writing file")
 		}
 		return WriteFileResult{
@@ -200,7 +232,7 @@ func NewReplaceRegexTool(baseDir string, opts ...Option) (tool.Tool, error) {
 			"replace_regex "+args.FilePath+" /"+args.Pattern+"/"); err != nil {
 			return ReplaceRegexResult{}, err
 		}
-		matched, err := ReplaceStringWithRegex(baseDir, args.FilePath, args.Pattern, args.Replacement)
+		matched, err := ReplaceStringWithRegex(o.effectiveBaseDir(baseDir, args.FilePath, false), args.FilePath, args.Pattern, args.Replacement)
 		if err != nil {
 			return ReplaceRegexResult{}, errors.Wrap(err, "replacing regex in file")
 		}

@@ -92,6 +92,7 @@ func (c *Client) Start(ctx context.Context) error {
 	c.stdout = stdout
 	c.stderr = stderr
 	c.scanner = bufio.NewScanner(stdout)
+	c.scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	c.running = true
 
 	// Drain stderr in background to avoid blocking
@@ -317,12 +318,12 @@ func (c *Client) stopLocked() {
 		_ = c.stdin.Close()
 	}
 	if c.cmd != nil && c.cmd.Process != nil {
-		_ = c.cmd.Process.Signal(os.Interrupt)
-		time.AfterFunc(1*time.Second, func() {
-			if c.cmd != nil && c.cmd.Process != nil {
-				_ = c.cmd.Process.Kill()
-			}
+		proc := c.cmd.Process
+		_ = proc.Signal(os.Interrupt)
+		timer := time.AfterFunc(1*time.Second, func() {
+			_ = proc.Kill()
 		})
 		_ = c.cmd.Wait()
+		timer.Stop()
 	}
 }

@@ -633,6 +633,12 @@ func MergeConfigs(userCfg, wsCfg FileConfig) FileConfig {
 		if len(wsCfg.Sandbox.AllowWrite) > 0 {
 			merged.Sandbox.AllowWrite = append([]string(nil), wsCfg.Sandbox.AllowWrite...)
 		}
+		if len(wsCfg.Sandbox.ReadOnly) > 0 {
+			merged.Sandbox.ReadOnly = append([]string(nil), wsCfg.Sandbox.ReadOnly...)
+		}
+		if wsCfg.Sandbox.Network != "" {
+			merged.Sandbox.Network = wsCfg.Sandbox.Network
+		}
 		if len(wsCfg.Sandbox.AllowNet) > 0 {
 			merged.Sandbox.AllowNet = append([]string(nil), wsCfg.Sandbox.AllowNet...)
 		}
@@ -644,6 +650,42 @@ func MergeConfigs(userCfg, wsCfg FileConfig) FileConfig {
 		}
 		if wsCfg.Sandbox.ShellTimeout != "" {
 			merged.Sandbox.ShellTimeout = wsCfg.Sandbox.ShellTimeout
+		}
+		if len(wsCfg.Sandbox.MCPAllow) > 0 {
+			merged.Sandbox.MCPAllow = append([]string(nil), wsCfg.Sandbox.MCPAllow...)
+		}
+		if wsCfg.Sandbox.Audit != "" {
+			merged.Sandbox.Audit = wsCfg.Sandbox.Audit
+		}
+	}
+
+	if wsCfg.Web != nil {
+		if merged.Web == nil {
+			merged.Web = &WebConfig{}
+		} else {
+			clone := *merged.Web
+			merged.Web = &clone
+		}
+		if wsCfg.Web.Provider != "" {
+			merged.Web.Provider = wsCfg.Web.Provider
+		}
+		if wsCfg.Web.APIKey != "" {
+			merged.Web.APIKey = wsCfg.Web.APIKey
+		}
+		if wsCfg.Web.APIKeyEnv != "" {
+			merged.Web.APIKeyEnv = wsCfg.Web.APIKeyEnv
+		}
+		if wsCfg.Web.CX != "" {
+			merged.Web.CX = wsCfg.Web.CX
+		}
+		if wsCfg.Web.CXEnv != "" {
+			merged.Web.CXEnv = wsCfg.Web.CXEnv
+		}
+		if wsCfg.Web.BaseURL != "" {
+			merged.Web.BaseURL = wsCfg.Web.BaseURL
+		}
+		if wsCfg.Web.MaxFetch > 0 {
+			merged.Web.MaxFetch = wsCfg.Web.MaxFetch
 		}
 	}
 

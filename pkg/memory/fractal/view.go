@@ -65,12 +65,20 @@ func (p ViewPart) Address() string {
 
 // View manages the active multi-resolution summary view tiling over older events.
 type View struct {
-	mu     sync.RWMutex
-	cfg    ViewConfig
-	store  *Store
-	parts  []ViewPart
-	tailTo int  // number of events covered by the tail
-	dirty  bool // tiling changed since it was last persisted
+	mu         sync.RWMutex
+	cfg        ViewConfig
+	store      *Store
+	parts      []ViewPart
+	tailTo     int  // number of events covered by the tail
+	dirty      bool // tiling changed since it was last persisted
+	coarsening bool // true when a sawtooth batch is in progress toward LowWaterBytes
+}
+
+// LiveHeadCount returns the configured live-head message count.
+func (v *View) LiveHeadCount() int {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.cfg.LiveHeadCount
 }
 
 // NewView constructs a View over the given Store. It loads the persisted tiling
@@ -283,19 +291,27 @@ func (v *View) bestMergeIndexFor(parts []ViewPart) int {
 // Between batches the view only grows at its end; a small append below the
 // high-water mark never triggers a merge, so old lines do not churn.
 func (v *View) fitLocked() {
-	if v.calculateSizeBytes() <= v.cfg.ViewBudgetBytes {
+	if v.calculateSizeBytes() > v.cfg.ViewBudgetBytes {
+		v.coarsening = true
+	}
+	if !v.coarsening {
 		return
 	}
 
 	for {
 		currentSize := v.calculateSizeBytes()
-		if currentSize <= v.cfg.LowWaterBytes || len(v.parts) < 2 {
+		if currentSize <= v.cfg.LowWaterBytes {
+			v.coarsening = false
+			break
+		}
+		if len(v.parts) < 2 {
 			break
 		}
 
 		bestIdx := v.bestMergeIndex()
 		if bestIdx == -1 {
-			// No built parents available to coarsen; cannot shrink further right now
+			// No built parents available to coarsen; cannot shrink further right now.
+			// Keep v.coarsening = true so Sync() finishes the batch once parents are built.
 			break
 		}
 

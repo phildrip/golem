@@ -90,6 +90,16 @@ func (m *Model) resumeAgentTurnCmd(ctx context.Context, callID string, approved 
 
 	go func() {
 		defer close(msgChan)
+		defer func() {
+			if r := recover(); r != nil {
+				select {
+				case <-ctx.Done():
+				case msgChan <- agentDoneMsg{
+					err: fmt.Errorf("agent internal error: %v", r),
+				}:
+				}
+			}
+		}()
 		reply, err := m.agent.RespondToApproval(ctx, callID, approved, bridge)
 		select {
 		case <-ctx.Done():

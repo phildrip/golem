@@ -36,6 +36,9 @@ func ParseAnchor(raw string) (LineAnchor, error) {
 	// Strip optional trailing colon (matches hashline tokenizer consume_optional_colon)
 	raw = strings.TrimSuffix(raw, ":")
 	parts := strings.Split(raw, ":")
+	if len(parts) > 2 {
+		return LineAnchor{}, errors.Errorf("invalid anchor %q: too many colons (use 'start..end' or 'start end' for ranges)", raw)
+	}
 	num, err := strconv.Atoi(parts[0])
 	if err != nil {
 		return LineAnchor{}, errors.Wrapf(err, "invalid line number in anchor %q", raw)
@@ -269,14 +272,36 @@ func PatchFileWithHashline(baseDir, filePath, op, anchorStr, content string, dry
 		}
 	}
 
-	// Clean content lines (strip optional "+ " prefixes from unified diff / hashline bodies)
+	// Clean content lines: only strip "+ " diff prefixes when all non-empty lines
+	// use the "+ " convention, so literal code lines starting with "+" are never corrupted.
 	var newBodyLines []string
 	if content != "" {
-		for _, row := range strings.Split(content, "\n") {
+		normalized := strings.TrimSuffix(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+		rawContentLines := strings.Split(normalized, "\n")
+		allDiffPrefixed := false
+		hasPlusSpace := false
+		for _, row := range rawContentLines {
+			if row == "" || row == "+" {
+				continue
+			}
 			if strings.HasPrefix(row, "+ ") {
-				newBodyLines = append(newBodyLines, strings.TrimPrefix(row, "+ "))
-			} else if strings.HasPrefix(row, "+") {
-				newBodyLines = append(newBodyLines, strings.TrimPrefix(row, "+"))
+				hasPlusSpace = true
+				allDiffPrefixed = true
+			} else {
+				allDiffPrefixed = false
+				hasPlusSpace = false
+				break
+			}
+		}
+		for _, row := range rawContentLines {
+			if allDiffPrefixed && hasPlusSpace {
+				if strings.HasPrefix(row, "+ ") {
+					newBodyLines = append(newBodyLines, strings.TrimPrefix(row, "+ "))
+				} else if row == "+" {
+					newBodyLines = append(newBodyLines, "")
+				} else {
+					newBodyLines = append(newBodyLines, row)
+				}
 			} else {
 				newBodyLines = append(newBodyLines, row)
 			}
@@ -487,7 +512,7 @@ func NewHashlineReadTool(baseDir string, opts ...Option) (tool.Tool, error) {
 		if err := o.checkRead(ctx, "hashline_read", args.FilePath); err != nil {
 			return HashlineReadResult{}, err
 		}
-		return ReadFileWithHashlines(baseDir, args.FilePath, args.StartLine, args.LineCount)
+		return ReadFileWithHashlines(o.effectiveBaseDir(baseDir, args.FilePath, true), args.FilePath, args.StartLine, args.LineCount)
 	})
 }
 
@@ -501,7 +526,7 @@ func NewHashlineFindBlockTool(baseDir string, opts ...Option) (tool.Tool, error)
 		if err := o.checkRead(ctx, "hashline_find_block", args.FilePath); err != nil {
 			return HashlineFindBlockResult{}, err
 		}
-		return FindBlockWithHashline(baseDir, args.FilePath, args.Anchor)
+		return FindBlockWithHashline(o.effectiveBaseDir(baseDir, args.FilePath, true), args.FilePath, args.Anchor)
 	})
 }
 
@@ -518,6 +543,6 @@ func NewHashlinePatchTool(baseDir string, opts ...Option) (tool.Tool, error) {
 				return HashlinePatchResult{}, err
 			}
 		}
-		return PatchFileWithHashline(baseDir, args.FilePath, args.Op, args.Anchor, args.Content, args.DryRun)
+		return PatchFileWithHashline(o.effectiveBaseDir(baseDir, args.FilePath, false), args.FilePath, args.Op, args.Anchor, args.Content, args.DryRun)
 	})
 }

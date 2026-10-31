@@ -436,4 +436,40 @@ func TestHashline_ParseAnchor_TrailingColon(t *testing.T) {
 	if a.LineNum != 42 || a.Hash != "a3" {
 		t.Errorf("expected 42:a3, got %d:%s", a.LineNum, a.Hash)
 	}
+	if _, err := ParseAnchor("42:a3:45:f1"); err == nil {
+		t.Errorf("expected error for anchor with multiple colons, got nil")
+	}
+}
+
+func TestHashline_PreservesLeadingPlusInRawCode(t *testing.T) {
+	tempDir := t.TempDir()
+	filePath := "math.js"
+	fullPath := filepath.Join(tempDir, filePath)
+	if err := os.WriteFile(fullPath, []byte("let x = 1;\n"), 0644); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	readRes, _ := ReadFileWithHashlines(tempDir, filePath, 1, 5)
+	anchor := readRes.Lines[0].Anchor
+
+	// Raw code where a line starts with "+" must not have "+" stripped.
+	rawReplacement := "let x = 1;\n+x;\n"
+	if _, err := PatchFileWithHashline(tempDir, filePath, "SWAP", anchor, rawReplacement, false); err != nil {
+		t.Fatalf("patch failed: %v", err)
+	}
+	got, _ := os.ReadFile(fullPath)
+	if string(got) != "let x = 1;\n+x;\n" {
+		t.Errorf("expected '+x;' preserved without extra blank line, got %q", string(got))
+	}
+
+	// Unified diff style where all lines start with "+ " should still strip "+ ".
+	readRes2, _ := ReadFileWithHashlines(tempDir, filePath, 1, 5)
+	rangeAnchor := readRes2.Lines[0].Anchor + ".." + readRes2.Lines[1].Anchor
+	if _, err := PatchFileWithHashline(tempDir, filePath, "SWAP", rangeAnchor, "+ const a = 1;\n+ const b = 2;", false); err != nil {
+		t.Fatalf("diff-prefixed patch failed: %v", err)
+	}
+	got2, _ := os.ReadFile(fullPath)
+	if string(got2) != "const a = 1;\nconst b = 2;\n" {
+		t.Errorf("expected '+ ' stripped on unified diff block, got %q", string(got2))
+	}
 }
