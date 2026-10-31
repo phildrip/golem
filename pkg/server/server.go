@@ -322,6 +322,19 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 					return
 				}
 				writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+			case http.MethodPatch:
+				var patchReq struct {
+					Title string `json:"title"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&patchReq); err != nil {
+					writeError(w, http.StatusBadRequest, "invalid request body")
+					return
+				}
+				if s.sessions.RenameSession(sessionID, patchReq.Title) {
+					writeJSON(w, http.StatusOK, map[string]string{"status": "renamed"})
+				} else {
+					writeError(w, http.StatusNotFound, "session not found or invalid title")
+				}
 			default:
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			}

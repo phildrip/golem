@@ -207,6 +207,80 @@ func TestSessionPickerModalAndCloseConfirmation(t *testing.T) {
 	}
 }
 
+func TestTUI_RestoresPersistedSessionEntriesOnSwitch(t *testing.T) {
+	tmpDir := t.TempDir()
+	baseCfg := golem.Config{
+		Provider:          "opencode",
+		BaseURL:           "http://127.0.0.1:1",
+		ModelName:         "mock-model",
+		APIKey:            "test-key",
+		StorageDir:        tmpDir,
+		WorkspaceDir:      tmpDir,
+		LiveHeadCount:     4,
+		ViewBudgetBytes:   1024,
+		CompactorInterval: 50 * time.Millisecond,
+	}
+
+	// 1. Create a session in sm1, add conversation events, then close sm1
+	sm1 := runtime.NewSessionManager(baseCfg, nil)
+	sess1, err := sm1.CreateSession(context.Background(), "Historic Work")
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	historicID := sess1.ID
+	sess1.Agent.Store().AppendEvent(fractal.KindUser, "user historic prompt")
+	sess1.Agent.Store().AppendEvent(fractal.KindTalk, "agent historic answer")
+	sm1.Close()
+
+	// 2. Open Golem main agent on base storage dir
+	mainAgent, err := golem.New(context.Background(), baseCfg)
+	if err != nil {
+		t.Fatalf("golem.New: %v", err)
+	}
+	defer mainAgent.Close()
+
+	// 3. Create SessionManager which restores sessions.json
+	sm2 := runtime.NewSessionManager(baseCfg, nil)
+	defer sm2.Close()
+	sm2.AdoptSession("default", "Main Session", mainAgent, baseCfg)
+
+	// 4. Construct TUI Model and attach SessionManager
+	m := NewModel(mainAgent, mainAgent.Store(), mainAgent.View())
+	m.SetSessionManager(sm2)
+
+	// Window resize
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = next.(Model)
+
+	// Should have Main Session and Historic Work
+	if m.SessionCount() != 2 {
+		t.Fatalf("expected 2 sessions in TUI, got %d", m.SessionCount())
+	}
+
+	// Switch to Historic Work
+	next, _ = m.SwitchSession(historicID)
+	m = next.(Model)
+
+	if m.ActiveSessionID() != historicID {
+		t.Fatalf("expected active session %s, got %s", historicID, m.ActiveSessionID())
+	}
+
+	// Entries should have been restored from the store
+	foundUser := false
+	foundAgent := false
+	for _, entry := range m.entries {
+		if entry.Type == TypeUser && strings.Contains(entry.Content, "user historic prompt") {
+			foundUser = true
+		}
+		if entry.Type == TypeAgent && strings.Contains(entry.Content, "agent historic answer") {
+			foundAgent = true
+		}
+	}
+	if !foundUser || !foundAgent {
+		t.Fatalf("expected restored entries in Historic Work session, got: %+v", m.entries)
+	}
+}
+
 func TestRenderGraphDAGAndModal(t *testing.T) {
 	spec := &graph.Spec{
 		Name: "verify-fix",

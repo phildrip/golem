@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -93,16 +94,67 @@ func (m *Model) SetSessionManager(sm *runtime.SessionManager) {
 	if sm == nil {
 		return
 	}
-	if _, ok := sm.GetSession(m.activeSessionID); !ok && m.agent != nil {
-		sess := sm.AdoptSession(m.activeSessionID, "Session 1", m.agent, m.agent.Config())
+	if m.agent != nil {
+		// Check if m.agent is already adopted in sm under an existing ID (e.g. "default")
+		foundID := ""
+		for _, s := range sm.ListSessions() {
+			if sess, ok := sm.GetSession(s.ID); ok && sess.Agent == m.agent {
+				foundID = s.ID
+				break
+			}
+		}
+		if foundID != "" {
+			if st, exists := m.sessions[m.activeSessionID]; exists && m.activeSessionID != foundID {
+				delete(m.sessions, m.activeSessionID)
+				st.id = foundID
+				if rtSess, ok := sm.GetSession(foundID); ok {
+					st.title = rtSess.Title
+				}
+				m.sessions[foundID] = st
+				m.sessionOrder = []string{foundID}
+				m.activeSessionID = foundID
+			}
+		} else if _, ok := sm.GetSession(m.activeSessionID); !ok {
+			sess := sm.AdoptSession(m.activeSessionID, "Session 1", m.agent, m.agent.Config())
+			if st, exists := m.sessions[m.activeSessionID]; exists {
+				delete(m.sessions, m.activeSessionID)
+				st.id = sess.ID
+				st.title = sess.Title
+				m.sessions[sess.ID] = st
+				m.sessionOrder[0] = sess.ID
+				m.activeSessionID = sess.ID
+			}
+		}
+	} else if activeSess, ok := sm.ActiveSession(); ok {
 		if st, exists := m.sessions[m.activeSessionID]; exists {
 			delete(m.sessions, m.activeSessionID)
-			st.id = sess.ID
-			st.title = sess.Title
-			m.sessions[sess.ID] = st
-			m.sessionOrder[0] = sess.ID
-			m.activeSessionID = sess.ID
+			st.id = activeSess.ID
+			st.title = activeSess.Title
+			if activeSess.Agent != nil {
+				st.store = activeSess.Agent.Store()
+				st.viewEngine = activeSess.Agent.View()
+			}
+			m.sessions[activeSess.ID] = st
+			m.sessionOrder[0] = activeSess.ID
+			m.activeSessionID = activeSess.ID
 		}
+	}
+
+	// Synchronize any sessions from the runtime session manager (including restored/discovered ones)
+	for _, s := range sm.ListSessions() {
+		if _, exists := m.sessions[s.ID]; !exists {
+			st := &chatState{
+				id:         s.ID,
+				title:      s.Title,
+				createdAt:  s.CreatedAt,
+				lastActive: s.UpdatedAt,
+			}
+			m.sessions[s.ID] = st
+			m.sessionOrder = append(m.sessionOrder, s.ID)
+		}
+	}
+	if m.activeSessionID == "" && len(m.sessionOrder) > 0 {
+		m.activeSessionID = m.sessionOrder[0]
 	}
 }
 
@@ -190,6 +242,21 @@ func (m *Model) loadSessionState(id string) {
 	m.agent = st.agent
 	m.store = st.store
 	m.viewEngine = st.viewEngine
+
+	// If switching to a session that was persisted and suspended, load its past entries into the viewport.
+	if len(st.entries) == 0 && st.store != nil {
+		allEvents := st.store.EventsTail(startupEventScanLimit)
+		cwd, _ := os.Getwd()
+		prof := m.currentProfile
+		if st.agent != nil && st.agent.Config().Profile != "" {
+			prof = st.agent.Config().Profile
+		}
+		st.startupHeader, st.entries = buildStartupEntries(allEvents, cwd, prof, time.Now())
+		if len(st.inputHistory) == 0 && len(allEvents) > 0 {
+			st.inputHistory = buildInputHistory(allEvents)
+			st.historyIndex = len(st.inputHistory)
+		}
+	}
 
 	entriesCopy := make([]ChatEntry, len(st.entries))
 	copy(entriesCopy, st.entries)

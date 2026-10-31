@@ -2,9 +2,12 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -143,6 +146,12 @@ func (s *Session) Events() []fractal.Event {
 		s.cachedEvents = events
 		return events
 	}
+	if len(s.cachedEvents) == 0 && s.cfg.StorageDir != "" {
+		if st, err := fractal.OpenStore(s.cfg.StorageDir); err == nil {
+			s.cachedEvents = st.GetAllEvents()
+			_ = st.Close()
+		}
+	}
 	out := make([]fractal.Event, len(s.cachedEvents))
 	copy(out, s.cachedEvents)
 	return out
@@ -229,6 +238,24 @@ func (s *Session) Resume(ctx context.Context) error {
 	return nil
 }
 
+// PersistedSessionMeta records a session's durable metadata for sessions.json.
+type PersistedSessionMeta struct {
+	ID           string    `json:"id"`
+	Title        string    `json:"title"`
+	RelDir       string    `json:"rel_dir,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	LastActiveAt time.Time `json:"last_active_at"`
+	TurnCount    int       `json:"turn_count"`
+}
+
+// SessionRegistry is the JSON layout for <StorageDir>/sessions.json.
+type SessionRegistry struct {
+	ActiveID string                 `json:"active_id,omitempty"`
+	Order    []string               `json:"order"`
+	Sessions []PersistedSessionMeta `json:"sessions"`
+}
+
 // SessionManager manages active and suspended agent sessions and dispatches turns.
 type SessionManager struct {
 	mu              sync.RWMutex
@@ -241,15 +268,222 @@ type SessionManager struct {
 	idleTimeout     time.Duration
 }
 
-// NewSessionManager creates a new SessionManager.
+// NewSessionManager creates a new SessionManager and restores persisted sessions from disk.
 func NewSessionManager(baseCfg golem.Config, broadcastFn BroadcastFunc) *SessionManager {
-	return &SessionManager{
+	sm := &SessionManager{
 		sessions:        make(map[string]*Session),
 		baseCfg:         baseCfg,
 		broadcastFn:     broadcastFn,
 		maxOpenSessions: DefaultMaxOpenSessions,
 		idleTimeout:     DefaultIdleTimeout,
 	}
+	sm.mu.Lock()
+	sm.loadRegistryLocked()
+	sm.mu.Unlock()
+	return sm
+}
+
+func (sm *SessionManager) registryPath() string {
+	dir := sm.baseCfg.StorageDir
+	if dir == "" {
+		dir = golem.DefaultConfig().StorageDir
+	}
+	return filepath.Join(dir, "sessions.json")
+}
+
+func (sm *SessionManager) loadRegistryLocked() {
+	baseDir := sm.baseCfg.StorageDir
+	if baseDir == "" {
+		baseDir = golem.DefaultConfig().StorageDir
+	}
+
+	target := sm.registryPath()
+	data, err := os.ReadFile(target)
+	var reg SessionRegistry
+	hasRegistryFile := false
+	if err == nil {
+		if json.Unmarshal(data, &reg) == nil {
+			hasRegistryFile = true
+		}
+	}
+
+	if hasRegistryFile {
+		for _, meta := range reg.Sessions {
+			if meta.ID == "" {
+				continue
+			}
+			sessDir := baseDir
+			if meta.RelDir != "" {
+				if filepath.IsAbs(meta.RelDir) {
+					sessDir = meta.RelDir
+				} else {
+					sessDir = filepath.Join(baseDir, meta.RelDir)
+				}
+			}
+
+			dbPath := filepath.Join(sessDir, "fractal.db")
+			if _, err := os.Stat(dbPath); err != nil && sessDir != baseDir {
+				continue
+			}
+
+			cfg := sm.baseCfg
+			cfg.SessionID = meta.ID
+			cfg.StorageDir = sessDir
+
+			sess := &Session{
+				ID:           meta.ID,
+				Title:        meta.Title,
+				CreatedAt:    meta.CreatedAt,
+				UpdatedAt:    meta.UpdatedAt,
+				LastActiveAt: meta.LastActiveAt,
+				TurnCount:    meta.TurnCount,
+				cfg:          cfg,
+				suspended:    true,
+				onWire:       sm.wireSessionCallbacks,
+				manager:      sm,
+			}
+			sm.sessions[meta.ID] = sess
+		}
+		for _, id := range reg.Order {
+			if _, ok := sm.sessions[id]; ok {
+				sm.order = append(sm.order, id)
+			}
+		}
+		if _, ok := sm.sessions[reg.ActiveID]; ok {
+			sm.activeID = reg.ActiveID
+		}
+	}
+
+	// Auto-discover past unindexed session-* directories on disk
+	entries, err := os.ReadDir(baseDir)
+	if err == nil {
+		discoveredAny := false
+		for _, entry := range entries {
+			if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "session-") {
+				continue
+			}
+			sessID := entry.Name()
+			if _, exists := sm.sessions[sessID]; exists {
+				continue
+			}
+
+			dbPath := filepath.Join(baseDir, sessID, "fractal.db")
+			info, err := os.Stat(dbPath)
+			if err != nil || info.IsDir() {
+				continue
+			}
+
+			modTime := info.ModTime().UTC()
+			sessDir := filepath.Join(baseDir, sessID)
+
+			title := fmt.Sprintf("Session %d", len(sm.sessions)+1)
+			turnCount := 0
+			if s, err := fractal.OpenStore(sessDir); err == nil {
+				evs := s.GetAllEvents()
+				for _, ev := range evs {
+					if ev.Kind == fractal.KindUser && strings.TrimSpace(ev.Text) != "" {
+						turnCount++
+						if title == fmt.Sprintf("Session %d", len(sm.sessions)+1) {
+							promptLine := strings.SplitN(strings.TrimSpace(ev.Text), "\n", 2)[0]
+							runes := []rune(promptLine)
+							if len(runes) > 24 {
+								promptLine = string(runes[:24]) + "..."
+							}
+							title = promptLine
+						}
+					}
+				}
+				_ = s.Close()
+			}
+
+			cfg := sm.baseCfg
+			cfg.SessionID = sessID
+			cfg.StorageDir = sessDir
+
+			sess := &Session{
+				ID:           sessID,
+				Title:        title,
+				CreatedAt:    modTime,
+				UpdatedAt:    modTime,
+				LastActiveAt: modTime,
+				TurnCount:    turnCount,
+				cfg:          cfg,
+				suspended:    true,
+				onWire:       sm.wireSessionCallbacks,
+				manager:      sm,
+			}
+			sm.sessions[sessID] = sess
+			sm.order = append(sm.order, sessID)
+			discoveredAny = true
+		}
+
+		if discoveredAny {
+			_ = sm.saveRegistryLocked()
+		}
+	}
+}
+
+func (sm *SessionManager) saveRegistryLocked() error {
+	baseDir := sm.baseCfg.StorageDir
+	if baseDir == "" {
+		baseDir = golem.DefaultConfig().StorageDir
+	}
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return err
+	}
+
+	reg := SessionRegistry{
+		ActiveID: sm.activeID,
+		Order:    make([]string, len(sm.order)),
+		Sessions: make([]PersistedSessionMeta, 0, len(sm.sessions)),
+	}
+	copy(reg.Order, sm.order)
+
+	for _, id := range sm.order {
+		sess, ok := sm.sessions[id]
+		if !ok {
+			continue
+		}
+		sess.mu.Lock()
+		title := sess.Title
+		cAt := sess.CreatedAt
+		uAt := sess.UpdatedAt
+		lAt := sess.LastActiveAt
+		turnCount := sess.TurnCount
+		storageDir := sess.cfg.StorageDir
+		sess.mu.Unlock()
+
+		relDir := ""
+		if storageDir != "" && storageDir != baseDir {
+			if rel, err := filepath.Rel(baseDir, storageDir); err == nil && !strings.HasPrefix(rel, "..") {
+				relDir = rel
+			} else {
+				relDir = storageDir
+			}
+		}
+
+		reg.Sessions = append(reg.Sessions, PersistedSessionMeta{
+			ID:           id,
+			Title:        title,
+			RelDir:       relDir,
+			CreatedAt:    cAt,
+			UpdatedAt:    uAt,
+			LastActiveAt: lAt,
+			TurnCount:    turnCount,
+		})
+	}
+
+	data, err := json.MarshalIndent(reg, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	target := sm.registryPath()
+	tmp := target + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, target)
 }
 
 // SetMaxOpenSessions configures the maximum number of concurrently open session
@@ -360,26 +594,51 @@ func (sm *SessionManager) AdoptSession(id, title string, agentInstance *golem.Ag
 			}
 		}
 	}
-	sess := &Session{
-		ID:           id,
-		Title:        title,
-		Agent:        agentInstance,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
-		TurnCount:    turnCount,
-		cfg:          cfg,
-		cachedEvents: cached,
-		ctx:          sessCtx,
-		cancel:       cancel,
-		onWire:       sm.wireSessionCallbacks,
-		manager:      sm,
+
+	var sess *Session
+	existing, exists := sm.sessions[id]
+	if exists {
+		sess = existing
+		sess.mu.Lock()
+		sess.Agent = agentInstance
+		sess.suspended = false
+		sess.ctx = sessCtx
+		sess.cancel = cancel
+		if title != "" {
+			sess.Title = title
+		}
+		if cached != nil {
+			sess.cachedEvents = cached
+			sess.TurnCount = turnCount
+		}
+		sess.cfg = cfg
+		sess.LastActiveAt = now
+		sess.UpdatedAt = now
+		sess.mu.Unlock()
+	} else {
+		sess = &Session{
+			ID:           id,
+			Title:        title,
+			Agent:        agentInstance,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+			LastActiveAt: now,
+			TurnCount:    turnCount,
+			cfg:          cfg,
+			cachedEvents: cached,
+			ctx:          sessCtx,
+			cancel:       cancel,
+			onWire:       sm.wireSessionCallbacks,
+			manager:      sm,
+		}
+		sm.sessions[id] = sess
+		sm.order = append(sm.order, id)
 	}
-	sm.sessions[id] = sess
-	sm.order = append(sm.order, id)
-	if sm.activeID == "" {
+
+	if sm.activeID == "" || id == "default" {
 		sm.activeID = id
 	}
+	_ = sm.saveRegistryLocked()
 	sm.mu.Unlock()
 
 	sm.wireSessionCallbacks(sess)
@@ -430,6 +689,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, title string) (*Ses
 		sm.activeID = id
 	}
 	isActive := sm.activeID == id
+	_ = sm.saveRegistryLocked()
 	sm.mu.Unlock()
 
 	sm.wireSessionCallbacks(sess)
@@ -507,6 +767,7 @@ func (sm *SessionManager) CreateSessionWithImport(ctx context.Context, title str
 		sm.activeID = id
 	}
 	isActive := sm.activeID == id
+	_ = sm.saveRegistryLocked()
 	sm.mu.Unlock()
 
 	sm.wireSessionCallbacks(sess)
@@ -648,10 +909,33 @@ func (sm *SessionManager) SetActiveSession(id string) bool {
 		return false
 	}
 	sm.activeID = id
+	_ = sm.saveRegistryLocked()
 	sm.mu.Unlock()
 
 	_ = sess.Resume(context.Background())
 	sm.broadcast(EventSessionActive, id, map[string]string{"active_id": id})
+	return true
+}
+
+// RenameSession updates the human-readable title of a session and persists it.
+func (sm *SessionManager) RenameSession(id, title string) bool {
+	sm.mu.Lock()
+	sess, ok := sm.sessions[id]
+	if !ok {
+		sm.mu.Unlock()
+		return false
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		sm.mu.Unlock()
+		return false
+	}
+	sess.mu.Lock()
+	sess.Title = title
+	sess.UpdatedAt = time.Now().UTC()
+	sess.mu.Unlock()
+	_ = sm.saveRegistryLocked()
+	sm.mu.Unlock()
 	return true
 }
 
@@ -754,6 +1038,7 @@ func (sm *SessionManager) DeleteSession(id string) error {
 			newActive = sm.sessions[sm.activeID]
 		}
 	}
+	_ = sm.saveRegistryLocked()
 	sm.mu.Unlock()
 
 	if newActive != nil && newActive.IsSuspended() {
@@ -765,6 +1050,7 @@ func (sm *SessionManager) DeleteSession(id string) error {
 	unsubSwarm := sess.unsubSwarm
 	unsubLock := sess.unsubLock
 	ag := sess.Agent
+	storageDir := sess.cfg.StorageDir
 	sess.unsubSwarm = nil
 	sess.unsubLock = nil
 	sess.Agent = nil
@@ -784,6 +1070,16 @@ func (sm *SessionManager) DeleteSession(id string) error {
 	if ag != nil {
 		_ = ag.Close()
 	}
+
+	// Remove dedicated storage directory from disk if it was a subfolder
+	baseDir := sm.baseCfg.StorageDir
+	if baseDir == "" {
+		baseDir = golem.DefaultConfig().StorageDir
+	}
+	if storageDir != "" && storageDir != baseDir && strings.HasPrefix(filepath.Clean(storageDir), filepath.Clean(baseDir)) {
+		_ = os.RemoveAll(storageDir)
+	}
+
 	sm.broadcast(EventSessionDeleted, id, map[string]string{"id": id})
 	return nil
 }
@@ -805,6 +1101,10 @@ func (sm *SessionManager) SendPrompt(ctx context.Context, sessionID, prompt stri
 	sess.LastActiveAt = now
 	ag := sess.Agent
 	sess.mu.Unlock()
+
+	sm.mu.Lock()
+	_ = sm.saveRegistryLocked()
+	sm.mu.Unlock()
 
 	sm.broadcast(EventUserPrompt, sessionID, map[string]string{"prompt": prompt})
 

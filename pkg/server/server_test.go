@@ -956,3 +956,40 @@ func TestSessionManager_SessionIDPropagation(t *testing.T) {
 		t.Errorf("expected sess.Agent.SessionID() to match %q, got %q", sess.ID, sess.Agent.SessionID())
 	}
 }
+
+func TestSessionManager_RenameSession(t *testing.T) {
+	tempDir := t.TempDir()
+	baseCfg := golem.Config{
+		Provider:        "opencode",
+		BaseURL:         "http://localhost:9999",
+		ModelName:       "test-model",
+		StorageDir:      tempDir,
+		WorkspaceDir:    tempDir,
+		LiveHeadCount:   4,
+		ViewBudgetBytes: 1024,
+	}
+
+	sm := NewSessionManager(baseCfg, NewHub())
+	sess, err := sm.CreateSession(context.Background(), "Original Title")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if !sm.RenameSession(sess.ID, "Renamed Title") {
+		t.Fatalf("RenameSession failed")
+	}
+
+	updated, ok := sm.GetSession(sess.ID)
+	if !ok || updated.Title != "Renamed Title" {
+		t.Fatalf("expected title 'Renamed Title', got %q", updated.Title)
+	}
+
+	// Verify persistence in sessions.json
+	sm2 := NewSessionManager(baseCfg, NewHub())
+	defer sm2.Close()
+	restored, ok := sm2.GetSession(sess.ID)
+	if !ok || restored.Title != "Renamed Title" {
+		t.Fatalf("expected restored title 'Renamed Title', got %q", restored.Title)
+	}
+}
+
