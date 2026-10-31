@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -35,6 +36,9 @@ import (
 // DefaultModelName is the primary model used for Golem reasoning.
 const DefaultModelName = "gemini-flash-latest"
 
+// DefaultCompactorGracePeriod is how long Agent.Close waits for an in-flight compaction pass to finish before canceling.
+const DefaultCompactorGracePeriod = 20 * time.Second
+
 // RetryCallback is invoked when transient API rate limits or 503s cause a retry.
 type RetryCallback func(attempt, maxRetries int, backoff time.Duration)
 
@@ -43,6 +47,21 @@ type StreamHandler interface {
 	OnChunk(token string)
 	OnToolStart(toolName, command string)
 	OnToolDone(toolName, output string, exitCode int)
+}
+
+// TokenUsage carries prompt and KV-cache token counts for a turn or pass.
+type TokenUsage struct {
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CandidatesTokens int64   `json:"candidates_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	CachedTokens     int64   `json:"cached_tokens"`
+	CacheHitRatio    float64 `json:"cache_hit_ratio"`
+}
+
+// TokenUsageStreamHandler optionally extends StreamHandler to receive token telemetry and cache hits.
+type TokenUsageStreamHandler interface {
+	StreamHandler
+	OnTokenUsage(usage TokenUsage)
 }
 
 // SubagentStreamHandler optionally extends StreamHandler to receive specialized subagent events.
@@ -65,8 +84,9 @@ type Config struct {
 	MountedMemories   []config.MountedMemoryConfig
 	LiveHeadCount     int
 	ViewBudgetBytes   int
-	CompactorInterval time.Duration
-	CompactorProvider string
+	CompactorInterval    time.Duration
+	CompactorGracePeriod time.Duration
+	CompactorProvider    string
 	CompactorModel    string
 	CompactorBaseURL  string
 	CompactorAPIKey   string
@@ -89,9 +109,10 @@ func DefaultConfig() Config {
 	return Config{
 		ModelName:         DefaultModelName,
 		StorageDir:        storage,
-		LiveHeadCount:     fractal.DefaultLiveHeadCount,
-		ViewBudgetBytes:   fractal.DefaultViewBudgetBytes,
-		CompactorInterval: 30 * time.Second,
+		LiveHeadCount:        fractal.DefaultLiveHeadCount,
+		ViewBudgetBytes:      fractal.DefaultViewBudgetBytes,
+		CompactorInterval:    30 * time.Second,
+		CompactorGracePeriod: DefaultCompactorGracePeriod,
 	}
 }
 
@@ -120,6 +141,9 @@ type Agent struct {
 	turnToolCalls       int    // tool calls executed in the in-flight turn
 	turnActive          bool   // whether a turn is currently running
 	currentTurnID       string // transaction GUID of the in-flight turn
+	closed              atomic.Bool
+	compactorMu         sync.Mutex
+	compactorRunning    atomic.Bool
 	compactorTrigger    chan struct{}
 	workerCancel        context.CancelFunc
 	workerWg            sync.WaitGroup
@@ -1014,7 +1038,20 @@ func (a *Agent) startCompactorWorker(ctx context.Context) {
 // fails every time leaves the view stuck at "not summarized yet", which used to
 // be invisible because the error was dropped on the floor.
 func (a *Agent) pumpCompactor(ctx context.Context) {
+	if a.compactor == nil {
+		return
+	}
+	a.compactorMu.Lock()
+	a.compactorRunning.Store(true)
+	defer func() {
+		a.compactorRunning.Store(false)
+		a.compactorMu.Unlock()
+	}()
+
 	if _, err := a.compactor.Pump(ctx); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) || isContextCanceled(err) {
+			return
+		}
 		a.health.Record("compactor", "pump", err)
 	}
 }
@@ -1204,6 +1241,39 @@ func (a *Agent) ProcessStreamImages(ctx context.Context, input string, images []
 
 // Close flushes and shuts down the store and underlying resources.
 func (a *Agent) Close() error {
+	if !a.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	// Give in-flight or pending compaction a brief grace period to finish
+	// writing nodes cleanly before canceling the worker context.
+	if a.compactor != nil {
+		gracePeriod := a.cfg.CompactorGracePeriod
+		if gracePeriod == 0 {
+			gracePeriod = DefaultCompactorGracePeriod
+		}
+
+		if gracePeriod > 0 {
+			if len(a.compactorTrigger) > 0 && !a.compactorRunning.Load() {
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			if a.compactorRunning.Load() {
+				done := make(chan struct{})
+				go func() {
+					a.compactorMu.Lock()
+					//lint:ignore SA2001 critical section used to await completion
+					a.compactorMu.Unlock()
+					close(done)
+				}()
+				select {
+				case <-done:
+				case <-time.After(gracePeriod):
+				}
+			}
+		}
+	}
+
 	if a.workerCancel != nil {
 		a.workerCancel()
 	}

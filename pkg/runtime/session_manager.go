@@ -44,6 +44,7 @@ const (
 	EventSwarmLock       = "swarm_lock"
 	EventMemoryAdded     = "memory_added"
 	EventApprovalRequest = "approval_request"
+	EventTokenUsage      = "token_usage"
 )
 
 // BroadcastFunc is an optional callback that receives session lifecycle and
@@ -971,6 +972,10 @@ func (a *sessionStreamAdapter) OnSubagentDone(role, model, result string, durati
 		"duration": duration.String(),
 		"error":    errStr,
 	})
+}
+
+func (a *sessionStreamAdapter) OnTokenUsage(usage golem.TokenUsage) {
+	a.broadcast(EventTokenUsage, a.sessionID, usage)
 }
 
 // Close gracefully closes all active sessions.

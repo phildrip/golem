@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/user/golem/pkg/config"
@@ -27,6 +28,9 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.ViewBudgetBytes != fractal.DefaultViewBudgetBytes {
 		t.Errorf("viewBudget = %d, want %d", cfg.ViewBudgetBytes, fractal.DefaultViewBudgetBytes)
+	}
+	if cfg.CompactorGracePeriod != DefaultCompactorGracePeriod {
+		t.Errorf("compactorGracePeriod = %v, want %v", cfg.CompactorGracePeriod, DefaultCompactorGracePeriod)
 	}
 }
 
@@ -809,3 +813,117 @@ func TestBuildInstructionPrefixCacheStability(t *testing.T) {
 		t.Errorf("unexpected layer order: catalog=%d memory=%d live=%d inbox=%d", catIdx, memIdx, liveIdx, inboxIdx)
 	}
 }
+
+type slowSummarizer struct {
+	delay time.Duration
+	calls int
+}
+
+func (s *slowSummarizer) Summarize(ctx context.Context, contextView, content string, isMerge bool) (string, error) {
+	s.calls++
+	select {
+	case <-time.After(s.delay):
+		return "summarized: done", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func TestAgentClose_CompactorGracePeriodCompletesCleanly(t *testing.T) {
+	store, err := fractal.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+
+	if _, err := store.AppendEvent(fractal.KindTalk, strings.Repeat("long text to compress ", 100)); err != nil {
+		t.Fatalf("AppendEvent failed: %v", err)
+	}
+	view := fractal.NewView(store, fractal.ViewConfig{LiveHeadCount: 0})
+	slowSub := &slowSummarizer{delay: 40 * time.Millisecond}
+	compactor := fractal.NewCompactor(store, view, slowSub, fractal.DefaultCompactorConfig())
+
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	a := &Agent{
+		store:            store,
+		view:             view,
+		compactor:        compactor,
+		health:           newHealth(),
+		compactorTrigger: make(chan struct{}, 1),
+		workerCancel:     workerCancel,
+		cfg: Config{
+			CompactorGracePeriod: 500 * time.Millisecond,
+		},
+	}
+
+	a.workerWg.Add(1)
+	go func() {
+		defer a.workerWg.Done()
+		a.startCompactorWorker(workerCtx)
+	}()
+
+	// Trigger compaction and close immediately
+	a.triggerCompactor()
+
+	closeErr := a.Close()
+	if closeErr != nil {
+		t.Fatalf("Close failed: %v", closeErr)
+	}
+
+	// Verify idempotency
+	if err := a.Close(); err != nil {
+		t.Fatalf("second Close failed: %v", err)
+	}
+
+	if slowSub.calls == 0 {
+		t.Errorf("expected slowSummarizer to be called")
+	}
+	if a.Health().Total() != 0 {
+		t.Errorf("expected 0 health problems, got %d: %s", a.Health().Total(), a.Health().Summary())
+	}
+}
+
+func TestAgentClose_CompactorGracePeriodTimeoutCancelsCleanly(t *testing.T) {
+	store, err := fractal.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+
+	if _, err := store.AppendEvent(fractal.KindTalk, strings.Repeat("long text to compress ", 100)); err != nil {
+		t.Fatalf("AppendEvent failed: %v", err)
+	}
+	view := fractal.NewView(store, fractal.ViewConfig{LiveHeadCount: 0})
+	slowSub := &slowSummarizer{delay: 1 * time.Second}
+	compactor := fractal.NewCompactor(store, view, slowSub, fractal.DefaultCompactorConfig())
+
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	a := &Agent{
+		store:            store,
+		view:             view,
+		compactor:        compactor,
+		health:           newHealth(),
+		compactorTrigger: make(chan struct{}, 1),
+		workerCancel:     workerCancel,
+		cfg: Config{
+			CompactorGracePeriod: 30 * time.Millisecond,
+		},
+	}
+
+	a.workerWg.Add(1)
+	go func() {
+		defer a.workerWg.Done()
+		a.startCompactorWorker(workerCtx)
+	}()
+
+	a.triggerCompactor()
+
+	closeErr := a.Close()
+	if closeErr != nil {
+		t.Fatalf("Close failed: %v", closeErr)
+	}
+
+	// When grace period expires and worker context is canceled, no error should be logged or recorded in health
+	if a.Health().Total() != 0 {
+		t.Errorf("expected 0 health problems on shutdown cancellation, got %d: %s", a.Health().Total(), a.Health().Summary())
+	}
+}
+

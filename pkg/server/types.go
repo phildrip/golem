@@ -45,6 +45,7 @@ const (
 
 	// Human-in-the-Loop sandbox confirmation
 	WSEventApprovalRequest WSEventType = "approval_request"
+	WSEventTokenUsage      WSEventType = "token_usage"
 
 	// Stream resume fallback when requested sequence aged out of ring buffer
 	WSEventResumeFailed WSEventType = "resume_failed"

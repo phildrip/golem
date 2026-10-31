@@ -1,6 +1,8 @@
 package golem
 
 import (
+	"context"
+	"errors"
 	"log"
 	"sort"
 	"strconv"
@@ -46,9 +48,23 @@ func newHealth() *Health {
 	}
 }
 
-// Record notes a failure that could not be returned to its caller.
-func (h *Health) Record(component, operation string, err error) {
+// isContextCanceled reports whether err represents a context cancellation or deadline expiration.
+func isContextCanceled(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "context canceled") || strings.Contains(msg, "context deadline exceeded")
+}
+
+// Record notes a failure that could not be returned to its caller. Context
+// cancellations and deadline expirations (e.g. during agent shutdown or turn
+// interruption) are suppressed to avoid false alarm health flags and log spam.
+func (h *Health) Record(component, operation string, err error) {
+	if err == nil || isContextCanceled(err) {
 		return
 	}
 	p := Problem{

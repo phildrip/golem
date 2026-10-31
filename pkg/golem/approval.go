@@ -50,6 +50,11 @@ func (a *Agent) streamPass(ctx context.Context, sessionID string, content *genai
 			runCtx = openai.WithSessionID(runCtx, a.sessionID)
 		}
 
+		var totalPromptTokens int64
+		var totalCachedTokens int64
+		var totalCandidatesTokens int64
+		var totalTokens int64
+
 		eventsSeq := a.runner.Run(runCtx, a.userID, sessionID, content, agent.RunConfig{
 			StreamingMode: agent.StreamingModeSSE,
 		})
@@ -58,7 +63,24 @@ func (a *Agent) streamPass(ctx context.Context, sessionID string, content *genai
 				runErr = err
 				break
 			}
-			if ev == nil || ev.Content == nil {
+			if ev == nil {
+				continue
+			}
+			if ev.UsageMetadata != nil {
+				if ev.UsageMetadata.PromptTokenCount > 0 {
+					totalPromptTokens = int64(ev.UsageMetadata.PromptTokenCount)
+				}
+				if ev.UsageMetadata.CachedContentTokenCount > 0 {
+					totalCachedTokens = int64(ev.UsageMetadata.CachedContentTokenCount)
+				}
+				if ev.UsageMetadata.CandidatesTokenCount > 0 {
+					totalCandidatesTokens = int64(ev.UsageMetadata.CandidatesTokenCount)
+				}
+				if ev.UsageMetadata.TotalTokenCount > 0 {
+					totalTokens = int64(ev.UsageMetadata.TotalTokenCount)
+				}
+			}
+			if ev.Content == nil {
 				continue
 			}
 			a.noteConfirmationRequest(ev, handler)
@@ -72,6 +94,22 @@ func (a *Agent) streamPass(ctx context.Context, sessionID string, content *genai
 						handler.OnChunk(part.Text)
 					}
 				}
+			}
+		}
+
+		if totalPromptTokens > 0 && handler != nil {
+			var ratio float64
+			if totalPromptTokens > 0 && totalCachedTokens > 0 {
+				ratio = float64(totalCachedTokens) / float64(totalPromptTokens)
+			}
+			if th, ok := handler.(TokenUsageStreamHandler); ok {
+				th.OnTokenUsage(TokenUsage{
+					PromptTokens:     totalPromptTokens,
+					CandidatesTokens: totalCandidatesTokens,
+					TotalTokens:      totalTokens,
+					CachedTokens:     totalCachedTokens,
+					CacheHitRatio:    ratio,
+				})
 			}
 		}
 

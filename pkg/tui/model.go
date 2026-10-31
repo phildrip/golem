@@ -128,6 +128,14 @@ type streamMsg struct {
 	Payload   tea.Msg
 }
 
+type tokenUsageMsg struct {
+	PromptTokens     int64
+	CandidatesTokens int64
+	TotalTokens      int64
+	CachedTokens     int64
+	CacheHitRatio    float64
+}
+
 type agentDoneMsg struct {
 	reply string
 	err   error
@@ -161,6 +169,8 @@ type Model struct {
 	ready              bool
 	isLoading          bool
 	streamingReply     string
+	hasFlushedPartial  bool
+	lastTokenUsage     *tokenUsageMsg
 	renderer           *glamour.TermRenderer
 	memoryStats        memoryStatsMsg
 	showTreeModal      bool
@@ -932,6 +942,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.textarea.Reset()
 			m.isLoading = true
 			m.streamingReply = ""
+			m.hasFlushedPartial = false
 
 			m.entries = append(m.entries, ChatEntry{
 				Type:    TypeUser,
@@ -979,11 +990,23 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.openApprovalPrompt(msg.req)
 		return m, nil
 
+	case tokenUsageMsg:
+		m.lastTokenUsage = &msg
+		return m, nil
+
 	case agentChunkMsg:
 		m.streamingReply += string(msg)
 		m.renderAndFollow()
 
 	case toolStartMsg:
+		if partial := strings.TrimRight(m.streamingReply, "\n"); strings.TrimSpace(partial) != "" {
+			m.entries = append(m.entries, ChatEntry{
+				Type:    TypeAgent,
+				Content: partial,
+			})
+			m.hasFlushedPartial = true
+		}
+		m.streamingReply = ""
 		m.entries = append(m.entries, ChatEntry{
 			Type:      TypeTool,
 			ToolName:  msg.toolName,
@@ -1005,6 +1028,14 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderAndFollow()
 
 	case subagentStartMsg:
+		if partial := strings.TrimRight(m.streamingReply, "\n"); strings.TrimSpace(partial) != "" {
+			m.entries = append(m.entries, ChatEntry{
+				Type:    TypeAgent,
+				Content: partial,
+			})
+			m.hasFlushedPartial = true
+		}
+		m.streamingReply = ""
 		m.trackGraphStart(msg.role, msg.model)
 		m.entries = append(m.entries, ChatEntry{
 			Type:           TypeSubagent,
@@ -1059,11 +1090,21 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		m.entries = append(m.entries, ChatEntry{
-			Type:    TypeAgent,
-			Content: reply,
-		})
+		// If the turn emitted tools/subagents and previously flushed partial text,
+		// append any trailing streamed text if present, or reply if reply is distinct.
+		// If no tools flushed partial text, reply (or trailing streamingReply) is the full answer.
+		finalText := reply
+		if strings.TrimSpace(reply) == "" && strings.TrimSpace(m.streamingReply) != "" {
+			finalText = m.streamingReply
+		}
+		if strings.TrimSpace(finalText) != "" || !m.hasFlushedPartial || msg.err != nil {
+			m.entries = append(m.entries, ChatEntry{
+				Type:    TypeAgent,
+				Content: finalText,
+			})
+		}
 		m.streamingReply = ""
+		m.hasFlushedPartial = false
 		m.renderAndFollow()
 
 		return m, m.updateMemoryStatsCmd()
@@ -1232,6 +1273,16 @@ func (m Model) View() string {
 	return frame
 }
 
+func formatTokens(n int64) string {
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+	if n >= 1_000 {
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
 // renderHeader builds the title bar and memory minimap above the conversation.
 // relayout measures its height, so don't hard-code assumptions about it here.
 func (m Model) renderHeader() string {
@@ -1251,6 +1302,18 @@ func (m Model) renderHeader() string {
 		}
 	}
 	sub := HeaderSubStyle.Render(fmt.Sprintf(" [%s | %s:%s] • Fractal Memory", profStr, provStr, modelStr))
+	if m.lastTokenUsage != nil && m.lastTokenUsage.PromptTokens > 0 {
+		var cacheBadge string
+		if m.lastTokenUsage.CachedTokens > 0 {
+			hitPct := int(m.lastTokenUsage.CacheHitRatio * 100)
+			cacheBadge = lipgloss.NewStyle().Bold(true).Foreground(ColorSuccess).Render(fmt.Sprintf(" • ⚡ %d%% CACHE HIT (%s/%s)",
+				hitPct, formatTokens(m.lastTokenUsage.CachedTokens), formatTokens(m.lastTokenUsage.PromptTokens)))
+		} else {
+			cacheBadge = lipgloss.NewStyle().Foreground(ColorWarning).Render(fmt.Sprintf(" • ⚡ 0%% CACHE MISS (%s tok)",
+				formatTokens(m.lastTokenUsage.PromptTokens)))
+		}
+		sub += cacheBadge
+	}
 	minimap := RenderMemoryMinimap(m.memoryStats.totalEvents, m.memoryStats.tailLevels, m.memoryStats.liveCount, false, m.memoryStats.problems)
 
 	// Both header lines are clipped to the pane: a header that wraps costs a
@@ -1692,6 +1755,16 @@ func (b *tuiStreamBridge) OnSubagentDone(role, model, result string, duration ti
 		result:   result,
 		duration: duration,
 		err:      err,
+	})
+}
+
+func (b *tuiStreamBridge) OnTokenUsage(usage golem.TokenUsage) {
+	b.send(tokenUsageMsg{
+		PromptTokens:     usage.PromptTokens,
+		CandidatesTokens: usage.CandidatesTokens,
+		TotalTokens:      usage.TotalTokens,
+		CachedTokens:     usage.CachedTokens,
+		CacheHitRatio:    usage.CacheHitRatio,
 	})
 }
 

@@ -135,3 +135,43 @@ func TestPumpCompactorSurfacesFailures(t *testing.T) {
 		t.Errorf("PumpStatus = (%d, %v), want (1, non-nil)", failures, pumpErr)
 	}
 }
+
+func TestPumpCompactorSuppressesContextCanceled(t *testing.T) {
+	store, err := fractal.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := store.AppendEvent(fractal.KindTalk, strings.Repeat("long reasoning ", 100)); err != nil {
+		t.Fatalf("AppendEvent failed: %v", err)
+	}
+	view := fractal.NewView(store, fractal.ViewConfig{LiveHeadCount: 0})
+	compactor := fractal.NewCompactor(store, view, failingSummarizer{err: context.Canceled}, fractal.DefaultCompactorConfig())
+
+	a := &Agent{compactor: compactor, health: newHealth()}
+	a.pumpCompactor(context.Background())
+
+	if got := a.Health().Count("compactor"); got != 0 {
+		t.Fatalf("compactor failures = %d, want 0 on context.Canceled", got)
+	}
+	if failures, pumpErr := compactor.PumpStatus(); failures != 0 || pumpErr != nil {
+		t.Errorf("PumpStatus = (%d, %v), want (0, nil)", failures, pumpErr)
+	}
+}
+
+func TestHealthRecord_IgnoresContextCanceled(t *testing.T) {
+	h := newHealth()
+
+	h.Record("compactor", "pump", context.Canceled)
+	h.Record("compactor", "pump", fmt.Errorf("merging node (2, 37): generating summary content: context canceled"))
+	h.Record("compactor", "pump", context.DeadlineExceeded)
+
+	if got := h.Total(); got != 0 {
+		t.Fatalf("expected 0 total problems recorded for context cancellation, got %d", got)
+	}
+	if summary := h.Summary(); summary != "" {
+		t.Fatalf("expected empty summary, got %q", summary)
+	}
+}
+

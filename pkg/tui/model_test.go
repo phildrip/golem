@@ -1261,11 +1261,11 @@ func TestModel_StreamMsgHandlingLifecycle(t *testing.T) {
 		t.Errorf("expected nextListenCmd to be scheduled while isLoading is true")
 	}
 
-	// 2. Process toolStartMsg wrapped in streamMsg
+	// 2. Process toolStartMsg wrapped in streamMsg (flushes "chunk 1" into entries[0] and appends tool in entries[1])
 	newM, nextCmd = m.Update(streamMsg{Payload: toolStartMsg{toolName: "shell", command: "pwd"}})
 	m = newM.(Model)
-	if len(m.entries) != 1 || !m.entries[0].IsRunning {
-		t.Errorf("expected running tool entry")
+	if len(m.entries) != 2 || m.entries[0].Type != TypeAgent || m.entries[0].Content != "chunk 1" || !m.entries[1].IsRunning {
+		t.Errorf("expected flushed partial agent text and running tool entry, got %+v", m.entries)
 	}
 	if nextCmd == nil {
 		t.Errorf("expected nextListenCmd to be scheduled while isLoading is true")
@@ -1759,3 +1759,120 @@ func TestModel_StartupReplayShowsNewestTurnEndToEnd(t *testing.T) {
 		t.Fatal("startup screen should show the end of the most recent response")
 	}
 }
+
+func TestModel_FlushesStreamingTextBeforeToolAndSubagent(t *testing.T) {
+	m := NewModel(nil, nil, nil)
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = newM.(Model)
+	m.isLoading = true
+
+	// Turn step 1: LLM streams some commentary
+	newM, _ = m.Update(agentChunkMsg("Two real findings already. Let me pin them down:"))
+	m = newM.(Model)
+	if m.streamingReply != "Two real findings already. Let me pin them down:" {
+		t.Fatalf("unexpected streaming reply: %q", m.streamingReply)
+	}
+
+	// Turn step 2: LLM executes a tool.
+	// This must flush "Two real findings already..." into m.entries as TypeAgent and clear streamingReply.
+	newM, _ = m.Update(toolStartMsg{toolName: "write_file", command: "evidence.md"})
+	m = newM.(Model)
+	if m.streamingReply != "" {
+		t.Fatalf("expected streamingReply to be empty after toolStartMsg, got %q", m.streamingReply)
+	}
+	if len(m.entries) != 2 {
+		t.Fatalf("expected 2 entries (flushed agent text + tool card), got %d: %+v", len(m.entries), m.entries)
+	}
+	if m.entries[0].Type != TypeAgent || m.entries[0].Content != "Two real findings already. Let me pin them down:" {
+		t.Fatalf("expected entry 0 to be TypeAgent with commentary, got %+v", m.entries[0])
+	}
+	if m.entries[1].Type != TypeTool || !m.entries[1].IsRunning {
+		t.Fatalf("expected entry 1 to be running TypeTool, got %+v", m.entries[1])
+	}
+
+	// Tool completes
+	newM, _ = m.Update(toolDoneMsg{toolName: "write_file", output: "wrote 42 bytes", exitCode: 0})
+	m = newM.(Model)
+
+	// Turn step 3: LLM streams more text after tool 1
+	newM, _ = m.Update(agentChunkMsg("The pack is in place. Now launching the graph:"))
+	m = newM.(Model)
+
+	// Turn step 4: LLM launches subagent
+	newM, _ = m.Update(subagentStartMsg{role: "researcher", model: "flash", prompt: "explore codebase"})
+	m = newM.(Model)
+	if m.streamingReply != "" {
+		t.Fatalf("expected streamingReply to be empty after subagentStartMsg, got %q", m.streamingReply)
+	}
+	if len(m.entries) != 4 {
+		t.Fatalf("expected 4 entries (text + tool + text + subagent), got %d: %+v", len(m.entries), m.entries)
+	}
+	if m.entries[2].Type != TypeAgent || m.entries[2].Content != "The pack is in place. Now launching the graph:" {
+		t.Fatalf("expected entry 2 to be TypeAgent, got %+v", m.entries[2])
+	}
+	if m.entries[3].Type != TypeSubagent || !m.entries[3].IsRunning {
+		t.Fatalf("expected entry 3 to be running TypeSubagent, got %+v", m.entries[3])
+	}
+
+	// Subagent completes
+	newM, _ = m.Update(subagentDoneMsg{role: "researcher", result: "all done"})
+	m = newM.(Model)
+
+	// Turn step 5: Final concluding commentary
+	newM, _ = m.Update(agentChunkMsg("Everything resolved."))
+	m = newM.(Model)
+
+	newM, _ = m.Update(agentDoneMsg{reply: "Everything resolved."})
+	m = newM.(Model)
+
+	if len(m.entries) != 5 {
+		t.Fatalf("expected 5 entries total, got %d: %+v", len(m.entries), m.entries)
+	}
+	if m.entries[4].Type != TypeAgent || m.entries[4].Content != "Everything resolved." {
+		t.Fatalf("expected entry 4 to be final TypeAgent text, got %+v", m.entries[4])
+	}
+}
+
+func TestModel_TokenUsageBadge(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := fractal.OpenStore(tmpDir)
+	defer store.Close()
+	view := fractal.NewView(store, fractal.DefaultViewConfig())
+	m := NewModel(nil, store, view)
+	m.width = 120
+	m.height = 30
+
+	// Initially no badge in header
+	header := m.renderHeader()
+	if strings.Contains(header, "CACHE") {
+		t.Fatalf("did not expect CACHE in initial header: %s", header)
+	}
+
+	// Receive cache hit tokenUsageMsg
+	newM, _ := m.Update(tokenUsageMsg{
+		PromptTokens: 3800,
+		CachedTokens: 3200,
+		CacheHitRatio: 3200.0 / 3800.0,
+	})
+	m = newM.(Model)
+
+	header = m.renderHeader()
+	if !strings.Contains(header, "CACHE HIT") || !strings.Contains(header, "84%") {
+		t.Fatalf("expected '84%%%% CACHE HIT' in header, got: %s", header)
+	}
+
+	// Receive cache miss tokenUsageMsg
+	newM, _ = m.Update(tokenUsageMsg{
+		PromptTokens: 1500,
+		CachedTokens: 0,
+		CacheHitRatio: 0.0,
+	})
+	m = newM.(Model)
+
+	header = m.renderHeader()
+	if !strings.Contains(header, "CACHE MISS") || !strings.Contains(header, "0%") {
+		t.Fatalf("expected '0%%%% CACHE MISS' in header, got: %s", header)
+	}
+}
+
+

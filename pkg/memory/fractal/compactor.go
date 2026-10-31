@@ -2,6 +2,7 @@ package fractal
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"log"
 	"strings"
@@ -459,6 +460,18 @@ func (c *Compactor) BuildNode(ctx context.Context, level, index int) (Node, erro
 	return node, nil
 }
 
+// isContextCanceled reports whether err represents a context cancellation or deadline expiration.
+func isContextCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "context canceled") || strings.Contains(msg, "context deadline exceeded")
+}
+
 // Pump advances compression for all eligible nodes in the tail.
 // Returns the count of nodes built in this pass.
 func (c *Compactor) Pump(ctx context.Context) (int, error) {
@@ -466,7 +479,7 @@ func (c *Compactor) Pump(ctx context.Context) (int, error) {
 	defer c.mu.Unlock()
 
 	built, err := c.pumpLocked(ctx)
-	if err != nil {
+	if err != nil && !isContextCanceled(err) && !stderrors.Is(ctx.Err(), context.Canceled) {
 		c.pumpFailures++
 		c.lastPumpErr = err
 	}
@@ -514,6 +527,9 @@ func (c *Compactor) pumpLocked(ctx context.Context) (int, error) {
 
 	// 1. Build level-0 nodes for new tail events (from the last watermark).
 	for i := c.watermark(0); i < tailEnd; i++ {
+		if ctx.Err() != nil {
+			return builtCount, ctx.Err()
+		}
 		if _, ok := c.store.GetNode(0, i); !ok {
 			if _, err := c.BuildNode(ctx, 0, i); err != nil {
 				return builtCount, errors.Wrapf(err, "building level 0 node %d", i)
@@ -539,6 +555,9 @@ func (c *Compactor) pumpLocked(ctx context.Context) (int, error) {
 
 		idx := c.watermark(level)
 		for ; idx < maxIndex; idx++ {
+			if ctx.Err() != nil {
+				return builtCount, ctx.Err()
+			}
 			if _, ok := c.store.GetNode(level, idx); ok {
 				c.setWatermark(level, idx+1)
 				continue

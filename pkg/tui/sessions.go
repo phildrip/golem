@@ -37,6 +37,8 @@ type chatState struct {
 	currentDraft      string
 	isLoading         bool
 	streamingReply    string
+	hasFlushedPartial bool
+	lastTokenUsage    *tokenUsageMsg
 	pendingApproval   *approval.Request
 	showApprovalModal bool
 	turnCtx           context.Context
@@ -155,6 +157,8 @@ func (m *Model) saveActiveSessionState() {
 	st.currentDraft = m.currentDraft
 	st.isLoading = m.isLoading
 	st.streamingReply = m.streamingReply
+	st.hasFlushedPartial = m.hasFlushedPartial
+	st.lastTokenUsage = m.lastTokenUsage
 	st.pendingApproval = m.pendingApproval
 	st.showApprovalModal = m.showApprovalModal
 	st.turnCtx = m.turnCtx
@@ -205,6 +209,8 @@ func (m *Model) loadSessionState(id string) {
 
 	m.isLoading = st.isLoading
 	m.streamingReply = st.streamingReply
+	m.hasFlushedPartial = st.hasFlushedPartial
+	m.lastTokenUsage = st.lastTokenUsage
 	m.pendingApproval = st.pendingApproval
 	m.showApprovalModal = st.showApprovalModal
 	m.turnCtx = st.turnCtx
@@ -410,6 +416,14 @@ func (m *Model) routeBackgroundStreamMsg(sessionID string, payload tea.Msg) tea.
 		st.streamingReply += string(msg)
 
 	case toolStartMsg:
+		if partial := strings.TrimRight(st.streamingReply, "\n"); strings.TrimSpace(partial) != "" {
+			st.entries = append(st.entries, ChatEntry{
+				Type:    TypeAgent,
+				Content: partial,
+			})
+			st.hasFlushedPartial = true
+		}
+		st.streamingReply = ""
 		st.entries = append(st.entries, ChatEntry{
 			Type:      TypeTool,
 			ToolName:  msg.toolName,
@@ -428,6 +442,14 @@ func (m *Model) routeBackgroundStreamMsg(sessionID string, payload tea.Msg) tea.
 		}
 
 	case subagentStartMsg:
+		if partial := strings.TrimRight(st.streamingReply, "\n"); strings.TrimSpace(partial) != "" {
+			st.entries = append(st.entries, ChatEntry{
+				Type:    TypeAgent,
+				Content: partial,
+			})
+			st.hasFlushedPartial = true
+		}
+		st.streamingReply = ""
 		st.entries = append(st.entries, ChatEntry{
 			Type:           TypeSubagent,
 			SubagentRole:   msg.role,
@@ -457,6 +479,10 @@ func (m *Model) routeBackgroundStreamMsg(sessionID string, payload tea.Msg) tea.
 		st.showApprovalModal = true
 		st.isLoading = true
 
+	case tokenUsageMsg:
+		st.lastTokenUsage = &msg
+		return nil
+
 	case agentDoneMsg:
 		if msg.seq != 0 && msg.seq != st.turnSeq {
 			return nil
@@ -478,11 +504,18 @@ func (m *Model) routeBackgroundStreamMsg(sessionID string, payload tea.Msg) tea.
 				reply = fmt.Sprintf("Error: %v", msg.err)
 			}
 		}
-		st.entries = append(st.entries, ChatEntry{
-			Type:    TypeAgent,
-			Content: reply,
-		})
+		finalText := reply
+		if st.streamingReply != "" {
+			finalText = st.streamingReply
+		}
+		if strings.TrimSpace(finalText) != "" || !st.hasFlushedPartial || msg.err != nil {
+			st.entries = append(st.entries, ChatEntry{
+				Type:    TypeAgent,
+				Content: finalText,
+			})
+		}
 		st.streamingReply = ""
+		st.hasFlushedPartial = false
 		return nil
 	}
 

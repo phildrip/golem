@@ -16,8 +16,17 @@ export type WSEventType =
 	| 'swarm_message'
 	| 'swarm_lock'
 	| 'approval_request'
+	| 'token_usage'
 	| 'profile_changed'
 	| 'resume_failed';
+
+export interface TokenUsagePayload {
+	prompt_tokens: number;
+	candidates_tokens: number;
+	total_tokens: number;
+	cached_tokens: number;
+	cache_hit_ratio: number;
+}
 
 // ApprovalPrompt is a sandbox confirmation waiting for a human: the exact
 // command or patch, plus why the policy asked.

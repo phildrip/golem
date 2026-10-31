@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { Bot, Network, Database, GitPullRequest, Settings, Terminal, Wifi, WifiOff } from '@lucide/svelte';
+	import { Bot, Network, Database, GitPullRequest, Settings, Terminal, Wifi, WifiOff, Zap } from '@lucide/svelte';
 	import SessionTabs from '$lib/components/SessionTabs.svelte';
 	import ChatArea from '$lib/components/ChatArea.svelte';
 	import PromptInput from '$lib/components/PromptInput.svelte';
@@ -29,7 +29,10 @@
 		userConfigPath,
 		workspaceConfigPath
 	} from '$lib/stores';
-	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal, SwarmMessage, ResourceLock, SwarmLockEvent, ProfilesResponse, ApprovalPrompt, GraphSpec, GraphRunRecord } from '$lib/types';
+	import type { SessionInfo, ChatMessage, WSEvent, SubagentNode, MemoryItem, PatchProposal, SwarmMessage, ResourceLock, SwarmLockEvent, ProfilesResponse, ApprovalPrompt, GraphSpec, GraphRunRecord, TokenUsagePayload } from '$lib/types';
+
+	let sessionTokenUsage = $state<Record<string, TokenUsagePayload>>({});
+	let currentTokenUsage = $derived($activeSessionId ? sessionTokenUsage[$activeSessionId] : undefined);
 
 	let activeSession = $derived(
 		$sessions.find((s) => s.id === $activeSessionId) || null
@@ -525,6 +528,12 @@
 				break;
 			}
 
+			case 'token_usage': {
+				const payload = event.payload as TokenUsagePayload;
+				sessionTokenUsage = { ...sessionTokenUsage, [sessId]: payload };
+				break;
+			}
+
 			case 'resume_failed': {
 				// Gap exceeded the server's 500-event ring buffer: refetch full session transcript.
 				pendingChunks.delete(sessId);
@@ -772,6 +781,21 @@
 					</span>
 				{/if}
 			</button>
+
+			<!-- Prompt Cache Hit/Miss Badge -->
+			{#if currentTokenUsage && currentTokenUsage.prompt_tokens > 0}
+				<div
+					class="flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[11px] font-mono shrink-0 {currentTokenUsage.cached_tokens > 0 ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-300' : 'bg-amber-950/40 border-amber-800/60 text-amber-300'}"
+					title="{currentTokenUsage.cached_tokens} cached / {currentTokenUsage.prompt_tokens} prompt tokens ({Math.round(currentTokenUsage.cache_hit_ratio * 100)}%)"
+				>
+					<Zap class="w-3.5 h-3.5 {currentTokenUsage.cached_tokens > 0 ? 'text-emerald-400' : 'text-amber-400'}" />
+					{#if currentTokenUsage.cached_tokens > 0}
+						<span>⚡ {Math.round(currentTokenUsage.cache_hit_ratio * 100)}% Cache Hit</span>
+					{:else}
+						<span>⚡ 0% Cache Miss</span>
+					{/if}
+				</div>
+			{/if}
 
 			<div class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 border border-slate-800 text-[11px] font-mono shrink-0">
 				{#if $serverConnected}
