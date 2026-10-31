@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestShellCommand(t *testing.T) {
@@ -49,6 +50,28 @@ func TestShellCommand(t *testing.T) {
 				t.Errorf("output %q does not contain %q", res.Output, tc.wantContains)
 			}
 		})
+	}
+}
+
+func TestShellCommandTimeoutOverride(t *testing.T) {
+	ctx := context.Background()
+
+	// Short timeout override: should time out
+	res, err := ExecuteShellCommand(ctx, "sleep 2", 100*time.Millisecond)
+	if err == nil {
+		t.Fatalf("expected timeout error, got nil (res: %+v)", res)
+	}
+	if !strings.Contains(err.Error(), "command timed out") {
+		t.Fatalf("expected 'command timed out' in error, got %v", err)
+	}
+
+	// Adequate timeout override: should succeed
+	res, err = ExecuteShellCommand(ctx, "echo 'hello from timeout override'", 5*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(res.Output, "hello from timeout override") {
+		t.Errorf("output %q does not contain expected text", res.Output)
 	}
 }
 

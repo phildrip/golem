@@ -901,3 +901,20 @@ func TestClient_ParsesUsageAndCachedTokens(t *testing.T) {
 		t.Errorf("unexpected UsageMetadata: %+v", got)
 	}
 }
+
+func TestClient_DefaultHTTPClient(t *testing.T) {
+	client := NewClient("test-model", "http://localhost", "key", nil)
+	if client.httpClient == nil {
+		t.Fatal("expected non-nil httpClient")
+	}
+	if client.httpClient.Timeout != 0 {
+		t.Fatalf("expected httpClient.Timeout to be 0 (unbounded SSE body streaming), got %v", client.httpClient.Timeout)
+	}
+	tr, ok := client.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected httpClient.Transport to be *http.Transport, got %T", client.httpClient.Transport)
+	}
+	if tr.ResponseHeaderTimeout != 120*time.Second {
+		t.Fatalf("expected ResponseHeaderTimeout 120s, got %v", tr.ResponseHeaderTimeout)
+	}
+}

@@ -18,7 +18,8 @@ import (
 
 // ShellArgs defines the input arguments for the shell execution tool.
 type ShellArgs struct {
-	Command string `json:"command" jsonschema:"The shell command to execute using bash"`
+	Command        string `json:"command" jsonschema:"The shell command to execute using bash"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Optional command execution timeout in seconds (default: 120s, max: 1800s)"`
 }
 
 // ShellResult defines the output of a shell command execution.
@@ -30,8 +31,8 @@ type ShellResult struct {
 // ExecuteShellCommand runs a command with bash and returns its combined output
 // and exit code. It is the unconfined entry point, kept for callers that have no
 // policy; tool code goes through ExecuteShell.
-func ExecuteShellCommand(ctx context.Context, command string) (ShellResult, error) {
-	return ExecuteShell(ctx, nil, command)
+func ExecuteShellCommand(ctx context.Context, command string, timeoutOverride ...time.Duration) (ShellResult, error) {
+	return ExecuteShell(ctx, nil, command, timeoutOverride...)
 }
 
 // ExecuteShell runs command under p.
@@ -42,16 +43,30 @@ func ExecuteShellCommand(ctx context.Context, command string) (ShellResult, erro
 // the agent that spawned it. In every other mode the command is a plain bash -c
 // that at least gets the policy's working directory, environment allowlist and
 // wall-clock budget.
-func ExecuteShell(ctx context.Context, p *sandbox.Policy, command string) (ShellResult, error) {
+//
+// An optional timeout override can be provided (e.g. from ShellArgs.TimeoutSeconds).
+// When provided and > 0, it overrides the policy's default shell timeout, clamped
+// to a maximum of 30 minutes (1800s).
+func ExecuteShell(ctx context.Context, p *sandbox.Policy, command string, timeoutOverride ...time.Duration) (ShellResult, error) {
+	timeout := p.ShellTimeout()
+	if len(timeoutOverride) > 0 && timeoutOverride[0] > 0 {
+		timeout = timeoutOverride[0]
+		const maxTimeout = 30 * time.Minute
+		if timeout > maxTimeout {
+			timeout = maxTimeout
+		}
+	}
 	env := p.FilterEnv(os.Environ())
 	if p.Mode() == sandbox.ModeIsolation {
-		res, err := sandbox.Run(ctx, p.IsolationSpec(command, env))
+		spec := p.IsolationSpec(command, env)
+		spec.TimeoutMS = timeout.Milliseconds()
+		res, err := sandbox.Run(ctx, spec)
 		if err != nil {
 			return ShellResult{Output: res.Output, ExitCode: res.ExitCode}, errors.Wrap(err, "shell")
 		}
 		return ShellResult{Output: res.Output, ExitCode: res.ExitCode}, nil
 	}
-	return runShellCommand(ctx, command, p.Workspace(), env, p.ShellTimeout())
+	return runShellCommand(ctx, command, p.Workspace(), env, timeout)
 }
 
 // runShellCommand is the unconfined path: bash -c in the workspace, with the
@@ -112,12 +127,16 @@ func NewShellTool(opts ...Option) (tool.Tool, error) {
 	o := newOptions(opts)
 	t, err := functiontool.New(functiontool.Config{
 		Name:        "shell",
-		Description: "Executes a shell command on the host system using bash. Returns stdout, stderr, and the exit code.",
+		Description: "Executes a shell command on the host system using bash. Returns stdout, stderr, and the exit code. For long-running commands (benchmarks, builds, migrations, tests), specify timeout_seconds.",
 	}, func(ctx agent.Context, args ShellArgs) (ShellResult, error) {
 		if err := o.checkShell(ctx, args.Command); err != nil {
 			return ShellResult{}, err
 		}
-		return ExecuteShell(ctx, o.policy, args.Command)
+		var timeout time.Duration
+		if args.TimeoutSeconds > 0 {
+			timeout = time.Duration(args.TimeoutSeconds) * time.Second
+		}
+		return ExecuteShell(ctx, o.policy, args.Command, timeout)
 	})
 
 	if err != nil {

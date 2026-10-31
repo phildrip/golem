@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -60,8 +61,30 @@ func NewClient(modelName, baseURL, apiKey string, httpClient *http.Client) *Clie
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
 	if httpClient == nil {
+		var transport *http.Transport
+		if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+			transport = dt.Clone()
+		} else {
+			transport = &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			}
+		}
+		// ResponseHeaderTimeout bounds time waiting for the server's response headers (TTFT).
+		// Once headers arrive and SSE body streaming begins, reading the stream is not capped
+		// by an arbitrary wall-clock timer so reasoning models and long-running turns are not
+		// killed mid-stream. Stream lifetime is bounded by the caller's context.
+		transport.ResponseHeaderTimeout = 120 * time.Second
 		httpClient = &http.Client{
-			Timeout: 120 * time.Second,
+			Transport: transport,
 		}
 	}
 	return &Client{
